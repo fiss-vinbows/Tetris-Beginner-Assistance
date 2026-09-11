@@ -1,0 +1,30 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# 実機デバッグの生成物(画面キャプチャを含むため公開しない)
+debug_log.txt
+debug_capture.mp4
+debug_frames/
+debug_frames_history/
+crash_log.txt
+
+# 配布用アーカイブ・作業ファイル
+backup/
+TT.aup2
+
+# Cold Clear 2 のビルド成果物(README の手順でビルドする)
+external/cold-clear-2/target/
+
+# エディタ・ツール
+.claude/
+
+# 第三者のリポジトリの複製(参考資料。URLは input/文献.txt 参照)
+input/TetrisAI-master/
+
+# 設計資料・課題メモ(内部資料。リポジトリには含めない)
+input/
+残課題_*.txt
+現状の課題*.txt
+RELEASE_NOTES_*.md
