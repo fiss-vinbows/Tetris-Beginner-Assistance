@@ -1874,6 +1874,36 @@ class TestAssistWorkerTickOnce(unittest.TestCase):
         # 手順の座標はおじゃま2行ぶん上にずれている(最下段のマスは行17以下)。
         self.assertTrue(all(r <= 17 for st in worker._opener.steps for r, _c in st.cells))
 
+    def test_search_for_the_next_form_keeps_going_until_the_board_is_readable(self) -> None:
+        # 図を置き終えた直後は最後のミノが読み切れていないことがある。1回
+        # 見つからなくても諦めず、読めた時点で次の図を始めること。
+        from src.engine.openers import apply_step, choose_opener
+
+        worker, received = self._opener_worker()
+        tpl, form, steps = choose_opener(list("SLIOJZT"))
+        board: set = set()
+        for step in steps:
+            board = apply_step(board, step.cells)
+        worker._opener_continuing = tpl
+        self.cold_clear.poll_suggestion.return_value = _move("I", landing_cells=[(9, 0), (9, 1), (9, 2), (9, 3)])
+        missing = set(board) - set(steps[-1].cells)  # 最後に置いたTがまだ読めていない
+        with patch("src.app.time.monotonic", return_value=1000.0):
+            with patch(
+                "src.app.recognize",
+                return_value=_recognition(current_piece="I", hold_piece="L", filled_cells=tuple(missing), next_queue=("L", "T", "J", "S", "Z")),
+            ):
+                worker._tick_once(capture=MagicMock())
+        self.assertIsNone(worker._opener)
+        self.assertIsNotNone(worker._opener_continuing, "1回見つからないだけで諦めている")
+        with patch("src.app.time.monotonic", return_value=1000.3):
+            with patch(
+                "src.app.recognize",
+                return_value=_recognition(current_piece="I", hold_piece="L", filled_cells=tuple(board), next_queue=("L", "T", "J", "S", "Z")),
+            ):
+                worker._tick_once(capture=MagicMock())
+        self.assertIsNotNone(worker._opener, "盤面が読めた後も2巡目が始まらない")
+        self.assertIn("2巡目", worker._opener.form.section)
+
     def test_opener_is_not_started_when_disabled(self) -> None:
         self.cold_clear.poll_suggestion.return_value = _move("I")
         with patch("src.app.recognize", return_value=_recognition(current_piece="I", next_queue=("L", "S", "T", "Z", "O"))):

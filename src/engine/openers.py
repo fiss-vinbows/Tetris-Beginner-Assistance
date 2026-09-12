@@ -266,15 +266,21 @@ def choose_form(
     sequence: list[str],
     hold: str | None,
 ) -> tuple[OpenerForm, list[OpenerStep]] | None:
-    """今の盤面(おじゃまを除く占有)に既存ブロックが一致し、ミノ順で組める図を返す。"""
+    """今の盤面(おじゃまを除く占有)に既存ブロックが一致し、ミノ順で組める図を返す。
+
+    一致は「図の既存ブロックがすべて盤面にあり、盤面にそれ以外のマスが
+    1ミノ分未満(3マス以下)」で判定する。置いたばかりのミノが光って
+    余分なマスとして読まれた程度なら次の図へ進めるようにするため。余分な
+    マスは置けない場所として手順探索にも渡す。
+    """
     target = frozenset(board_cells)
     # 置くミノが多い図(ホールドに残さず7つ置く形)を優先する。迷走砲のように
     # 「Zをホールドしておく形」と「Zも置く形」の両方が載っている場合、
     # 2巡目以降の図は後者を前提にしているため。
     for form in sorted(template.forms, key=lambda f: -len(f.items)):
-        if form.existing != target:
+        if not form.existing <= target or len(target - form.existing) >= 4:
             continue
-        steps = plan_form(form, sequence, hold)
+        steps = plan_form(form, sequence, hold, placed=set(target))
         if steps is not None:
             return form, steps
     return None

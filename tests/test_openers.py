@@ -128,6 +128,18 @@ class TestPlanForm(unittest.TestCase):
         self.assertTrue(steps2[-1].spin, "最後の手がTスピン")
         self.assertTrue(steps2[-1].use_hold, "TはホールドからTスピンに使う")
 
+    def test_next_form_tolerates_a_few_extra_cells(self) -> None:
+        # 【2026-09-12実機】置いたばかりのミノが光って余分なマスとして読まれ、
+        # 厳密一致では2巡目の図が見つからなかった(はちみつ砲)。数マスの
+        # 余分は許し、その場所には置けないものとして手順を探すこと。
+        template = _template("はちみつ砲")
+        tpl, form, steps = choose_opener(list("SLIOJZT"))
+        board, hold, _rest = _run_steps(steps, "SLIOJZT", None, set())
+        with_noise = board | {(10, 5)}
+        second = choose_form(template, with_noise, list("ILTJSZO"), hold)
+        self.assertIsNotNone(second, "余分なマス1つで2巡目の図が見つからない")
+        self.assertIsNone(choose_form(template, board | {(10, 0), (10, 1), (10, 2), (10, 3)}, list("ILTJSZO"), hold))
+
     def test_spin_item_is_placed_last(self) -> None:
         form = parse_form("--z-------\n-zz----o--\n-zU----oU-\nccUU--ccUc\nccUcccccc-")
         # 図の解釈: Uは1つのT(4マス)でなければならないので、この図は解釈不能

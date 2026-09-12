@@ -2037,6 +2037,9 @@ class AssistWorker(QtCore.QThread):
         # 中から、今の盤面に既存ブロックが一致するものを探す。図が見つから
         # なかったり中断したらNoneに戻し、次に盤面が空になるまで始めない。
         self._opener_continuing: OpenerTemplate | None = None
+        # 続きの図を探し始めた時刻。見つからないまま一定時間過ぎたら諦める
+        # (置いたばかりのミノが読み切れていない間は見つからないことがある)。
+        self._opener_continue_since: float | None = None
         # 「該当なし」を同じミノ順で毎tick記録しないための控え。
         self._opener_declined_sequence: list[str] | None = None
 
@@ -3465,10 +3468,17 @@ class AssistWorker(QtCore.QThread):
         if self._opener_continuing is not None:
             chosen_form = choose_form(self._opener_continuing, matched_cells, sequence, hold)
             if chosen_form is None:
-                self._log_opener(
-                    f"次の図が見つからず終了 {self._opener_continuing.name_ja} ミノ順={''.join(sequence)} hold={hold}"
-                )
-                self._opener_continuing = None
+                # 【2026-09-12実機】図を置き終えた直後のtickは、置いたばかりの
+                # ミノが光っていて盤面が図と厳密に一致しないことがあり、1回で
+                # 諦めると2巡目が始まらなかった(はちみつ砲)。しばらく探し続ける。
+                if self._opener_continue_since is None:
+                    self._opener_continue_since = time.monotonic()
+                elif time.monotonic() - self._opener_continue_since >= self.OPENER_CONTINUE_TIMEOUT_SEC:
+                    self._log_opener(
+                        f"次の図が見つからず終了 {self._opener_continuing.name_ja} ミノ順={''.join(sequence)} hold={hold} 盤面={sorted(board_cells)}"
+                    )
+                    self._opener_continuing = None
+                    self._opener_continue_since = None
                 return
             template = self._opener_continuing
             form, steps = chosen_form
@@ -3493,6 +3503,7 @@ class AssistWorker(QtCore.QThread):
                 return
         self._opener = _OpenerRun(template=template, form=form, steps=steps, board=set(board_cells))
         self._opener_continuing = None
+        self._opener_continue_since = None
         # AIの提案を先に出していた場合でも、この手番からテンプレの手に切り替える。
         self._committed_placement = None
         self._committed_placement_tbp = None
@@ -3505,6 +3516,8 @@ class AssistWorker(QtCore.QThread):
     # 固定を検知してから、盤面が手順どおりになるのをこの秒数まで待つ。
     # 超えたら手順から外れたとみなしてテンプレをやめる。
     OPENER_CONFIRM_TIMEOUT_SEC = 1.5
+    # 図を置き終えてから、次の図を探し続ける秒数。
+    OPENER_CONTINUE_TIMEOUT_SEC = 3.0
 
     def _check_opener_progress(self, recognition: RecognitionResult) -> None:
         """固定後、盤面が手順どおりになったかを毎tick確認して手順を進める。
@@ -3531,6 +3544,7 @@ class AssistWorker(QtCore.QThread):
             if opener.current_step() is None:
                 self._log_opener(f"図を置き終えた [{opener.form.section}]")
                 self._opener_continuing = opener.template
+                self._opener_continue_since = None
                 self._opener = None
             return
         elapsed = time.monotonic() - opener.awaiting_since
