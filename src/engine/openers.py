@@ -299,10 +299,25 @@ def choose_opener(
     return None
 
 
+def full_rows_after(cells: set[tuple[int, int]], step_cells: Cells) -> list[int]:
+    """ミノを置いた後に揃う(消える)行。"""
+    result = set(cells) | set(step_cells)
+    return [r for r in range(BOARD_ROWS) if all((r, c) in result for c in range(BOARD_COLS))]
+
+
+def shift_cells_for_clears(cells: Cells, cleared_rows: list[int]) -> Cells:
+    """消えた行より上のマスを、消えた行数ぶん下へずらす。
+
+    図は「消える前」の座標で描かれている(TSDのTと、その後に置くミノが
+    同じ図にある)ため、消去が起きたら残りの手の座標を実際の盤面に合わせる。
+    """
+    return tuple((r + sum(1 for fr in cleared_rows if fr > r), c) for r, c in cells)
+
+
 def apply_step(cells: set[tuple[int, int]], step_cells: Cells) -> set[tuple[int, int]]:
     """盤面(占有マス集合)にミノを置き、揃った行を消して詰めた結果を返す。"""
     result = set(cells) | set(step_cells)
-    full_rows = [r for r in range(BOARD_ROWS) if all((r, c) in result for c in range(BOARD_COLS))]
+    full_rows = full_rows_after(cells, step_cells)
     if not full_rows:
         return result
     shifted: set[tuple[int, int]] = set()

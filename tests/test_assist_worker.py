@@ -1904,6 +1904,32 @@ class TestAssistWorkerTickOnce(unittest.TestCase):
         self.assertIsNotNone(worker._opener, "盤面が読めた後も2巡目が始まらない")
         self.assertIn("2巡目", worker._opener.form.section)
 
+    def test_remaining_opener_steps_shift_down_after_a_line_clear(self) -> None:
+        # 【2026-09-12実機】パフェ狙いの図はTSDのTとその後に置くミノが「消える前」
+        # の座標で描かれている。TSDで2行消えた後、次の手(L)の座標をずらさずに
+        # いたため、宙に浮いた位置になり提案が捨てられて何も表示されなかった。
+        from src.app import _OpenerRun
+        from src.engine.openers import OPENER_TEMPLATES, OpenerStep
+
+        worker, received = self._opener_worker()
+        # 盤面: 18・19行目が col 4〜6 の穴を除いて埋まっている(TSDのスロット)。
+        board = {(r, c) for r in (18, 19) for c in range(10) if c not in (4, 5, 6)} | {(19, 4), (19, 6)}
+        tsd = ((18, 4), (18, 5), (18, 6), (19, 5))
+        next_l = ((15, 4), (15, 5), (16, 5), (17, 5))
+        tpl = OPENER_TEMPLATES[0]
+        worker._opener = _OpenerRun(
+            template=tpl, form=tpl.forms[0], steps=[OpenerStep("T", tsd, False), OpenerStep("L", next_l, False)], board=set(board)
+        )
+        worker._opener.awaiting_since = 999.0
+        # TSDを打った後の盤面: 18・19行目が消え、残り(なし)。
+        with patch("src.app.time.monotonic", return_value=1000.0):
+            worker._check_opener_progress(_recognition(current_piece="L", filled_cells=()))
+        self.assertIsNotNone(worker._opener)
+        self.assertEqual(worker._opener.index, 1)
+        self.assertEqual(
+            sorted(worker._opener.steps[1].cells), sorted((r + 2, c) for r, c in next_l), "消去後に残りの手がずれていない"
+        )
+
     def test_opener_is_not_started_when_disabled(self) -> None:
         self.cold_clear.poll_suggestion.return_value = _move("I")
         with patch("src.app.recognize", return_value=_recognition(current_piece="I", next_queue=("L", "S", "T", "Z", "O"))):

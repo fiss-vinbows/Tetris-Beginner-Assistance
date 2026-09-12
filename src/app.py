@@ -63,7 +63,9 @@ from src.engine.openers import (
     apply_step,
     choose_form,
     choose_opener,
+    full_rows_after,
     known_sequence,
+    shift_cells_for_clears,
 )
 from src.overlay.renderer import (
     PLAN_DOT_ALPHA,
@@ -3538,6 +3540,17 @@ class AssistWorker(QtCore.QThread):
         expected = opener.expected_after_current()
         extra = actual - expected
         if expected <= actual and len(extra) < 4:
+            # 【2026-09-12実機】この手でラインが消えたら(TSD等)、図の残りの手は
+            # 「消える前」の座標で描かれているので、消えた行数ぶん下へずらす。
+            # ずらさないとパフェ狙いの図の次の手が宙に浮いた位置になり、物理的に
+            # 成立しない提案として捨てられて何も表示されなかった。
+            cleared = full_rows_after(opener.board, opener.steps[opener.index].cells)
+            if cleared:
+                opener.steps = opener.steps[: opener.index + 1] + [
+                    OpenerStep(st.piece, shift_cells_for_clears(st.cells, cleared), st.use_hold, st.spin)
+                    for st in opener.steps[opener.index + 1 :]
+                ]
+                self._log_opener(f"{len(cleared)}行消去: 残りの手順を下へずらす")
             opener.board = expected
             opener.index += 1
             opener.awaiting_since = None
