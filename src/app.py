@@ -56,6 +56,9 @@ from src.capture.screen_capture import CaptureRegion, ScreenCapture
 from src.engine.board_state import BoardState
 from src.engine.cold_clear_client import ColdClearClient, ColdClearMove
 from src.overlay.renderer import (
+    PLAN_DOT_ALPHA,
+    PLAN_DOT_RADIUS_RATIO,
+    PlanStep,
     LANDING_DOT_OUTLINE_WIDTH,
     LANDING_DOT_RADIUS_RATIO,
     BoardLayout,
@@ -1248,6 +1251,24 @@ def _draw_suggestion_on_bgr_frame(
             thickness=LANDING_DOT_OUTLINE_WIDTH,
             lineType=cv2.LINE_AA,
         )
+    # 読み筋(2手目以降)は小さいドット+番号。
+    plan_radius = max(2, round(calibration.cell_size * PLAN_DOT_RADIUS_RATIO))
+    for index, step in enumerate(draw_data.plan_steps or [], start=2):
+        rgb = PIECE_COLORS[step.piece]
+        color = (rgb.b, rgb.g, rgb.r)
+        for row, col in step.cells:
+            center_x = (
+                calibration.board_origin_x - region_origin_x + col * calibration.cell_size + calibration.cell_size // 2
+            )
+            center_y = (
+                calibration.board_origin_y - region_origin_y + row * calibration.cell_size + calibration.cell_size // 2
+            )
+            cv2.circle(bgr_frame, (center_x, center_y), plan_radius, color, thickness=-1, lineType=cv2.LINE_AA)
+        if step.cells:
+            row, col = min(step.cells)
+            text_x = calibration.board_origin_x - region_origin_x + col * calibration.cell_size + 2
+            text_y = calibration.board_origin_y - region_origin_y + row * calibration.cell_size + calibration.cell_size - 4
+            cv2.putText(bgr_frame, str(index), (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
 
 
 def _draw_next_debug_dots_on_bgr_frame(
@@ -1585,6 +1606,35 @@ def _board_after_placement(board: BoardState, piece: str, cells: tuple[tuple[int
     return cleared
 
 
+def _plan_steps_on_screen(board: BoardState, move: ColdClearMove) -> list[PlanStep]:
+    """読み筋(2手目以降)のうち、今の画面座標のまま表示できる手を返す。
+
+    ライン消去が起きると、それ以降の手の着地マスは(盤面が下へ詰まるため)
+    今の画面上の位置と対応しなくなる。1手目から順に仮想的に置いていき、
+    ラインが消える手までを表示対象にする(その手自身は消去前の座標なので
+    表示できる。次の手からは表示しない)。
+    """
+    steps: list[PlanStep] = []
+    if not move.plan:
+        return steps
+    placed = board.clone()
+    for r, c in move.landing_cells:
+        if 0 <= r < placed.height and 0 <= c < placed.width:
+            placed.grid[r][c] = move.piece
+    placed, cleared = placed.clear_lines()
+    if cleared:
+        return steps
+    for piece, cells in move.plan:
+        steps.append(PlanStep(piece=piece, cells=list(cells)))
+        for r, c in cells:
+            if 0 <= r < placed.height and 0 <= c < placed.width:
+                placed.grid[r][c] = piece
+        placed, cleared = placed.clear_lines()
+        if cleared:
+            break
+    return steps
+
+
 class AssistWorker(QtCore.QThread):
     """支援モードの認識→思考ループを、UIスレッドをブロックせず回すワーカー。
 
@@ -1882,6 +1932,8 @@ class AssistWorker(QtCore.QThread):
         self._committed_placement: tuple[str, tuple[tuple[int, int], ...]] | None = None
         # 提示済み配置のTBP上の手(Placement辞書。playで伝え直す用)。
         self._committed_placement_tbp: dict | None = None
+        # 提示済みの手そのもの(読み筋を含む)。同じ配置が届いた時にこれを返す。
+        self._committed_move: ColdClearMove | None = None
         # Cold Clear 2の探索木を引き継げる状態か(_ColdClearContinuation参照)。
         # Noneなら次の要求は従来どおりstartで局面を渡し直す。
         self._cc_continuation: _ColdClearContinuation | None = None
@@ -2779,7 +2831,12 @@ class AssistWorker(QtCore.QThread):
             best = self._stabilize_suggestion(best)
 
         if best is not None:
-            draw_data = OverlayDrawData(piece=best.piece, landing_cells=best.landing_cells, use_hold=best.use_hold)
+            draw_data = OverlayDrawData(
+                piece=best.piece,
+                landing_cells=best.landing_cells,
+                use_hold=best.use_hold,
+                plan_steps=_plan_steps_on_screen(recognition.board, best),
+            )
             if draw_data != self._last_valid_draw_data:
                 self._last_valid_draw_data = draw_data
                 self._last_draw_data_set_time = time.monotonic()
@@ -3404,10 +3461,13 @@ class AssistWorker(QtCore.QThread):
         if self._committed_placement is None:
             self._committed_placement = placement
             self._committed_placement_tbp = move.placement
+            # 読み筋(2手目以降)も一緒に固定する。探索が深まって2手目以降だけが
+            # 変わっても表示を揺らさない(1手目と同じく「置くまで変更しない」)。
+            self._committed_move = move
             return move
 
         if placement == self._committed_placement:
-            return move
+            return self._committed_move if self._committed_move is not None else move
 
         # この手番については既に配置を提示済みなので、探索が深まって別の
         # 配置が返ってきても切り替えない。

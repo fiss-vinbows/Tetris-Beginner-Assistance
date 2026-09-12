@@ -26,6 +26,41 @@ from src.engine.cold_clear_client import (
 _HAS_COLD_CLEAR = COLD_CLEAR_EXE.exists()
 
 
+class TestPlanParsing(unittest.TestCase):
+    """suggestionの読み筋(plan。このフォーク独自のTBP拡張)の解釈。"""
+
+    def _client_with_response(self, response: dict):
+        client = ColdClearClient.__new__(ColdClearClient)
+        client._board_height = 20
+        client._send = MagicMock()
+        client._recv = MagicMock(return_value=response)
+        return client
+
+    def test_plan_after_the_first_move_is_converted_to_board_cells(self) -> None:
+        first = {"location": {"type": "O", "orientation": "north", "x": 8, "y": 0}, "spin": "none"}
+        second = {"location": {"type": "T", "orientation": "north", "x": 4, "y": 0}, "spin": "none"}
+        third = {"location": {"type": "I", "orientation": "north", "x": 1, "y": 0}, "spin": "none"}
+        client = self._client_with_response(
+            {"type": "suggestion", "moves": [first], "plan": [first, second, third], "move_info": {}}
+        )
+
+        move = client.poll_suggestion("T")
+
+        self.assertEqual(move.piece, "O")
+        self.assertEqual([piece for piece, _cells in move.plan], ["T", "I"])
+        self.assertEqual(
+            sorted(move.plan[0][1]),
+            sorted(location_to_board_cells("T", "north", 4, 0, 20)),
+        )
+
+    def test_missing_plan_field_is_tolerated(self) -> None:
+        # 本家のCold Clear 2(plan無し)でも動くこと。
+        first = {"location": {"type": "O", "orientation": "north", "x": 8, "y": 0}, "spin": "none"}
+        client = self._client_with_response({"type": "suggestion", "moves": [first], "move_info": {}})
+        move = client.poll_suggestion("T")
+        self.assertEqual(move.plan, [])
+
+
 class TestBeginnerConfig(unittest.TestCase):
     """初心者向けの評価設定(config/cold_clear_beginner.json)の回帰テスト。
 

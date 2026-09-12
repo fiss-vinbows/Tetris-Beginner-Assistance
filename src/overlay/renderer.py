@@ -18,6 +18,10 @@ from src.vision.piece_colors import PIECE_COLORS
 LANDING_DOT_RADIUS_RATIO = 0.22  # セルサイズに対するドット半径の比率
 LANDING_DOT_OUTLINE_WIDTH = 3  # ドットの白い縁取りの太さ（どんな背景色でも視認できるように）
 
+# 読み筋(2手目以降)のドット。1手目より小さく・薄くして区別し、手番の番号を添える。
+PLAN_DOT_RADIUS_RATIO = 0.15
+PLAN_DOT_ALPHA = 150
+
 
 @dataclass
 class BoardLayout:
@@ -43,12 +47,23 @@ class BoardLayout:
 
 
 @dataclass
+class PlanStep:
+    """読み筋の1手(2手目以降)。cellsは現在の画面座標での着地マス。"""
+
+    piece: str
+    cells: list[tuple[int, int]]
+
+
+@dataclass
 class OverlayDrawData:
     """1フレーム分の描画内容（solver.BestMoveから変換して渡す）"""
 
     piece: str
     landing_cells: list[tuple[int, int]]  # (row, col) 消去前の着地マス
     use_hold: bool
+    # 読み筋(2手目以降)。先頭が2手目。ライン消去で画面座標がずれる手より
+    # 先は含めない(app._plan_steps_on_screen参照)。
+    plan_steps: list[PlanStep] | None = None
 
 
 def _piece_qcolor(piece: str, alpha: int) -> QtGui.QColor:
@@ -74,6 +89,39 @@ def render_overlay(
     # 指示により廃止した。着地マス表示だけで「次に置くべき場所」は伝わる
     # ため、ホールド欄側の追加表示は不要と判断された。
     _render_landing_cells(painter, layout, data)
+    _render_plan_steps(painter, layout, data)
+
+
+def _render_plan_steps(
+    painter: QtGui.QPainter,
+    layout: BoardLayout,
+    data: OverlayDrawData,
+) -> None:
+    """読み筋(2手目以降)を、小さく薄いドットと手番の番号で示す。"""
+    if not data.plan_steps:
+        return
+    radius = layout.cell_size * PLAN_DOT_RADIUS_RATIO
+    font = painter.font()
+    font.setPixelSize(max(8, int(layout.cell_size * 0.45)))
+    font.setBold(True)
+    painter.setFont(font)
+    for index, step in enumerate(data.plan_steps, start=2):
+        painter.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255, PLAN_DOT_ALPHA), 2))
+        painter.setBrush(QtGui.QBrush(_piece_qcolor(step.piece, PLAN_DOT_ALPHA)))
+        for row, col in step.cells:
+            x, y, w, h = _cell_rect(layout, row, col)
+            painter.drawEllipse(QtCore.QPointF(x + w / 2, y + h / 2), radius, radius)
+        # 番号はミノの一番上・左のマスに添える。
+        if step.cells:
+            row, col = min(step.cells)
+            x, y, w, h = _cell_rect(layout, row, col)
+            painter.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255, 230)))
+            # ドットと重ならないよう、マスの左上に寄せる。
+            painter.drawText(
+                QtCore.QRectF(x + 1, y, w, h),
+                QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop,
+                str(index),
+            )
 
 
 def _cell_rect(layout: BoardLayout, row: int, col: int) -> tuple[float, float, float, float]:

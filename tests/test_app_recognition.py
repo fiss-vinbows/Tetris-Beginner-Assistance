@@ -849,6 +849,50 @@ def _board_key_with_filled_count(count: int, width: int = BOARD_COLS, height: in
     return tuple(tuple(row) for row in grid)
 
 
+class TestPlanStepsOnScreen(unittest.TestCase):
+    """読み筋(2手目以降)のうち画面座標のまま表示できる手の判定。"""
+
+    def _move(self, piece, cells, plan):
+        from src.engine.cold_clear_client import ColdClearMove
+
+        return ColdClearMove(use_hold=False, piece=piece, landing_cells=cells, nodes=0, nps=0.0, plan=plan)
+
+    def test_all_steps_are_shown_when_nothing_clears(self) -> None:
+        from src.app import _plan_steps_on_screen
+        from src.engine.board_state import BoardState
+
+        move = self._move("O", [(19, 0), (19, 1), (18, 0), (18, 1)], [
+            ("I", [(19, 2), (19, 3), (19, 4), (19, 5)]),
+            ("T", [(17, 0), (17, 1), (17, 2), (16, 1)]),
+        ])
+        steps = _plan_steps_on_screen(BoardState(), move)
+        self.assertEqual([s.piece for s in steps], ["I", "T"])
+
+    def test_no_steps_when_the_first_move_clears_a_line(self) -> None:
+        from src.app import _plan_steps_on_screen
+        from src.engine.board_state import BoardState
+
+        board = BoardState()
+        for c in range(6):
+            board.grid[19][c] = "G"
+        move = self._move("I", [(19, 6), (19, 7), (19, 8), (19, 9)], [("T", [(18, 0), (18, 1), (18, 2), (17, 1)])])
+        self.assertEqual(_plan_steps_on_screen(board, move), [])
+
+    def test_steps_stop_after_the_move_that_clears_a_line(self) -> None:
+        from src.app import _plan_steps_on_screen
+        from src.engine.board_state import BoardState
+
+        board = BoardState()
+        for c in range(6):
+            board.grid[19][c] = "G"
+        move = self._move("O", [(18, 8), (18, 9), (17, 8), (17, 9)], [
+            ("I", [(19, 6), (19, 7), (19, 8), (19, 9)]),  # この手でラインが消える
+            ("T", [(18, 0), (18, 1), (18, 2), (17, 1)]),  # 消去後の座標なので表示しない
+        ])
+        steps = _plan_steps_on_screen(board, move)
+        self.assertEqual([s.piece for s in steps], ["I"])
+
+
 class TestIsPlausibleBoardTransition(unittest.TestCase):
     def test_no_previous_board_is_always_plausible(self) -> None:
         candidate = _board_key_with_filled_count(5)

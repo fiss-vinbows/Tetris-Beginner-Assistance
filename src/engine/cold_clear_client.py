@@ -89,6 +89,11 @@ class ColdClearMove:
     # TBPのPlacement(location+spinを含む生の辞書)。advance_thinkingで
     # 「この手を指した」とCold Clear 2へ伝え直すために保持する。
     placement: dict | None = None
+    # 読み筋(このフォーク独自のTBP拡張 "plan")。この手に続く2手目以降の
+    # (ミノ種, 着地マス)。次のミノが確定している範囲で最大4手。ライン消去の
+    # 影響は含まない(各手は「その手を指す直前の盤面」での着地マス)ため、
+    # 画面へ表示できる範囲は呼び出し側が判断する(app._plan_steps_on_screen参照)。
+    plan: list[tuple[str, list[tuple[int, int]]]] | None = None
 
 
 def location_to_board_cells(piece: str, orientation: str, x: int, y: int, board_height: int) -> list[tuple[int, int]]:
@@ -335,6 +340,17 @@ class ColdClearClient:
             piece, location["orientation"], location["x"], location["y"], self._board_height
         )
         move_info = result.get("move_info", {})
+        plan: list[tuple[str, list[tuple[int, int]]]] = []
+        for step in result.get("plan", [])[1:]:
+            loc = step["location"]
+            plan.append(
+                (
+                    loc["type"],
+                    location_to_board_cells(
+                        loc["type"], loc["orientation"], loc["x"], loc["y"], self._board_height
+                    ),
+                )
+            )
         return ColdClearMove(
             use_hold=use_hold,
             piece=piece,
@@ -342,6 +358,7 @@ class ColdClearClient:
             nodes=move_info.get("nodes", 0),
             nps=move_info.get("nps", 0.0),
             placement=move,
+            plan=plan,
         )
 
     def suggest_move(

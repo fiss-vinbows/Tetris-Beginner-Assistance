@@ -1648,6 +1648,32 @@ class TestAssistWorkerTickOnce(unittest.TestCase):
             self.worker._tick_once(capture=MagicMock())
         self.assertIsNone(self.worker._cc_continuation)
 
+    def test_plan_steps_are_frozen_with_the_first_move(self) -> None:
+        # 読み筋(2手目以降)も1手目と一緒に固定する。探索が深まって2手目だけ
+        # 変わった結果が届いても、表示中の読み筋を揺らさないこと。
+        from src.engine.cold_clear_client import ColdClearMove
+
+        def move_with_plan(second_cells):
+            return ColdClearMove(
+                use_hold=False, piece="T", landing_cells=[(19, 0), (19, 1), (19, 2), (18, 1)],
+                nodes=0, nps=0.0, placement={"location": {}, "spin": "none"},
+                plan=[("O", second_cells)],
+            )
+
+        self.cold_clear.poll_suggestion.return_value = move_with_plan([(19, 8), (19, 9), (18, 8), (18, 9)])
+        with patch("src.app.time.monotonic", return_value=1000.0):
+            with patch("src.app.recognize", return_value=_recognition(current_piece="T")):
+                self.worker._tick_once(capture=MagicMock())
+        first = self.received_draw_data[-1]
+        self.assertEqual(first.plan_steps[0].cells, [(19, 8), (19, 9), (18, 8), (18, 9)])
+
+        self.cold_clear.poll_suggestion.return_value = move_with_plan([(19, 5), (19, 6), (18, 5), (18, 6)])
+        with patch("src.app.time.monotonic", return_value=1000.5):
+            with patch("src.app.recognize", return_value=_recognition(current_piece="T")):
+                self.worker._tick_once(capture=MagicMock())
+        shown = [d for d in self.received_draw_data if d is not None]
+        self.assertEqual(shown[-1].plan_steps[0].cells, [(19, 8), (19, 9), (18, 8), (18, 9)], "読み筋が途中で変わっている")
+
     def test_recognition_failure_does_not_clear_the_suggestion(self) -> None:
         # 仕様「提示した配置は、実際にミノを置くまで変更しない」の回帰テスト。
         # 認識できないことは「置いた」ことを意味しないので、提案を消す理由に
