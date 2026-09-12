@@ -32,3 +32,4 @@ RELEASE_NOTES_*.md
 # PyInstaller のビルド成果物
 build/
 dist/
+開発記録_*.md
