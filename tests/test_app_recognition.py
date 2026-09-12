@@ -849,6 +849,35 @@ def _board_key_with_filled_count(count: int, width: int = BOARD_COLS, height: in
     return tuple(tuple(row) for row in grid)
 
 
+class TestTspinLabel(unittest.TestCase):
+    def _move(self, piece, cells, spin):
+        from src.engine.cold_clear_client import ColdClearMove
+
+        return ColdClearMove(
+            use_hold=False, piece=piece, landing_cells=cells, nodes=0, nps=0.0,
+            placement={"location": {}, "spin": spin},
+        )
+
+    def test_tspin_double_is_labeled(self) -> None:
+        from src.app import _tspin_label
+        from src.engine.board_state import BoardState
+
+        board = BoardState()
+        for r in (18, 19):
+            for c in range(10):
+                if c not in (4, 5, 6) or (r == 19 and c in (4, 6)):
+                    board.grid[r][c] = "G"
+        move = self._move("T", [(18, 4), (18, 5), (18, 6), (19, 5)], "full")
+        self.assertEqual(_tspin_label(board, move), "狙い: Tスピンダブル(TSD)")
+
+    def test_non_spin_moves_have_no_label(self) -> None:
+        from src.app import _tspin_label
+        from src.engine.board_state import BoardState
+
+        self.assertIsNone(_tspin_label(BoardState(), self._move("T", [(19, 0), (19, 1), (19, 2), (18, 1)], "none")))
+        self.assertIsNone(_tspin_label(BoardState(), self._move("S", [(19, 0), (19, 1), (18, 1), (18, 2)], "full")))
+
+
 class TestPlanStepsOnScreen(unittest.TestCase):
     """読み筋(2手目以降)のうち画面座標のまま表示できる手の判定。"""
 

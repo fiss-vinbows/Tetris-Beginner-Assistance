@@ -27,6 +27,15 @@ def _template(name_ja: str):
     return next(t for t in OPENER_TEMPLATES if t.name_ja == name_ja)
 
 
+def _choose_with(name_ja: str, sequence: str):
+    """指定テンプレの1巡目の図を空の盤面に対して選ぶ(テンプレの優先順に依らない)。"""
+    template = _template(name_ja)
+    chosen = choose_form(template, set(), list(sequence), None)
+    assert chosen is not None, f"{name_ja}が{sequence}で組めない"
+    form, steps = chosen
+    return template, form, steps
+
+
 def _run_steps(steps, sequence, hold, board):
     """手順を実際のミノ順に対して実行し、(盤面, ホールド, 残りのミノ順)を返す。"""
     seq = list(sequence)
@@ -82,7 +91,7 @@ class TestPlanForm(unittest.TestCase):
     def test_honey_cup_first_bag_then_second_bag_then_tst(self) -> None:
         # 1巡目 → 2巡目の図 → TSTの図、と既存ブロックの一致でつながること。
         template = _template("はちみつ砲")
-        chosen = choose_opener(list("ILSTZOJ"))
+        chosen = _choose_with("はちみつ砲", "ILSTZOJ")
         self.assertIsNotNone(chosen)
         tpl, form, steps = chosen
         self.assertEqual(tpl.name_ja, "はちみつ砲")
@@ -114,7 +123,7 @@ class TestPlanForm(unittest.TestCase):
         # ホールドしたTを未知の次ミノと入れ替えて打つため、既知の7ミノだけ
         # では手順が組めなかった (3)LはZの下へ回転入れする形だった。
         template = _template("迷走砲")
-        chosen = choose_opener(list("LOJZITS"))
+        chosen = _choose_with("迷走砲", "LOJZITS")
         self.assertIsNotNone(chosen)
         tpl, form, steps = chosen
         self.assertEqual(tpl.name_ja, "迷走砲")
@@ -133,7 +142,7 @@ class TestPlanForm(unittest.TestCase):
         # 厳密一致では2巡目の図が見つからなかった(はちみつ砲)。数マスの
         # 余分は許し、その場所には置けないものとして手順を探すこと。
         template = _template("はちみつ砲")
-        tpl, form, steps = choose_opener(list("SLIOJZT"))
+        tpl, form, steps = _choose_with("はちみつ砲", "SLIOJZT")
         board, hold, _rest = _run_steps(steps, "SLIOJZT", None, set())
         with_noise = board | {(10, 5)}
         second = choose_form(template, with_noise, list("IOTSZJL"), hold)
@@ -145,7 +154,7 @@ class TestPlanForm(unittest.TestCase):
         # 入れる手順を出していた(Sを入れる方法が無い)。ページに回転入れの
         # 明記が無いミノは、ハードドロップで入る置き順だけを認めること。
         template = _template("はちみつ砲")
-        tpl, form, steps = choose_opener(list("TZLISOJ"))
+        tpl, form, steps = _choose_with("はちみつ砲", "TZLISOJ")
         board, hold, _rest = _run_steps(steps, "TZLISOJ", None, set())
         self.assertEqual(hold, "J")
         # T O L Z S J I の順では、TをJと入れ替えた時点でJを置くしかなく、その
@@ -163,7 +172,7 @@ class TestPlanForm(unittest.TestCase):
         # Tスピンで消える行に掛かるミノだけ置いてTST/TSDの形までは組む
         # (上に積むパフェ用のミノは省略してよい)。
         template = _template("はちみつ砲")
-        tpl, form, steps = choose_opener(list("TIJSLZO"))
+        tpl, form, steps = _choose_with("はちみつ砲", "TIJSLZO")
         board, hold, _rest = _run_steps(steps, "TIJSLZO", None, set())
         second = choose_form(template, board, list("IOTSLJZ"), hold)
         self.assertIsNotNone(second, "砲だけの手順も見つからない")

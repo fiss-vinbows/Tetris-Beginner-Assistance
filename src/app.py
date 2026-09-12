@@ -1693,6 +1693,30 @@ def _board_after_placement(board: BoardState, piece: str, cells: tuple[tuple[int
     return cleared
 
 
+def _tspin_label(board: BoardState, move: ColdClearMove) -> str | None:
+    """AIの提案がTスピンなら、その狙い(種類と消去ライン数)を表す文字を返す。
+
+    【2026-09-12・利用者の方針】自由モードでもTST・STSD・インペリアル
+    クロスなどのTスピンは候補から外さず、狙いをメッセージ欄に示す。
+    STSD/インペリアルクロスのような組み方の名前は配置だけからは判別できない
+    ため、結果(シングル/ダブル/トリプル、ミニ)で表示する。
+    """
+    if move.placement is None or move.piece != "T":
+        return None
+    spin = move.placement.get("spin", "none")
+    if spin == "none":
+        return None
+    placed = board.clone()
+    for r, c in move.landing_cells:
+        if 0 <= r < placed.height and 0 <= c < placed.width:
+            placed.grid[r][c] = "T"
+    _cleared_board, lines = placed.clear_lines()
+    names = {1: "Tスピンシングル(TSS)", 2: "Tスピンダブル(TSD)", 3: "Tスピントリプル(TST)"}
+    if spin == "mini":
+        return f"狙い: Tスピンミニ({lines}ライン)"
+    return "狙い: " + names.get(lines, f"Tスピン({lines}ライン)")
+
+
 def _plan_steps_on_screen(board: BoardState, move: ColdClearMove) -> list[PlanStep]:
     """読み筋(2手目以降)のうち、今の画面座標のまま表示できる手を返す。
 
@@ -2963,7 +2987,7 @@ class AssistWorker(QtCore.QThread):
                 label=(
                     f"開幕テンプレ\n{self._opener.template.name_ja}\n{self._opener.form.section.split(' > ')[-1]}"
                     if self._opener is not None
-                    else None
+                    else _tspin_label(recognition.board, best)
                 ),
             )
             if draw_data != self._last_valid_draw_data:

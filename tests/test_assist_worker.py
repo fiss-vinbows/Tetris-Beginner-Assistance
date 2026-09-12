@@ -1679,6 +1679,14 @@ class TestAssistWorkerTickOnce(unittest.TestCase):
         worker = AssistWorker(_make_calibration(), self.cold_clear, debug_log_path=None, opener_enabled=True)
         received: list[object] = []
         worker.draw_data_ready.connect(received.append)
+        # これらのテストは「はちみつ砲」の図を前提に書いているので、テンプレの
+        # 優先順(迷走砲が先頭)に左右されないよう、はちみつ砲だけに絞る。
+        from src.engine import openers
+
+        honey = next(t for t in openers.OPENER_TEMPLATES if t.name_ja == "はちみつ砲")
+        patcher = patch.object(openers, "OPENER_TEMPLATES", (honey,))
+        patcher.start()
+        self.addCleanup(patcher.stop)
         return worker, received
 
     def test_opener_overrides_the_ai_suggestion_at_game_start(self) -> None:
