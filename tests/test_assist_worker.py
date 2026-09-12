@@ -1674,6 +1674,75 @@ class TestAssistWorkerTickOnce(unittest.TestCase):
         shown = [d for d in self.received_draw_data if d is not None]
         self.assertEqual(shown[-1].plan_steps[0].cells, [(19, 8), (19, 9), (18, 8), (18, 9)], "読み筋が途中で変わっている")
 
+    # ---- 開幕テンプレ ----
+    def _opener_worker(self):
+        worker = AssistWorker(_make_calibration(), self.cold_clear, debug_log_path=None, opener_enabled=True)
+        received: list[object] = []
+        worker.draw_data_ready.connect(received.append)
+        return worker, received
+
+    def test_opener_overrides_the_ai_suggestion_at_game_start(self) -> None:
+        # 盤面・HOLDが空で1巡目のミノ順が分かる手番では、組めるテンプレの
+        # 手をAIの提案の代わりに出し、テンプレ名をラベルに載せること。
+        worker, received = self._opener_worker()
+        self.cold_clear.poll_suggestion.return_value = _move("I", landing_cells=[(19, 5), (19, 6), (19, 7), (19, 8)])
+        # I L S T Z O J → はちみつ砲(左)が組める(Iを最下段左に置く)
+        with patch("src.app.time.monotonic", return_value=1000.0):
+            with patch("src.app.recognize", return_value=_recognition(current_piece="I", next_queue=("L", "S", "T", "Z", "O"))):
+                worker._tick_once(capture=MagicMock())
+        self.assertIsNotNone(worker._opener)
+        self.assertEqual(worker._opener.template.name_ja, "はちみつ砲")
+        shown = received[-1]
+        self.assertEqual(shown.piece, "I")
+        self.assertEqual(sorted(shown.landing_cells), [(19, 0), (19, 1), (19, 2), (19, 3)])
+        self.assertIn("はちみつ砲", shown.label)
+        self.assertTrue(shown.plan_steps, "テンプレの残り手順が読み筋として出ていない")
+
+    def test_opener_advances_when_the_piece_is_placed_as_shown(self) -> None:
+        worker, received = self._opener_worker()
+        self.cold_clear.poll_suggestion.return_value = _move("I")
+        with patch("src.app.time.monotonic", return_value=1000.0):
+            with patch("src.app.recognize", return_value=_recognition(current_piece="I", next_queue=("L", "S", "T", "Z", "O"))):
+                worker._tick_once(capture=MagicMock())
+                worker._tick_once(capture=MagicMock())
+        first_cells = tuple(worker._opener.steps[0].cells)
+        # 提示どおりIを置いた: NEXTが進み、盤面にIの4マス。
+        with patch("src.app.time.monotonic", return_value=1000.5):
+            with patch(
+                "src.app.recognize",
+                return_value=_recognition(current_piece=None, filled_cells=first_cells, next_queue=("S", "T", "Z", "O", "J")),
+            ):
+                worker._tick_once(capture=MagicMock())
+        self.assertIsNotNone(worker._opener, "手順どおりなのにテンプレが中断された")
+        self.assertEqual(worker._opener.index, 1)
+        self.assertEqual(received[-1].piece, worker._opener.steps[1].piece)
+
+    def test_opener_is_abandoned_when_the_piece_is_placed_elsewhere(self) -> None:
+        worker, received = self._opener_worker()
+        self.cold_clear.poll_suggestion.return_value = _move("L", landing_cells=[(19, 0), (19, 1), (19, 2), (18, 2)])
+        with patch("src.app.time.monotonic", return_value=1000.0):
+            with patch("src.app.recognize", return_value=_recognition(current_piece="I", next_queue=("L", "S", "T", "Z", "O"))):
+                worker._tick_once(capture=MagicMock())
+                worker._tick_once(capture=MagicMock())
+        with patch("src.app.time.monotonic", return_value=1000.5):
+            with patch(
+                "src.app.recognize",
+                return_value=_recognition(
+                    current_piece=None, filled_cells=((19, 6), (19, 7), (19, 8), (19, 9)), next_queue=("S", "T", "Z", "O", "J")
+                ),
+            ):
+                worker._tick_once(capture=MagicMock())
+        self.assertIsNone(worker._opener, "手順と違う置き方なのにテンプレが続いている")
+        shown = [d for d in received if d is not None]
+        self.assertEqual(shown[-1].piece, "L", "AIの提案に戻っていない")
+        self.assertIsNone(shown[-1].label)
+
+    def test_opener_is_not_started_when_disabled(self) -> None:
+        self.cold_clear.poll_suggestion.return_value = _move("I")
+        with patch("src.app.recognize", return_value=_recognition(current_piece="I", next_queue=("L", "S", "T", "Z", "O"))):
+            self.worker._tick_once(capture=MagicMock())
+        self.assertIsNone(self.worker._opener)
+
     def test_recognition_failure_does_not_clear_the_suggestion(self) -> None:
         # 仕様「提示した配置は、実際にミノを置くまで変更しない」の回帰テスト。
         # 認識できないことは「置いた」ことを意味しないので、提案を消す理由に

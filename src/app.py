@@ -55,6 +55,7 @@ from src.capture.calibrate import CONFIG_PATH, CalibrationResult, load_calibrati
 from src.capture.screen_capture import CaptureRegion, ScreenCapture
 from src.engine.board_state import BoardState
 from src.engine.cold_clear_client import ColdClearClient, ColdClearMove
+from src.engine.openers import OpenerStep, OpenerTemplate, choose_opener
 from src.overlay.renderer import (
     PLAN_DOT_ALPHA,
     PLAN_DOT_RADIUS_RATIO,
@@ -1269,6 +1270,22 @@ def _draw_suggestion_on_bgr_frame(
             text_x = calibration.board_origin_x - region_origin_x + col * calibration.cell_size + 2
             text_y = calibration.board_origin_y - region_origin_y + row * calibration.cell_size + calibration.cell_size - 4
             cv2.putText(bgr_frame, str(index), (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+    # ラベル(開幕テンプレ名など)。cv2の内蔵フォントは日本語を描けないので、
+    # 括弧内の英語名だけをHOLD欄の下に焼き込む。
+    if draw_data.label:
+        ascii_lines = [line for line in draw_data.label.splitlines() if line.isascii()]
+        hx, hy, hw, hh = calibration.hold_rect
+        for i, line in enumerate(ascii_lines):
+            cv2.putText(
+                bgr_frame,
+                line.strip("()"),
+                (hx - region_origin_x, hy - region_origin_y + hh + 20 + i * 18),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
 
 
 def _draw_next_debug_dots_on_bgr_frame(
@@ -1591,6 +1608,52 @@ class _ColdClearContinuation:
     reserve: str
 
 
+@dataclass
+class _OpenerRun:
+    """進行中の開幕テンプレ(src.engine.openers参照)。"""
+
+    template: OpenerTemplate
+    steps: list[OpenerStep]
+    index: int = 0  # 次に置く手
+
+    def current_step(self) -> OpenerStep | None:
+        return self.steps[self.index] if self.index < len(self.steps) else None
+
+    def expected_cells_after(self, count: int) -> set[tuple[int, int]]:
+        cells: set[tuple[int, int]] = set()
+        for step in self.steps[:count]:
+            cells.update(step.cells)
+        return cells
+
+    def as_move(self, current_piece: str | None) -> ColdClearMove:
+        """今の手をCold Clear 2の提案と同じ形にして返す(読み筋は残りの手順)。"""
+        step = self.steps[self.index]
+        plan = [(s.piece, list(s.cells)) for s in self.steps[self.index + 1 :]]
+        return ColdClearMove(
+            use_hold=step.use_hold,
+            piece=step.piece,
+            landing_cells=list(step.cells),
+            nodes=0,
+            nps=0.0,
+            placement=None,
+            plan=plan,
+        )
+
+
+_ALL_PIECE_TYPES = frozenset("IOTSZJL")
+
+
+def _first_bag_sequence(current_piece: str | None, next_queue: tuple[str, ...]) -> list[str] | None:
+    """対局開始時の1巡目7ミノの順(操作ミノ+NEXT5+残り1つ)を求める。求まらなければNone。"""
+    if current_piece is None or len(next_queue) != 5:
+        return None
+    seen = [current_piece, *next_queue]
+    if len(set(seen)) != 6 or not set(seen) <= _ALL_PIECE_TYPES:
+        return None
+    (missing,) = _ALL_PIECE_TYPES - set(seen)
+    return [*seen, missing]
+
+
 def _board_occupancy(board: BoardState) -> tuple[tuple[bool, ...], ...]:
     """占有だけを比較するための盤面キー(種類は無視)。"""
     return tuple(tuple(cell is not None for cell in row) for row in board.grid)
@@ -1783,10 +1846,13 @@ class AssistWorker(QtCore.QThread):
         cold_clear: ColdClearClient,
         debug_log_path: Path | None,
         record_video: bool = False,
+        opener_enabled: bool = False,
     ) -> None:
         super().__init__()
         self.calibration = calibration
         self.cold_clear = cold_clear
+        # 対局開始時に開幕テンプレ(src.engine.openers)を提示するか。
+        self._opener_enabled = opener_enabled
         self._debug_log_path = debug_log_path
         self._debug_log_file = None
         # 画面録画(暫定機能)。有効な場合、支援モード中キャリブレーション
@@ -1940,6 +2006,8 @@ class AssistWorker(QtCore.QThread):
         # 要求を見送ったtickで固定(HOLD変化なしのnext_advanced)があったか。
         # 再試行のtickで探索木の引き継ぎ(play)を判断するために持ち越す。
         self._cc_pending_lock = False
+        # 進行中の開幕テンプレ(_OpenerRun参照)。Noneなら通常どおりAIの提案を出す。
+        self._opener: _OpenerRun | None = None
 
     def stop(self) -> None:
         self._running = False
@@ -2619,6 +2687,7 @@ class AssistWorker(QtCore.QThread):
             # 提示済み配置(_committed_placement)は下で解除するので、その前に控える。
             locked_now = (next_advanced and not just_held) or self._cc_pending_lock
             self._cc_pending_lock = False
+            self._update_opener(recognition, locked_now=locked_now, garbage_rise=garbage_rise)
             committed_before_lock = self._committed_placement
             committed_tbp_before_lock = self._committed_placement_tbp
             if next_advanced and not just_held:
@@ -2792,6 +2861,11 @@ class AssistWorker(QtCore.QThread):
                     self.msleep(self.IDLE_SLEEP_MS)
                     return
 
+        if self._opener is not None and self._opener.current_step() is not None:
+            # 開幕テンプレ進行中はAIの提案の代わりにテンプレの手を出す。
+            # 以降の検査(実行可能なミノか、物理的に成立するか)は同じように通す。
+            best = self._opener.as_move(self._last_current_piece)
+
         if best is not None and best.piece not in _available_pieces(
             self._last_current_piece, recognition.hold_piece, recognition.next_queue
         ):
@@ -2836,6 +2910,11 @@ class AssistWorker(QtCore.QThread):
                 landing_cells=best.landing_cells,
                 use_hold=best.use_hold,
                 plan_steps=_plan_steps_on_screen(recognition.board, best),
+                label=(
+                    f"開幕テンプレ\n{self._opener.template.name_ja}\n({self._opener.template.name_en})"
+                    if self._opener is not None
+                    else None
+                ),
             )
             if draw_data != self._last_valid_draw_data:
                 self._last_valid_draw_data = draw_data
@@ -3277,6 +3356,63 @@ class AssistWorker(QtCore.QThread):
         # ため生の値をそのまま使う。
         return recognition
 
+    def _update_opener(self, recognition: RecognitionResult, *, locked_now: bool, garbage_rise: int) -> None:
+        """開幕テンプレの開始判定と、固定ごとの進行確認。
+
+        開始: 盤面が空・HOLDが空・操作ミノとNEXT5枠が読めている手番で、
+        1巡目のミノ順(7つ)に対して組めるテンプレがあれば始める。
+        進行: 固定のたびに「ここまでの手順を置いた盤面」と認識した盤面の
+        占有を比べ、一致すれば次の手へ、違えば(別の場所に置いた・おじゃま等)
+        テンプレをやめて通常のAI提案に戻る。全手を置き終えたら完了。
+        """
+        opener = self._opener
+        if opener is not None:
+            if garbage_rise:
+                self._log_opener("中断(おじゃま)")
+                self._opener = None
+                return
+            if not locked_now:
+                return
+            actual = {
+                (r, c)
+                for r, row in enumerate(recognition.board.grid)
+                for c, cell in enumerate(row)
+                if cell is not None
+            }
+            if actual != opener.expected_cells_after(opener.index + 1):
+                self._log_opener(f"中断(手順と異なる盤面) 期待={sorted(opener.expected_cells_after(opener.index + 1))} 実際={sorted(actual)}")
+                self._opener = None
+                return
+            opener.index += 1
+            if opener.current_step() is None:
+                self._log_opener("完成")
+                self._opener = None
+            return
+
+        if not self._opener_enabled:
+            return
+        board_empty = all(cell is None for row in recognition.board.grid for cell in row)
+        if not (board_empty and recognition.hold_known and recognition.hold_piece is None):
+            return
+        sequence = _first_bag_sequence(self._last_current_piece, recognition.next_queue)
+        if sequence is None:
+            return
+        chosen = choose_opener(sequence)
+        if chosen is None:
+            self._log_opener(f"該当なし ミノ順={''.join(sequence)}")
+            return
+        template, steps = chosen
+        self._opener = _OpenerRun(template=template, steps=steps)
+        self._log_opener(
+            f"開始 {template.name_ja} ミノ順={''.join(sequence)} 手順="
+            + " ".join(f"{s.piece}{'(H)' if s.use_hold else ''}" for s in steps)
+        )
+
+    def _log_opener(self, text: str) -> None:
+        if self._debug_log_file is not None:
+            self._debug_log_file.write(f"----- 開幕テンプレ: {text} -----\n")
+            self._debug_log_file.flush()
+
     def _request_thinking(
         self,
         recognition: RecognitionResult,
@@ -3538,6 +3674,15 @@ class MainWindow(QtWidgets.QWidget):
         )
         layout.addWidget(self.record_video_checkbox)
 
+        self.opener_checkbox = QtWidgets.QCheckBox("開幕テンプレを提示する(はちみつ砲・迷走砲・山岳積み2号・オリーブ積み)")
+        self.opener_checkbox.setChecked(True)
+        self.opener_checkbox.setToolTip(
+            "対局開始時(盤面とHOLDが空)のミノ順から組める開幕テンプレを選び、"
+            "1巡目の手順をAIの提案の代わりに表示します。テンプレ名は"
+            "HOLD欄の下に表示します。提示と違う場所に置くと通常のAI提案に戻ります。"
+        )
+        layout.addWidget(self.opener_checkbox)
+
         hint = QtWidgets.QLabel(
             "支援モード中は画面右上の「終了」ボタンで終了できます"
             "（ゲーム側のEscキー操作と競合しないよう、Escキーは使いません）"
@@ -3615,7 +3760,13 @@ class MainWindow(QtWidgets.QWidget):
 
         debug_log_path = DEBUG_LOG_PATH if self.debug_log_checkbox.isChecked() else None
         record_video = self.record_video_checkbox.isChecked()
-        self.worker = AssistWorker(self.calibration, self.cold_clear, debug_log_path, record_video=record_video)
+        self.worker = AssistWorker(
+            self.calibration,
+            self.cold_clear,
+            debug_log_path,
+            record_video=record_video,
+            opener_enabled=self.opener_checkbox.isChecked(),
+        )
         # 別スレッド(worker)からのシグナルなので、必ずメインスレッドの
         # イベントループ経由で_on_draw_data_readyが呼ばれるよう明示する
         # （AutoConnectionでも通常は自動的にQueuedConnectionになるはずだが、

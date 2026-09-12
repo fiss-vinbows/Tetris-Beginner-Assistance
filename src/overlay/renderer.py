@@ -64,6 +64,8 @@ class OverlayDrawData:
     # 読み筋(2手目以降)。先頭が2手目。ライン消去で画面座標がずれる手より
     # 先は含めない(app._plan_steps_on_screen参照)。
     plan_steps: list[PlanStep] | None = None
+    # 盤面の横(HOLD欄の下)に出す短い文字。開幕テンプレの名前など。
+    label: str | None = None
 
 
 def _piece_qcolor(piece: str, alpha: int) -> QtGui.QColor:
@@ -90,6 +92,33 @@ def render_overlay(
     # ため、ホールド欄側の追加表示は不要と判断された。
     _render_landing_cells(painter, layout, data)
     _render_plan_steps(painter, layout, data)
+    _render_label(painter, layout, data)
+
+
+def _render_label(painter: QtGui.QPainter, layout: BoardLayout, data: OverlayDrawData) -> None:
+    """HOLD欄の下の空きに、目指す積み方の名前などを表示する。"""
+    if not data.label:
+        return
+    x, y, w, h = layout.hold_rect
+    font = painter.font()
+    font.setPixelSize(max(10, int(layout.cell_size * 0.5)))
+    font.setBold(True)
+    painter.setFont(font)
+    rect = QtCore.QRectF(x - layout.cell_size, y + h + layout.cell_size * 0.5, w + layout.cell_size * 2, layout.cell_size * 4)
+    # 背景の上でも読めるよう、黒い縁取りの上に白文字を重ねる。
+    for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        painter.setPen(QtGui.QPen(QtGui.QColor(0, 0, 0, 220)))
+        painter.drawText(
+            rect.translated(dx, dy),
+            QtCore.Qt.AlignmentFlag.AlignHCenter | QtCore.Qt.AlignmentFlag.AlignTop | QtCore.Qt.TextFlag.TextWordWrap,
+            data.label,
+        )
+    painter.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255, 255)))
+    painter.drawText(
+        rect,
+        QtCore.Qt.AlignmentFlag.AlignHCenter | QtCore.Qt.AlignmentFlag.AlignTop | QtCore.Qt.TextFlag.TextWordWrap,
+        data.label,
+    )
 
 
 def _render_plan_steps(
