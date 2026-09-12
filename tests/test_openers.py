@@ -107,6 +107,27 @@ class TestPlanForm(unittest.TestCase):
         # TSTで3行消える。
         self.assertEqual(len(board) + 4 - len(board_after), 30)
 
+    def test_stray_cannon_connects_first_bag_to_second_bag(self) -> None:
+        # 【2026-09-12実機】迷走砲で「次の図が見つからず終了」になった。
+        # 原因は(1)Zをホールドに残す6ミノの1巡目形を選んでいたが、2巡目の
+        # 図はZも置く形を前提にしていた (2)2巡目の最後の手(Tスピン)は
+        # ホールドしたTを未知の次ミノと入れ替えて打つため、既知の7ミノだけ
+        # では手順が組めなかった (3)LはZの下へ回転入れする形だった。
+        template = _template("迷走砲")
+        chosen = choose_opener(list("LOJZITS"))
+        self.assertIsNotNone(chosen)
+        tpl, form, steps = chosen
+        self.assertEqual(tpl.name_ja, "迷走砲")
+        self.assertEqual(len(steps), 7, "Zも置く7ミノの形を選ぶ")
+        board, hold, _rest = _run_steps(steps, "LOJZITS", None, set())
+        self.assertIsNone(hold)
+        second = choose_form(template, board, list("JTSIOZL"), hold)
+        self.assertIsNotNone(second, "2巡目の図が見つからない")
+        form2, steps2 = second
+        self.assertIn("2巡目", form2.section)
+        self.assertTrue(steps2[-1].spin, "最後の手がTスピン")
+        self.assertTrue(steps2[-1].use_hold, "TはホールドからTスピンに使う")
+
     def test_spin_item_is_placed_last(self) -> None:
         form = parse_form("--z-------\n-zz----o--\n-zU----oU-\nccUU--ccUc\nccUcccccc-")
         # 図の解釈: Uは1つのT(4マス)でなければならないので、この図は解釈不能

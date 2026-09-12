@@ -158,25 +158,54 @@ def _can_hard_drop(placed: set[tuple[int, int]], cells: Cells) -> bool:
     return any(r + 1 >= BOARD_ROWS or (r + 1, c) in placed for r, c in cells)
 
 
+def _can_rest(placed: set[tuple[int, int]], cells: Cells) -> bool:
+    """cellsが空いていて、床か既存ブロックの上に載るか(入れ方は問わない)。"""
+    if any(cell in placed for cell in cells):
+        return False
+    return any(r + 1 >= BOARD_ROWS or (r + 1, c) in placed for r, c in cells)
+
+
 def plan_form(
-    form: OpenerForm, sequence: list[str], hold: str | None, placed: set[tuple[int, int]] | None = None
+    form: OpenerForm,
+    sequence: list[str],
+    hold: str | None,
+    placed: set[tuple[int, int]] | None = None,
+    allow_tuck: bool | None = None,
 ) -> list[OpenerStep] | None:
     """実際のミノ順(先頭が操作中のミノ)とホールドに対して、図を組む手順を返す。
 
     各手番で「操作中のミノを置く」か「ホールドして、ホールドにあったミノ
     (空なら次のミノ)を置く」のどちらかを選ぶ。Tスピンの手('U')は他のミノを
     すべて置いた後にだけ置ける。図のミノをすべて置ける手順が無ければNone。
+
+    allow_tuck: 張り出しの下へ回転入れ・横入れするミノを許すか。Noneなら、
+    まずハードドロップだけで組める手順を探し、無ければ許して探し直す。
+    テトリス堂の図には「Lは左回転で後入れできる」のように、ハードドロップ
+    では入らない置き方を前提にした形があるため(迷走砲の2巡目など)。
     """
+    if allow_tuck is None:
+        strict = plan_form(form, sequence, hold, placed, allow_tuck=False)
+        if strict is not None:
+            return strict
+        return plan_form(form, sequence, hold, placed, allow_tuck=True)
+
     placed_cells = set(placed) if placed is not None else set(form.existing)
     items = form.items
     spin_count = sum(1 for it in items if it.spin)
+    # 分かっているミノ順の先に「種類不明のミノ」を2つ足す。図の最後の手が
+    # ホールドしていたミノなら、次に来るミノが何であれホールドと入れ替えて
+    # 置けるため(例: TをホールドしておいてTスピンを最後に打つ)、既知の
+    # ミノ順だけでは手順が組めない形を救う。不明のミノ自体は置けない。
+    sequence = [*sequence, "?", "?"]
 
     def placeable(item: FormItem, current_placed: set[tuple[int, int]], done: frozenset[int]) -> bool:
         if item.spin:
             if len(done) < len(items) - spin_count:
                 return False
             return all(cell not in current_placed for cell in item.cells)
-        return _can_hard_drop(current_placed, item.cells)
+        if _can_hard_drop(current_placed, item.cells):
+            return True
+        return allow_tuck and _can_rest(current_placed, item.cells)
 
     def candidates(piece: str, current_placed: set[tuple[int, int]], done: frozenset[int]) -> list[int]:
         return [
@@ -239,7 +268,10 @@ def choose_form(
 ) -> tuple[OpenerForm, list[OpenerStep]] | None:
     """今の盤面(おじゃまを除く占有)に既存ブロックが一致し、ミノ順で組める図を返す。"""
     target = frozenset(board_cells)
-    for form in template.forms:
+    # 置くミノが多い図(ホールドに残さず7つ置く形)を優先する。迷走砲のように
+    # 「Zをホールドしておく形」と「Zも置く形」の両方が載っている場合、
+    # 2巡目以降の図は後者を前提にしているため。
+    for form in sorted(template.forms, key=lambda f: -len(f.items)):
         if form.existing != target:
             continue
         steps = plan_form(form, sequence, hold)
