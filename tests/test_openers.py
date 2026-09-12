@@ -158,6 +158,26 @@ class TestPlanForm(unittest.TestCase):
         form = next(f for f in template.forms if f.section == "理想形 > 2巡目" and "L" in f.tuck_pieces)
         self.assertIn("L", form.tuck_pieces)
 
+    def test_cannon_is_built_even_when_the_top_pieces_cannot_follow_the_figure(self) -> None:
+        # 【2026-09-12・利用者の方針】2巡目の図どおりに全部置けないミノ順でも、
+        # Tスピンで消える行に掛かるミノだけ置いてTST/TSDの形までは組む
+        # (上に積むパフェ用のミノは省略してよい)。
+        template = _template("はちみつ砲")
+        tpl, form, steps = choose_opener(list("TIJSLZO"))
+        board, hold, _rest = _run_steps(steps, "TIJSLZO", None, set())
+        second = choose_form(template, board, list("IOTSLJZ"), hold)
+        self.assertIsNotNone(second, "砲だけの手順も見つからない")
+        form2, steps2 = second
+        self.assertLess(len(steps2), len(form2.items), "全部置く手順は組めないはず")
+        placed = {cell for st in steps2 for cell in st.cells}
+        required_cells = {cell for i in form2.required for cell in form2.items[i].cells}
+        self.assertTrue(required_cells <= placed, "砲に必要なミノが省略されている")
+        board2, hold2, _rest = _run_steps(steps2, "IOTSLJZ", hold, board)
+        self.assertEqual(hold2, "T")
+        tst = choose_form(template, board2, list("JZOISL"), hold2)
+        self.assertIsNotNone(tst, "砲の形が出来たのにTSTの図が選ばれない")
+        self.assertTrue(tst[1][0].spin)
+
     def test_spin_item_is_placed_last(self) -> None:
         form = parse_form("--z-------\n-zz----o--\n-zU----oU-\nccUU--ccUc\nccUcccccc-")
         # 図の解釈: Uは1つのT(4マス)でなければならないので、この図は解釈不能

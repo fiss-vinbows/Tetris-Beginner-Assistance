@@ -50,6 +50,16 @@ class OpenerForm:
     text: str
     # ハードドロップで入らなくても回転入れで置けるとページに明記されているミノ種。
     tuck_pieces: frozenset[str] = frozenset()
+    # Tスピン(砲)の形を作るのに必要なミノの番号(itemsの添字)。Noneなら全部。
+    # 図どおり全部は置けないミノ順でも、ここに含まれるミノだけ置ければ
+    # TST/TSDは打てる(パフェは諦める)。
+    required: frozenset[int] | None = None
+
+    def is_spin_only(self) -> bool:
+        return all(item.spin for item in self.items)
+
+    def spin_rows(self) -> frozenset[int]:
+        return frozenset(r for item in self.items if item.spin for r, _c in item.cells)
 
 
 # ページの注記で「後から回転入れできる」とされているミノ。
@@ -138,6 +148,42 @@ def mirror_form_text(text: str) -> str:
     return "\n".join(line[::-1].translate(table) for line in text.splitlines())
 
 
+def _with_required(form: OpenerForm, spin_rows: frozenset[int]) -> OpenerForm:
+    """Tスピンで消える行に掛かるミノを「必要なミノ」として印を付けた図を返す。"""
+    required = frozenset(i for i, item in enumerate(form.items) if any(r in spin_rows for r, _c in item.cells))
+    if not required or len(required) == len(form.items):
+        return form
+    return OpenerForm(form.section, form.existing, form.items, form.text, form.tuck_pieces, required)
+
+
+def _mark_required_items(forms: list[OpenerForm]) -> list[OpenerForm]:
+    """【2026-09-12・利用者の方針】2巡目の図どおりに全部置けないミノ順でも、
+    TST/TSDの形(砲)までは組み切る。Tスピンで消える行に掛かるミノだけを
+    必須にし、その上に積むミノ(パフェ用)は置ければ置く扱いにする。
+
+    Tスピンが同じ図に描かれている場合はその行から、はちみつ砲のように
+    Tスピンだけ別の図(U)になっている場合は同じセクションのその図から、
+    消える行を求める。
+    """
+    result: list[OpenerForm] = []
+    spin_only = [f for f in forms if f.is_spin_only()]
+    for form in forms:
+        if form.is_spin_only():
+            result.append(form)
+            continue
+        if any(item.spin for item in form.items):
+            result.append(_with_required(form, form.spin_rows()))
+            continue
+        # 同じセクションの、この図の続きにあたるTスピン図(既存ブロックが
+        # この図の完成形に含まれるもの)を探す。
+        completed = set(form.existing) | {cell for item in form.items for cell in item.cells}
+        partner = next(
+            (u for u in spin_only if u.section == form.section and u.existing <= completed), None
+        )
+        result.append(_with_required(form, partner.spin_rows()) if partner is not None else form)
+    return result
+
+
 def _build_templates() -> tuple[OpenerTemplate, ...]:
     templates = []
     for name_ja, name_en, url, source_forms in OPENER_SOURCE_FORMS:
@@ -153,7 +199,7 @@ def _build_templates() -> tuple[OpenerTemplate, ...]:
                 form = parse_form(variant, section, pieces)
                 if form is not None:
                     forms.append(form)
-        templates.append(OpenerTemplate(name_ja, name_en, url, tuple(forms)))
+        templates.append(OpenerTemplate(name_ja, name_en, url, tuple(_mark_required_items(forms))))
     return tuple(templates)
 
 
@@ -214,9 +260,20 @@ def plan_form(
     """
     if allow_tuck is None:
         strict = plan_form(form, sequence, hold, placed, allow_tuck=False)
-        if strict is not None or not form.tuck_pieces:
+        if strict is None and form.tuck_pieces:
+            strict = plan_form(form, sequence, hold, placed, allow_tuck=True)
+        if strict is not None or form.required is None:
             return strict
-        return plan_form(form, sequence, hold, placed, allow_tuck=True)
+        # 図どおりに全部は置けない。Tスピンに必要なミノだけの図で探し直す
+        # (パフェは諦めて砲の形までは組む)。
+        reduced = OpenerForm(
+            form.section,
+            form.existing,
+            tuple(item for i, item in enumerate(form.items) if i in form.required),
+            form.text,
+            form.tuck_pieces,
+        )
+        return plan_form(reduced, sequence, hold, placed)
 
     placed_cells = set(placed) if placed is not None else set(form.existing)
     items = form.items
@@ -309,7 +366,15 @@ def choose_form(
     # 「Zをホールドしておく形」と「Zも置く形」の両方が載っている場合、
     # 2巡目以降の図は後者を前提にしているため。
     for form in sorted(template.forms, key=lambda f: -len(f.items)):
-        if not form.existing <= target or len(target - form.existing) >= 4:
+        if form.is_spin_only():
+            # Tスピンだけの図: 消える行の既存ブロックが揃い、スロットが空いて
+            # いれば打てる(上に積むミノが図と違っていても構わない)。
+            rows = form.spin_rows()
+            needed = {cell for cell in form.existing if cell[0] in rows}
+            slot = {cell for item in form.items for cell in item.cells}
+            if not needed <= target or slot & target:
+                continue
+        elif not form.existing <= target or len(target - form.existing) >= 4:
             continue
         steps = plan_form(form, sequence, hold)
         if steps is not None:
