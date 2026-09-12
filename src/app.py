@@ -1663,6 +1663,19 @@ def _non_garbage_cells(board: BoardState) -> set[tuple[int, int]]:
     }
 
 
+def _garbage_row_count(board: BoardState) -> int:
+    """盤面の下から続くおじゃま行の数(穴を除きGARBAGEで埋まった行)。"""
+    count = 0
+    for r in range(board.height - 1, -1, -1):
+        row = board.grid[r]
+        garbage = sum(1 for cell in row if cell == "GARBAGE")
+        if garbage >= board.width - 2 and all(cell in (None, "GARBAGE") for cell in row):
+            count += 1
+        else:
+            break
+    return count
+
+
 def _board_occupancy(board: BoardState) -> tuple[tuple[bool, ...], ...]:
     """占有だけを比較するための盤面キー(種類は無視)。"""
     return tuple(tuple(cell is not None for cell in row) for row in board.grid)
@@ -3444,8 +3457,13 @@ class AssistWorker(QtCore.QThread):
         if sequence is None:
             return
         hold = recognition.hold_piece
+        # 【2026-09-12・利用者の指示】おじゃまが来ていても図は続ける。図は
+        # 盤面の最下段から描かれているので、おじゃま行の数だけ下へずらした
+        # 座標で既存ブロックを照合し、手順は上へ戻す。
+        garbage_rows = _garbage_row_count(recognition.board)
+        matched_cells = {(r + garbage_rows, c) for r, c in board_cells}
         if self._opener_continuing is not None:
-            chosen_form = choose_form(self._opener_continuing, board_cells, sequence, hold)
+            chosen_form = choose_form(self._opener_continuing, matched_cells, sequence, hold)
             if chosen_form is None:
                 self._log_opener(
                     f"次の図が見つからず終了 {self._opener_continuing.name_ja} ミノ順={''.join(sequence)} hold={hold}"
@@ -3457,13 +3475,22 @@ class AssistWorker(QtCore.QThread):
         else:
             if board_cells or hold is not None:
                 return
-            chosen = choose_opener(sequence, hold, board_cells)
+            chosen = choose_opener(sequence, hold, matched_cells)
             if chosen is None:
                 if self._opener_declined_sequence != sequence:
                     self._opener_declined_sequence = sequence
                     self._log_opener(f"該当なし ミノ順={''.join(sequence)}")
                 return
             template, form, steps = chosen
+        if garbage_rows:
+            steps = [
+                OpenerStep(st.piece, tuple((r - garbage_rows, c) for r, c in st.cells), st.use_hold, st.spin)
+                for st in steps
+            ]
+            if any(r < 0 for st in steps for r, _c in st.cells):
+                self._log_opener(f"おじゃま{garbage_rows}行で図が盤面上端を超えるため始めない")
+                self._opener_continuing = None
+                return
         self._opener = _OpenerRun(template=template, form=form, steps=steps, board=set(board_cells))
         self._opener_continuing = None
         # AIの提案を先に出していた場合でも、この手番からテンプレの手に切り替える。

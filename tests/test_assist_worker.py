@@ -1848,6 +1848,32 @@ class TestAssistWorkerTickOnce(unittest.TestCase):
         self.assertIn("2巡目", shown.label)
         self.assertEqual(shown.piece, worker._opener.steps[0].piece)
 
+    def test_next_form_is_found_even_with_garbage_rows_under_the_stack(self) -> None:
+        # 【2026-09-12・利用者の指示】TST/TSDまでは妨害にかかわらず積む。
+        # おじゃま行の上に載った1巡目の形からでも、2巡目の図を見つけること。
+        from src.engine.openers import apply_step, choose_opener
+
+        worker, received = self._opener_worker()
+        tpl, form, steps = choose_opener(list("ILSTZOJ"))
+        board: set = set()
+        for step in steps:
+            board = apply_step(board, step.cells)
+        risen = {(r - 2, c) for r, c in board}  # おじゃま2行ぶん上へ
+        worker._opener_continuing = tpl
+        rec = _recognition(current_piece="T", hold_piece="J", filled_cells=tuple(risen), next_queue=("O", "S", "Z", "I", "J"))
+        for r in (18, 19):
+            for c in range(10):
+                if c != 3:
+                    rec.board.grid[r][c] = "GARBAGE"
+        self.cold_clear.poll_suggestion.return_value = _move("T", landing_cells=[(9, 0), (9, 1), (9, 2), (8, 1)])
+        with patch("src.app.time.monotonic", return_value=1000.0):
+            with patch("src.app.recognize", return_value=rec):
+                worker._tick_once(capture=MagicMock())
+        self.assertIsNotNone(worker._opener, "おじゃまがあると2巡目の図が見つからない")
+        self.assertIn("2巡目", worker._opener.form.section)
+        # 手順の座標はおじゃま2行ぶん上にずれている(最下段のマスは行17以下)。
+        self.assertTrue(all(r <= 17 for st in worker._opener.steps for r, _c in st.cells))
+
     def test_opener_is_not_started_when_disabled(self) -> None:
         self.cold_clear.poll_suggestion.return_value = _move("I")
         with patch("src.app.recognize", return_value=_recognition(current_piece="I", next_queue=("L", "S", "T", "Z", "O"))):
