@@ -71,7 +71,7 @@ cargo build --release
 
 ```bash
 venv\Scripts\pip install pyinstaller
-venv\Scripts\python.exe toolsuild_exe.py
+venv\Scripts\python.exe tools\build_exe.py
 ```
 
 ### ソースから起動(開発時)
