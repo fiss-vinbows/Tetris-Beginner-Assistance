@@ -67,6 +67,7 @@ from src.engine.openers import (
     known_sequence,
     shift_cells_for_clears,
 )
+from src.paths import APP_TITLE, app_root, is_frozen
 from src.overlay.renderer import (
     PLAN_DOT_ALPHA,
     PLAN_DOT_RADIUS_RATIO,
@@ -98,7 +99,7 @@ SAFETY_TIMEOUT_MS = 10 * 60 * 1000  # 10分
 
 # 認識結果デバッグログの出力先。最善手が実際の盤面と食い違って見える時、
 # AIがそのtickで何を認識していたかを突き合わせて確認するために使う。
-DEBUG_LOG_PATH = Path(__file__).resolve().parent.parent / "debug_log.txt"
+DEBUG_LOG_PATH = app_root() / "debug_log.txt"
 
 # このapp.pyモジュールが最初にimportされた（＝プロセスが起動した）時点での
 # app.py自身の最終更新時刻。モジュールレベルで一度だけ評価されるため、
@@ -112,17 +113,19 @@ DEBUG_LOG_PATH = Path(__file__).resolve().parent.parent / "debug_log.txt"
 # 繰り返すと、ログには常に「最新のタイムスタンプ」が記録されてしまい、
 # 実際には古いコードのまま動いていることを検出できないという重大な欠陥が
 # あった。モジュール読み込み時に固定することで、この矛盾を解消する。
-_APP_MODULE_LOAD_TIME = datetime.fromtimestamp(Path(__file__).stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+_APP_MODULE_LOAD_TIME = datetime.fromtimestamp(
+    Path(sys.executable if is_frozen() else __file__).stat().st_mtime
+).strftime("%Y-%m-%d %H:%M:%S")
 
 # 実際にキャリブレーション座標で切り出した生画像の保存先（直近1回分を上書き）。
 # テキストログだけでは分からない「座標そのもののズレ」を画像で直接確認するため。
-DEBUG_FRAMES_DIR = Path(__file__).resolve().parent.parent / "debug_frames"
+DEBUG_FRAMES_DIR = app_root() / "debug_frames"
 
 # 支援モード中の画面録画(暫定機能)の保存先。実機での不具合報告のたびに
 # 別途画面録画ソフトで撮り直すのが手間だという要望を受け、キャリブレーション
 # 済みの撮影範囲(盤面+HOLD+NEXT欄)をアプリ自身で録画できるようにする。
 # 支援モード開始のたびに上書きする(直近1回分のみ保持)。
-DEBUG_VIDEO_PATH = Path(__file__).resolve().parent.parent / "debug_capture.mp4"
+DEBUG_VIDEO_PATH = app_root() / "debug_capture.mp4"
 
 # 画面録画の目標フレームレート。毎tick(IDLE_SLEEP_MS=8ms間隔)書き出すと
 # ファイルサイズ・エンコード負荷が過大になるため間引く。人間が後から見て
@@ -135,7 +138,7 @@ VIDEO_RECORD_FPS = 15.0
 # 上書きされてしまい、問題の瞬間を後から確認できないという指摘を受けて
 # 導入した。「提案が変化した瞬間」だけを対象にすることで、保存件数を
 # 現実的な数に抑えつつ、揺れ・点滅の原因調査に必要な画像を確実に残す。
-DEBUG_FRAMES_HISTORY_DIR = Path(__file__).resolve().parent.parent / "debug_frames_history"
+DEBUG_FRAMES_HISTORY_DIR = app_root() / "debug_frames_history"
 FRAME_HISTORY_SIZE = 40
 
 
@@ -2103,7 +2106,7 @@ class AssistWorker(QtCore.QThread):
                     # 支援モードを終了させる。
                     import traceback
 
-                    crash_log_path = Path(__file__).resolve().parent.parent / "crash_log.txt"
+                    crash_log_path = app_root() / "crash_log.txt"
                     with open(crash_log_path, "a", encoding="utf-8") as f:
                         f.write(f"\n===== クラッシュ {datetime.now().isoformat()} =====\n")
                         traceback.print_exc(file=f)
@@ -3797,7 +3800,7 @@ class AssistWorker(QtCore.QThread):
 class MainWindow(QtWidgets.QWidget):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("テトリス初心者支援AI")
+        self.setWindowTitle(APP_TITLE)
         self.resize(360, 160)
 
         self.calibration: CalibrationResult | None = None
@@ -4062,7 +4065,7 @@ def _log_uncaught_exception(exc_type, exc_value, exc_traceback) -> None:
     """
     import traceback
 
-    crash_log_path = Path(__file__).resolve().parent.parent / "crash_log.txt"
+    crash_log_path = app_root() / "crash_log.txt"
     with open(crash_log_path, "a", encoding="utf-8") as f:
         f.write(f"\n===== クラッシュ(メインスレッド) {datetime.now().isoformat()} =====\n")
         traceback.print_exception(exc_type, exc_value, exc_traceback, file=f)

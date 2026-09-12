@@ -27,20 +27,19 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..paths import app_root, is_frozen
 from .board_state import BoardState
 
 # cargo build --release で生成される実行ファイル。README参照。
+# 実行ファイル形式(TBA.exe)では、同じフォルダに置いた cold-clear-2.exe を使う。
 COLD_CLEAR_EXE = (
-    Path(__file__).resolve().parent.parent.parent
-    / "external"
-    / "cold-clear-2"
-    / "target"
-    / "release"
-    / "cold-clear-2.exe"
+    app_root() / "cold-clear-2.exe"
+    if is_frozen()
+    else app_root() / "external" / "cold-clear-2" / "target" / "release" / "cold-clear-2.exe"
 )
 
 # 初心者向けの評価設定(ColdClearClient.__init__参照)。
-COLD_CLEAR_CONFIG = Path(__file__).resolve().parent.parent.parent / "config" / "cold_clear_beginner.json"
+COLD_CLEAR_CONFIG = app_root() / "config" / "cold_clear_beginner.json"
 
 # 後方互換用のデフォルト値（suggest_moveのみで使用）。
 THINK_SECONDS = 0.6

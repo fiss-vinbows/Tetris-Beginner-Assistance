@@ -32,7 +32,10 @@ from pathlib import Path
 
 import numpy as np
 
-TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
+from ..paths import resource_root
+
+# 実行ファイル形式ではPyInstallerが同梱データとして展開した場所から読む。
+TEMPLATES_DIR = resource_root() / "src" / "vision" / "templates"
 
 # テンプレート化する7色のミノ。GARBAGE・空マスは意図的に含めない
 # (モジュールdocstring参照)。

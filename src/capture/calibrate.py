@@ -18,7 +18,9 @@ from pathlib import Path
 
 from PyQt6 import QtCore, QtGui, QtWidgets
 
-CONFIG_PATH = Path(__file__).resolve().parent.parent.parent / "config" / "calibration.json"
+from ..paths import app_root
+
+CONFIG_PATH = app_root() / "config" / "calibration.json"
 
 BOARD_COLS = 10
 BOARD_ROWS = 20

@@ -28,3 +28,7 @@ input/
 残課題_*.txt
 現状の課題*.txt
 RELEASE_NOTES_*.md
+
+# PyInstaller のビルド成果物
+build/
+dist/

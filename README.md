@@ -1,4 +1,4 @@
-# テトリス初心者支援AI
+# TBA (Tetris Beginner Assistance)
 
 ぷよぷよテトリスの画面をリアルタイムで認識し、最善手をオーバーレイ表示する支援AI。
 
@@ -59,6 +59,22 @@ cargo build --release
 `start.bat`を実行し、「キャリブレーションを実行」から盤面・ホールド・ネクスト欄の位置を指定する（同じウィンドウ配置・解像度である限り再利用できる）。
 
 ## 起動
+
+### 実行ファイル形式(配布物)
+
+`dist/TBA/` に揃えた一式(`TBA.exe`、`_internal/`、`cold-clear-2.exe`、`config/`)を
+任意のフォルダに置き、`TBA.exe` をダブルクリックする。Python や Rust の
+インストールは不要。設定(`config/calibration.json`)・デバッグログ・録画は
+`TBA.exe` と同じフォルダに作られる。
+
+配布物の作り方(開発環境で):
+
+```bash
+venv\Scripts\pip install pyinstaller
+venv\Scripts\python.exe toolsuild_exe.py
+```
+
+### ソースから起動(開発時)
 
 ```bash
 start.bat
