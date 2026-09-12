@@ -1615,6 +1615,9 @@ class _OpenerRun:
     template: OpenerTemplate
     steps: list[OpenerStep]
     index: int = 0  # 次に置く手
+    # 固定を検知してから、盤面が手順どおりになったのをまだ確認できていない
+    # 場合の検知時刻。Noneなら確認待ちではない。
+    awaiting_since: float | None = None
 
     def current_step(self) -> OpenerStep | None:
         return self.steps[self.index] if self.index < len(self.steps) else None
@@ -1847,12 +1850,15 @@ class AssistWorker(QtCore.QThread):
         debug_log_path: Path | None,
         record_video: bool = False,
         opener_enabled: bool = False,
+        plan_depth: int = 3,
     ) -> None:
         super().__init__()
         self.calibration = calibration
         self.cold_clear = cold_clear
         # 対局開始時に開幕テンプレ(src.engine.openers)を提示するか。
         self._opener_enabled = opener_enabled
+        # 表示する手数(1=今の手だけ、最大5)。2手目以降が読み筋ドットになる。
+        self._plan_depth = max(1, min(5, plan_depth))
         self._debug_log_path = debug_log_path
         self._debug_log_file = None
         # 画面録画(暫定機能)。有効な場合、支援モード中キャリブレーション
@@ -2861,6 +2867,7 @@ class AssistWorker(QtCore.QThread):
                     self.msleep(self.IDLE_SLEEP_MS)
                     return
 
+        self._check_opener_progress(recognition)
         if self._opener is not None and self._opener.current_step() is not None:
             # 開幕テンプレ進行中はAIの提案の代わりにテンプレの手を出す。
             # 以降の検査(実行可能なミノか、物理的に成立するか)は同じように通す。
@@ -2909,7 +2916,7 @@ class AssistWorker(QtCore.QThread):
                 piece=best.piece,
                 landing_cells=best.landing_cells,
                 use_hold=best.use_hold,
-                plan_steps=_plan_steps_on_screen(recognition.board, best),
+                plan_steps=_plan_steps_on_screen(recognition.board, best)[: self._plan_depth - 1],
                 label=(
                     f"開幕テンプレ\n{self._opener.template.name_ja}\n({self._opener.template.name_en})"
                     if self._opener is not None
@@ -3371,22 +3378,12 @@ class AssistWorker(QtCore.QThread):
                 self._log_opener("中断(おじゃま)")
                 self._opener = None
                 return
-            if not locked_now:
-                return
-            actual = {
-                (r, c)
-                for r, row in enumerate(recognition.board.grid)
-                for c, cell in enumerate(row)
-                if cell is not None
-            }
-            if actual != opener.expected_cells_after(opener.index + 1):
-                self._log_opener(f"中断(手順と異なる盤面) 期待={sorted(opener.expected_cells_after(opener.index + 1))} 実際={sorted(actual)}")
-                self._opener = None
-                return
-            opener.index += 1
-            if opener.current_step() is None:
-                self._log_opener("完成")
-                self._opener = None
+            if locked_now and opener.awaiting_since is None:
+                # 固定を検知した。盤面が手順どおりになったかは、光っている
+                # 置いたばかりのミノが読み切れていない等で同じtickには確定
+                # できないことがあるため、ここでは確認待ちにして毎tick
+                # (_check_opener_progress)確かめる。
+                opener.awaiting_since = time.monotonic()
             return
 
         if not self._opener_enabled:
@@ -3407,6 +3404,46 @@ class AssistWorker(QtCore.QThread):
             f"開始 {template.name_ja} ミノ順={''.join(sequence)} 手順="
             + " ".join(f"{s.piece}{'(H)' if s.use_hold else ''}" for s in steps)
         )
+
+    # 固定を検知してから、盤面が手順どおりになるのをこの秒数まで待つ。
+    # 超えたら手順から外れたとみなしてテンプレをやめる。
+    OPENER_CONFIRM_TIMEOUT_SEC = 1.5
+
+    def _check_opener_progress(self, recognition: RecognitionResult) -> None:
+        """固定後、盤面が手順どおりになったかを毎tick確認して手順を進める。
+
+        【即断しない理由(2026-09-12実機)】固定を検知したtickの盤面は、置いた
+        ばかりのミノが光って種類不明・一部未読になっていることがあり、
+        厳密な一致で即断すると手順どおりに置いているのにテンプレが中断した。
+        「期待するマスがすべて埋まっている」ことを確認できた時点で進め、
+        期待と無関係なマスが1ミノ分以上(4マス以上)埋まったら別の場所に
+        置いたとみなして中断する。どちらも確認できないまま一定時間が過ぎた
+        場合も中断する。
+        """
+        opener = self._opener
+        if opener is None or opener.awaiting_since is None:
+            return
+        actual = {
+            (r, c)
+            for r, row in enumerate(recognition.board.grid)
+            for c, cell in enumerate(row)
+            if cell is not None
+        }
+        expected = opener.expected_cells_after(opener.index + 1)
+        extra = actual - expected
+        if expected <= actual and len(extra) < 4:
+            opener.index += 1
+            opener.awaiting_since = None
+            if opener.current_step() is None:
+                self._log_opener("完成")
+                self._opener = None
+            return
+        elapsed = time.monotonic() - opener.awaiting_since
+        if len(extra) >= 4 or elapsed >= self.OPENER_CONFIRM_TIMEOUT_SEC:
+            self._log_opener(
+                f"中断(手順と異なる盤面 {elapsed:.1f}秒) 期待={sorted(expected)} 実際={sorted(actual)}"
+            )
+            self._opener = None
 
     def _log_opener(self, text: str) -> None:
         if self._debug_log_file is not None:
@@ -3676,6 +3713,19 @@ class MainWindow(QtWidgets.QWidget):
 
         self.opener_checkbox = QtWidgets.QCheckBox("開幕テンプレを提示する(はちみつ砲・迷走砲・山岳積み2号・オリーブ積み)")
         self.opener_checkbox.setChecked(True)
+
+        depth_row = QtWidgets.QHBoxLayout()
+        depth_row.addWidget(QtWidgets.QLabel("最善手の表示手数(1〜5):"))
+        self.plan_depth_spin = QtWidgets.QSpinBox()
+        self.plan_depth_spin.setRange(1, 5)
+        self.plan_depth_spin.setValue(3)
+        self.plan_depth_spin.setToolTip(
+            "1なら今のミノの置き場所だけ、2以上なら2手目以降の読み筋も"
+            "小さいドット+番号で表示します。ラインが消える手より先は表示しません。"
+        )
+        depth_row.addWidget(self.plan_depth_spin)
+        depth_row.addStretch(1)
+        layout.addLayout(depth_row)
         self.opener_checkbox.setToolTip(
             "対局開始時(盤面とHOLDが空)のミノ順から組める開幕テンプレを選び、"
             "1巡目の手順をAIの提案の代わりに表示します。テンプレ名は"
@@ -3766,6 +3816,7 @@ class MainWindow(QtWidgets.QWidget):
             debug_log_path,
             record_video=record_video,
             opener_enabled=self.opener_checkbox.isChecked(),
+            plan_depth=self.plan_depth_spin.value(),
         )
         # 別スレッド(worker)からのシグナルなので、必ずメインスレッドの
         # イベントループ経由で_on_draw_data_readyが呼ばれるよう明示する

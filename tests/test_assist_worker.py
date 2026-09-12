@@ -1737,6 +1737,50 @@ class TestAssistWorkerTickOnce(unittest.TestCase):
         self.assertEqual(shown[-1].piece, "L", "AIの提案に戻っていない")
         self.assertIsNone(shown[-1].label)
 
+    def test_opener_waits_for_a_partially_read_piece_instead_of_aborting(self) -> None:
+        # 【2026-09-12実機】固定を検知したtickでは置いたばかりのミノが光って
+        # 一部しか読めないことがある。厳密一致で即断すると手順どおりなのに
+        # テンプレが中断した。期待するマスが揃うまで待って進めること。
+        worker, received = self._opener_worker()
+        self.cold_clear.poll_suggestion.return_value = _move("I")
+        with patch("src.app.time.monotonic", return_value=1000.0):
+            with patch("src.app.recognize", return_value=_recognition(current_piece="I", next_queue=("L", "S", "T", "Z", "O"))):
+                worker._tick_once(capture=MagicMock())
+                worker._tick_once(capture=MagicMock())
+        first_cells = tuple(worker._opener.steps[0].cells)
+        partial = first_cells[:2]
+        with patch("src.app.time.monotonic", return_value=1000.5):
+            with patch(
+                "src.app.recognize",
+                return_value=_recognition(current_piece=None, filled_cells=partial, next_queue=("S", "T", "Z", "O", "J")),
+            ):
+                worker._tick_once(capture=MagicMock())
+        self.assertIsNotNone(worker._opener, "一部しか読めていない段階で中断している")
+        self.assertEqual(worker._opener.index, 0)
+        with patch("src.app.time.monotonic", return_value=1000.6):
+            with patch(
+                "src.app.recognize",
+                return_value=_recognition(current_piece=None, filled_cells=first_cells, next_queue=("S", "T", "Z", "O", "J")),
+            ):
+                worker._tick_once(capture=MagicMock())
+        self.assertIsNotNone(worker._opener)
+        self.assertEqual(worker._opener.index, 1)
+
+    def test_plan_depth_limits_the_number_of_shown_steps(self) -> None:
+        from src.engine.cold_clear_client import ColdClearMove
+
+        worker = AssistWorker(_make_calibration(), self.cold_clear, debug_log_path=None, plan_depth=2)
+        received: list[object] = []
+        worker.draw_data_ready.connect(received.append)
+        self.cold_clear.poll_suggestion.return_value = ColdClearMove(
+            use_hold=False, piece="T", landing_cells=[(19, 0), (19, 1), (19, 2), (18, 1)], nodes=0, nps=0.0,
+            placement={"location": {}, "spin": "none"},
+            plan=[("O", [(19, 8), (19, 9), (18, 8), (18, 9)]), ("I", [(19, 4), (19, 5), (19, 6), (19, 7)])],
+        )
+        with patch("src.app.recognize", return_value=_recognition(current_piece="T")):
+            worker._tick_once(capture=MagicMock())
+        self.assertEqual(len(received[-1].plan_steps), 1, "表示手数2なら読み筋は1手だけ")
+
     def test_opener_is_not_started_when_disabled(self) -> None:
         self.cold_clear.poll_suggestion.return_value = _move("I")
         with patch("src.app.recognize", return_value=_recognition(current_piece="I", next_queue=("L", "S", "T", "Z", "O"))):
