@@ -1,121 +1,136 @@
-"""開幕テンプレ(1巡目)の定義と、実際のミノ順に合わせた手順の組み立て。
+"""開幕テンプレ: 盤面図(opener_data.py)から、実際のミノ順に合わせた手順をその場で組み立てる。
 
-テンプレの形は「テトリス堂(https://shiwehi.com/tetris/)」の各ページに
-テキストで掲載されている1巡目の盤面図をそのまま写したもの(小文字の
-ミノ記号、'-'は空マス、下の行ほど盤面の下)。左右反転の形もページの
-掲載どおり別の図として持つ。
-
-【手順は事前に書かず、その場で組み立てる】
-テンプレの解説は「Iが早いこと」「JとLの早い方で左右を決める」のように
-ミノ順の条件と分岐で説明されるが、1巡目に限れば「最終形の各ミノの位置」が
-分かれば、実際に出てきた順番に対して
-  ・今のミノをテンプレの位置へ置けるか(下に支えがあり、上が空いていて
+テンプレの解説ページは「Iが早いこと」「JとLの早い方で左右を決める」のように
+ミノ順の条件と分岐で説明されているが、各巡の「最終形の図」さえあれば、
+実際に出てきた順番に対して
+  ・今のミノを図の位置へ置けるか(下に支えがあり、上が空いていて
     ハードドロップで入る)
   ・置けなければホールドして、ホールドしていたミノを置けるか
-を全探索すれば手順が決まる(7手なので探索は一瞬)。これなら分岐の
-手順データを手入力する必要がなく、写し間違いの余地も減る。
-どの順でも置けない場合、そのテンプレはその手番順では組めない。
+を全探索すれば手順が決まる(1巡7手なので探索は一瞬)。分岐の手順データを
+手入力する必要がなく、写し間違いの余地も減る。
+
+【巡をまたぐ進め方】
+図には「既に置いてあるブロック('c')」が描かれている。ある巡の図を置き
+終えたら、次はその盤面(既存ブロック)に一致する図を同じテンプレの中から
+探し、実際のミノ順で組めるものを選ぶ。理想形/通常形/妥協形、左右反転、
+Tスピンを打つ図などは、すべてこの「既存ブロックの一致」で自然に選ばれる。
+'U'(Tスピンで入れるT)は、図の他のミノをすべて置いてから最後に入れる。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .opener_data import OPENER_SOURCE_FORMS
+
 BOARD_ROWS = 20
 BOARD_COLS = 10
 
 Cells = tuple[tuple[int, int], ...]
+
+_ALL_PIECES = "IOTSZJL"
+
+
+@dataclass(frozen=True)
+class FormItem:
+    piece: str
+    cells: Cells
+    spin: bool = False  # Tスピンで入れる(ハードドロップでは入らない)
+
+
+@dataclass(frozen=True)
+class OpenerForm:
+    section: str
+    existing: frozenset[tuple[int, int]]  # 既に置いてあるべきブロック
+    items: tuple[FormItem, ...]  # この図で置くミノ
+    text: str
 
 
 @dataclass(frozen=True)
 class OpenerTemplate:
     name_ja: str
     name_en: str
-    # 1巡目の最終形(複数あれば左右反転などの別形)。各要素はテキスト盤面図。
-    forms: tuple[str, ...]
+    source_url: str
+    forms: tuple[OpenerForm, ...]
 
 
-# テトリス堂の各ページ「1巡目とミノ順」より。
-OPENER_TEMPLATES: tuple[OpenerTemplate, ...] = (
-    OpenerTemplate(
-        name_ja="はちみつ砲",
-        name_en="Honey Cup",
-        forms=(
-            "----------\n"
-            "-ss-------\n"
-            "ssl----t--\n"
-            "lll-zzttoo\n"
-            "iiii-zztoo",
-            "----------\n"
-            "-------zz-\n"
-            "--t----jzz\n"
-            "oottss-jjj\n"
-            "ootss-iiii",
-        ),
-    ),
-    OpenerTemplate(
-        name_ja="迷走砲",
-        name_en="Stray Cannon",
-        forms=(
-            "i---------\n"
-            "ils-t--j--\n"
-            "ilsstt-joo\n"
-            "illst-jjoo",
-        ),
-    ),
-    OpenerTemplate(
-        name_ja="山岳積み2号",
-        name_en="Mountainous Stacking 2",
-        forms=(
-            "------l---\n"
-            "------l---\n"
-            "is----ll--\n"
-            "iss----t--\n"
-            "ijs-zzttoo\n"
-            "ijjj-zztoo",
-            "---j------\n"
-            "---j------\n"
-            "--jj----zi\n"
-            "--t----zzi\n"
-            "oottss-zli\n"
-            "ootss-llli",
-        ),
-    ),
-    OpenerTemplate(
-        name_ja="オリーブ積み",
-        name_en="Olive Stacking",
-        forms=(
-            "--z-------\n"
-            "-zz------j\n"
-            "-zl--t-ssj\n"
-            "ool-ttssjj\n"
-            "ooll-tiiii",
-            "-------s--\n"
-            "l------ss-\n"
-            "lzz-t--js-\n"
-            "llzztt-joo\n"
-            "iiiit-jjoo",
-        ),
-    ),
-)
+def _components(cells: list[tuple[int, int]]) -> list[Cells]:
+    """4近傍で連結した塊に分ける。"""
+    remaining = set(cells)
+    groups: list[Cells] = []
+    while remaining:
+        start = min(remaining)
+        stack = [start]
+        group = {start}
+        remaining.discard(start)
+        while stack:
+            r, c = stack.pop()
+            for nr, nc in ((r + 1, c), (r - 1, c), (r, c + 1), (r, c - 1)):
+                if (nr, nc) in remaining:
+                    remaining.discard((nr, nc))
+                    group.add((nr, nc))
+                    stack.append((nr, nc))
+        groups.append(tuple(sorted(group)))
+    return groups
 
 
-def parse_form(form: str) -> dict[str, Cells]:
-    """テキスト盤面図を {ミノ種: 着地マス(row, col)} に変換する。最下行がrow=19。"""
-    lines = [line for line in form.splitlines() if line]
-    cells: dict[str, list[tuple[int, int]]] = {}
+def parse_form(text: str, section: str = "") -> OpenerForm | None:
+    """テキスト盤面図を解釈する。ミノが4マスの塊になっていない図はNone。"""
+    lines = [line for line in text.splitlines() if line]
+    if not lines or any(len(line) != BOARD_COLS for line in lines):
+        return None
+    existing: set[tuple[int, int]] = set()
+    by_symbol: dict[str, list[tuple[int, int]]] = {}
     for i, line in enumerate(lines):
         row = BOARD_ROWS - len(lines) + i
         for col, ch in enumerate(line):
             if ch == "-":
                 continue
-            cells.setdefault(ch.upper(), []).append((row, col))
-    result: dict[str, Cells] = {}
-    for piece, cs in cells.items():
-        if len(cs) != 4:
-            raise ValueError(f"テンプレ図の{piece}が4マスではない: {cs}")
-        result[piece] = tuple(sorted(cs))
-    return result
+            if ch in "cC":
+                existing.add((row, col))
+            else:
+                by_symbol.setdefault(ch, []).append((row, col))
+    items: list[FormItem] = []
+    for symbol, cells in by_symbol.items():
+        if symbol == "U":
+            piece, spin = "T", True
+        elif symbol.upper() in _ALL_PIECES:
+            piece, spin = symbol.upper(), False
+        else:
+            return None
+        for group in _components(cells):
+            if len(group) != 4:
+                return None
+            items.append(FormItem(piece, group, spin))
+    if not items:
+        return None
+    return OpenerForm(section=section, existing=frozenset(existing), items=tuple(items), text=text)
+
+
+def mirror_form_text(text: str) -> str:
+    """左右反転した図(列を反転し、J↔L・S↔Zを入れ替える)。"""
+    table = str.maketrans("jlszJLSZ", "ljzsLJZS")
+    return "\n".join(line[::-1].translate(table) for line in text.splitlines())
+
+
+def _build_templates() -> tuple[OpenerTemplate, ...]:
+    templates = []
+    for name_ja, name_en, url, source_forms in OPENER_SOURCE_FORMS:
+        forms: list[OpenerForm] = []
+        seen: set[str] = set()
+        for section, text in source_forms:
+            for variant in (text, mirror_form_text(text)):
+                if variant in seen:
+                    continue
+                seen.add(variant)
+                form = parse_form(variant, section)
+                if form is not None:
+                    forms.append(form)
+        templates.append(OpenerTemplate(name_ja, name_en, url, tuple(forms)))
+    return tuple(templates)
+
+
+OPENER_TEMPLATES: tuple[OpenerTemplate, ...] = _build_templates()
 
 
 @dataclass(frozen=True)
@@ -123,6 +138,7 @@ class OpenerStep:
     piece: str
     cells: Cells
     use_hold: bool  # ホールドしてから置く(置くミノは操作中のミノではない)
+    spin: bool = False
 
 
 def _can_hard_drop(placed: set[tuple[int, int]], cells: Cells) -> bool:
@@ -142,53 +158,119 @@ def _can_hard_drop(placed: set[tuple[int, int]], cells: Cells) -> bool:
     return any(r + 1 >= BOARD_ROWS or (r + 1, c) in placed for r, c in cells)
 
 
-def plan_opener(form_cells: dict[str, Cells], sequence: list[str]) -> list[OpenerStep] | None:
-    """実際のミノ順(先頭が操作中のミノ)に対して、テンプレを組む手順を返す。
+def plan_form(
+    form: OpenerForm, sequence: list[str], hold: str | None, placed: set[tuple[int, int]] | None = None
+) -> list[OpenerStep] | None:
+    """実際のミノ順(先頭が操作中のミノ)とホールドに対して、図を組む手順を返す。
 
     各手番で「操作中のミノを置く」か「ホールドして、ホールドにあったミノ
-    (空なら次のミノ)を置く」のどちらかを選ぶ。ホールドの入れ替えは各手番
-    1回まで。全7手を置ける手順が無ければNone。
+    (空なら次のミノ)を置く」のどちらかを選ぶ。Tスピンの手('U')は他のミノを
+    すべて置いた後にだけ置ける。図のミノをすべて置ける手順が無ければNone。
     """
-    # 形に含まれないミノ(はちみつ砲のJなど)は、1巡目の間ホールドに残す
-    # 想定。形のミノがすべてミノ順に含まれていれば組める可能性がある。
-    if len(sequence) != 7 or len(set(sequence)) != 7 or not set(form_cells) <= set(sequence):
-        return None
+    placed_cells = set(placed) if placed is not None else set(form.existing)
+    items = form.items
+    spin_count = sum(1 for it in items if it.spin)
 
-    def search(index: int, hold: str | None, placed: set[tuple[int, int]], done: set[str]) -> list[OpenerStep] | None:
-        if len(done) == len(form_cells):
+    def placeable(item: FormItem, current_placed: set[tuple[int, int]], done: frozenset[int]) -> bool:
+        if item.spin:
+            if len(done) < len(items) - spin_count:
+                return False
+            return all(cell not in current_placed for cell in item.cells)
+        return _can_hard_drop(current_placed, item.cells)
+
+    def candidates(piece: str, current_placed: set[tuple[int, int]], done: frozenset[int]) -> list[int]:
+        return [
+            i
+            for i, item in enumerate(items)
+            if i not in done and item.piece == piece and placeable(item, current_placed, done)
+        ]
+
+    def search(index: int, hold_piece: str | None, current_placed: set[tuple[int, int]], done: frozenset[int]):
+        if len(done) == len(items):
             return []
         if index >= len(sequence):
             return None
         current = sequence[index]
-        # 1) 操作中のミノをそのまま置く(形に含まれないミノはホールドへ回すしかない)
-        if current in form_cells and current not in done and _can_hard_drop(placed, form_cells[current]):
-            rest = search(index + 1, hold, placed | set(form_cells[current]), done | {current})
+        # 1) 操作中のミノをそのまま置く
+        for i in candidates(current, current_placed, done):
+            rest = search(index + 1, hold_piece, current_placed | set(items[i].cells), done | {i})
             if rest is not None:
-                return [OpenerStep(current, form_cells[current], use_hold=False)] + rest
+                return [OpenerStep(current, items[i].cells, False, items[i].spin)] + rest
         # 2) ホールドして、出てきたミノを置く
-        if hold is None:
-            # 空のHOLDへ格納: 操作ミノがHOLDへ入り、次のミノが操作対象になる
+        if hold_piece is None:
             if index + 1 < len(sequence):
                 nxt = sequence[index + 1]
-                if nxt in form_cells and nxt not in done and _can_hard_drop(placed, form_cells[nxt]):
-                    rest = search(index + 2, current, placed | set(form_cells[nxt]), done | {nxt})
+                for i in candidates(nxt, current_placed, done):
+                    rest = search(index + 2, current, current_placed | set(items[i].cells), done | {i})
                     if rest is not None:
-                        return [OpenerStep(nxt, form_cells[nxt], use_hold=True)] + rest
+                        return [OpenerStep(nxt, items[i].cells, True, items[i].spin)] + rest
         else:
-            if hold in form_cells and hold not in done and _can_hard_drop(placed, form_cells[hold]):
-                rest = search(index + 1, current, placed | set(form_cells[hold]), done | {hold})
+            for i in candidates(hold_piece, current_placed, done):
+                rest = search(index + 1, current, current_placed | set(items[i].cells), done | {i})
                 if rest is not None:
-                    return [OpenerStep(hold, form_cells[hold], use_hold=True)] + rest
+                    return [OpenerStep(hold_piece, items[i].cells, True, items[i].spin)] + rest
         return None
 
-    return search(0, None, set(), set())
+    return search(0, hold, placed_cells, frozenset())
 
 
-def choose_opener(sequence: list[str]) -> tuple[OpenerTemplate, list[OpenerStep]] | None:
-    """1巡目のミノ順に対して組めるテンプレを探し、最初に見つかったものと手順を返す。"""
-    for template in OPENER_TEMPLATES:
-        for form in template.forms:
-            steps = plan_opener(parse_form(form), sequence)
-            if steps is not None:
-                return template, steps
+def known_sequence(current_piece: str | None, next_queue: tuple[str, ...]) -> list[str] | None:
+    """操作ミノ+NEXT5枠から、分かる範囲のミノ順を返す。
+
+    6つがすべて異なる種類なら同じ袋(7-bag)なので残り1つも確定できる。
+    種類が重なる(袋の境目をまたぐ)場合は6つだけを返す。
+    """
+    if current_piece is None or len(next_queue) != 5:
+        return None
+    seen = [current_piece, *next_queue]
+    if not set(seen) <= set(_ALL_PIECES):
+        return None
+    if len(set(seen)) == 6:
+        (missing,) = set(_ALL_PIECES) - set(seen)
+        return [*seen, missing]
+    return seen
+
+
+def choose_form(
+    template: OpenerTemplate,
+    board_cells: set[tuple[int, int]],
+    sequence: list[str],
+    hold: str | None,
+) -> tuple[OpenerForm, list[OpenerStep]] | None:
+    """今の盤面(おじゃまを除く占有)に既存ブロックが一致し、ミノ順で組める図を返す。"""
+    target = frozenset(board_cells)
+    for form in template.forms:
+        if form.existing != target:
+            continue
+        steps = plan_form(form, sequence, hold)
+        if steps is not None:
+            return form, steps
     return None
+
+
+def choose_opener(
+    sequence: list[str], hold: str | None = None, board_cells: set[tuple[int, int]] | None = None
+) -> tuple[OpenerTemplate, OpenerForm, list[OpenerStep]] | None:
+    """組めるテンプレを探し、最初に見つかったものと図・手順を返す(既定は空の盤面)。"""
+    cells = board_cells if board_cells is not None else set()
+    for template in OPENER_TEMPLATES:
+        chosen = choose_form(template, cells, sequence, hold)
+        if chosen is not None:
+            form, steps = chosen
+            return template, form, steps
+    return None
+
+
+def apply_step(cells: set[tuple[int, int]], step_cells: Cells) -> set[tuple[int, int]]:
+    """盤面(占有マス集合)にミノを置き、揃った行を消して詰めた結果を返す。"""
+    result = set(cells) | set(step_cells)
+    full_rows = [r for r in range(BOARD_ROWS) if all((r, c) in result for c in range(BOARD_COLS))]
+    if not full_rows:
+        return result
+    shifted: set[tuple[int, int]] = set()
+    for r, c in result:
+        if r in full_rows:
+            continue
+        drop = sum(1 for fr in full_rows if fr > r)
+        shifted.add((r + drop, c))
+    return shifted

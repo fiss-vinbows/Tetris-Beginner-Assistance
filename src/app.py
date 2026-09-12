@@ -30,6 +30,7 @@ import sys
 import time
 from collections import Counter
 from dataclasses import dataclass
+from dataclasses import replace as dataclass_replace
 from typing import NamedTuple
 from datetime import datetime
 from pathlib import Path
@@ -55,7 +56,15 @@ from src.capture.calibrate import CONFIG_PATH, CalibrationResult, load_calibrati
 from src.capture.screen_capture import CaptureRegion, ScreenCapture
 from src.engine.board_state import BoardState
 from src.engine.cold_clear_client import ColdClearClient, ColdClearMove
-from src.engine.openers import OpenerStep, OpenerTemplate, choose_opener
+from src.engine.openers import (
+    OpenerForm,
+    OpenerStep,
+    OpenerTemplate,
+    apply_step,
+    choose_form,
+    choose_opener,
+    known_sequence,
+)
 from src.overlay.renderer import (
     PLAN_DOT_ALPHA,
     PLAN_DOT_RADIUS_RATIO,
@@ -1610,10 +1619,14 @@ class _ColdClearContinuation:
 
 @dataclass
 class _OpenerRun:
-    """進行中の開幕テンプレ(src.engine.openers参照)。"""
+    """進行中の開幕テンプレの1つの図(src.engine.openers参照)。"""
 
     template: OpenerTemplate
+    form: OpenerForm
     steps: list[OpenerStep]
+    # 図を置き始める前の盤面(おじゃまを除く占有)。手順を進めるたびに
+    # apply_stepで更新し、ライン消去による詰めも反映する。
+    board: set[tuple[int, int]]
     index: int = 0  # 次に置く手
     # 固定を検知してから、盤面が手順どおりになったのをまだ確認できていない
     # 場合の検知時刻。Noneなら確認待ちではない。
@@ -1622,13 +1635,10 @@ class _OpenerRun:
     def current_step(self) -> OpenerStep | None:
         return self.steps[self.index] if self.index < len(self.steps) else None
 
-    def expected_cells_after(self, count: int) -> set[tuple[int, int]]:
-        cells: set[tuple[int, int]] = set()
-        for step in self.steps[:count]:
-            cells.update(step.cells)
-        return cells
+    def expected_after_current(self) -> set[tuple[int, int]]:
+        return apply_step(self.board, self.steps[self.index].cells)
 
-    def as_move(self, current_piece: str | None) -> ColdClearMove:
+    def as_move(self) -> ColdClearMove:
         """今の手をCold Clear 2の提案と同じ形にして返す(読み筋は残りの手順)。"""
         step = self.steps[self.index]
         plan = [(s.piece, list(s.cells)) for s in self.steps[self.index + 1 :]]
@@ -1643,18 +1653,14 @@ class _OpenerRun:
         )
 
 
-_ALL_PIECE_TYPES = frozenset("IOTSZJL")
-
-
-def _first_bag_sequence(current_piece: str | None, next_queue: tuple[str, ...]) -> list[str] | None:
-    """対局開始時の1巡目7ミノの順(操作ミノ+NEXT5+残り1つ)を求める。求まらなければNone。"""
-    if current_piece is None or len(next_queue) != 5:
-        return None
-    seen = [current_piece, *next_queue]
-    if len(set(seen)) != 6 or not set(seen) <= _ALL_PIECE_TYPES:
-        return None
-    (missing,) = _ALL_PIECE_TYPES - set(seen)
-    return [*seen, missing]
+def _non_garbage_cells(board: BoardState) -> set[tuple[int, int]]:
+    """おじゃま(GARBAGE)を除いた占有マス。テンプレの図はおじゃまの上に載る前提。"""
+    return {
+        (r, c)
+        for r, row in enumerate(board.grid)
+        for c, cell in enumerate(row)
+        if cell is not None and cell != "GARBAGE"
+    }
 
 
 def _board_occupancy(board: BoardState) -> tuple[tuple[bool, ...], ...]:
@@ -2014,6 +2020,12 @@ class AssistWorker(QtCore.QThread):
         self._cc_pending_lock = False
         # 進行中の開幕テンプレ(_OpenerRun参照)。Noneなら通常どおりAIの提案を出す。
         self._opener: _OpenerRun | None = None
+        # 直前に1つの図を置き終えたテンプレ。次の図(2巡目以降)はこのテンプレの
+        # 中から、今の盤面に既存ブロックが一致するものを探す。図が見つから
+        # なかったり中断したらNoneに戻し、次に盤面が空になるまで始めない。
+        self._opener_continuing: OpenerTemplate | None = None
+        # 「該当なし」を同じミノ順で毎tick記録しないための控え。
+        self._opener_declined_sequence: list[str] | None = None
 
     def stop(self) -> None:
         self._running = False
@@ -2572,6 +2584,18 @@ class AssistWorker(QtCore.QThread):
             board_data_trustworthy = True
             self._last_board_key = recognition.board_key
             self._pending_board_key = None
+            if board_settling:
+                # 【2026-09-12・実機ログ】ライン消去・REN等のエフェクトが続いて
+                # 確定待ちが途切れないまま強制受理すると、消えた行の古いマスと
+                # 下へ詰まった新しいマスが二重に残った盤面でAIに要求し、その
+                # 幻のマスの上に提案が出て空中に浮いた。強制受理のときは
+                # 「最新の読みで空」のマス(空になる確定待ち)を空として扱う。
+                cleaned = recognition.board.clone()
+                for r, row in enumerate(recognition.pending_grid):
+                    for c, cell in enumerate(row):
+                        if cell is not None and cell[0] is None:
+                            cleaned.grid[r][c] = None
+                recognition = dataclass_replace(recognition, board=cleaned)
         if board_data_trustworthy:
             self._last_board_trustworthy_time = now_board_trust
 
@@ -2868,10 +2892,11 @@ class AssistWorker(QtCore.QThread):
                     return
 
         self._check_opener_progress(recognition)
+        self._maybe_start_opener(recognition)
         if self._opener is not None and self._opener.current_step() is not None:
             # 開幕テンプレ進行中はAIの提案の代わりにテンプレの手を出す。
             # 以降の検査(実行可能なミノか、物理的に成立するか)は同じように通す。
-            best = self._opener.as_move(self._last_current_piece)
+            best = self._opener.as_move()
 
         if best is not None and best.piece not in _available_pieces(
             self._last_current_piece, recognition.hold_piece, recognition.next_queue
@@ -2918,7 +2943,7 @@ class AssistWorker(QtCore.QThread):
                 use_hold=best.use_hold,
                 plan_steps=_plan_steps_on_screen(recognition.board, best)[: self._plan_depth - 1],
                 label=(
-                    f"開幕テンプレ\n{self._opener.template.name_ja}\n({self._opener.template.name_en})"
+                    f"開幕テンプレ\n{self._opener.template.name_ja}\n{self._opener.form.section.split(' > ')[-1]}"
                     if self._opener is not None
                     else None
                 ),
@@ -3364,13 +3389,14 @@ class AssistWorker(QtCore.QThread):
         return recognition
 
     def _update_opener(self, recognition: RecognitionResult, *, locked_now: bool, garbage_rise: int) -> None:
-        """開幕テンプレの開始判定と、固定ごとの進行確認。
+        """開幕テンプレの開始判定(図の選択)と、固定の検知。
 
-        開始: 盤面が空・HOLDが空・操作ミノとNEXT5枠が読めている手番で、
-        1巡目のミノ順(7つ)に対して組めるテンプレがあれば始める。
-        進行: 固定のたびに「ここまでの手順を置いた盤面」と認識した盤面の
-        占有を比べ、一致すれば次の手へ、違えば(別の場所に置いた・おじゃま等)
-        テンプレをやめて通常のAI提案に戻る。全手を置き終えたら完了。
+        開始: 盤面が空・HOLDが空の手番では、1巡目のミノ順で組めるテンプレを
+        探す。1つの図を置き終えた後は、同じテンプレの中から今の盤面に
+        既存ブロックが一致し、今のミノ順(操作ミノ+NEXT5枠、同じ袋なら
+        残り1つも確定)とホールドで組める図を探して続ける(2巡目以降)。
+        進行: 固定を検知したら確認待ちにし、_check_opener_progressで盤面が
+        手順どおりになったか毎tick確かめる。
         """
         opener = self._opener
         if opener is not None:
@@ -3386,9 +3412,11 @@ class AssistWorker(QtCore.QThread):
                     if any(r < 0 for r, _c in cells):
                         self._log_opener(f"中断(おじゃま{garbage_rise}行で盤面上端を超える)")
                         self._opener = None
+                        self._opener_continuing = None
                         return
-                    shifted.append(OpenerStep(step.piece, cells, step.use_hold))
+                    shifted.append(OpenerStep(step.piece, cells, step.use_hold, step.spin))
                 opener.steps = shifted
+                opener.board = {(r - garbage_rise, c) for r, c in opener.board}
                 self._log_opener(f"おじゃま{garbage_rise}行: 手順を上へずらして続行")
             if locked_now and opener.awaiting_since is None:
                 # 固定を検知した。盤面が手順どおりになったかは、光っている
@@ -3396,25 +3424,55 @@ class AssistWorker(QtCore.QThread):
                 # できないことがあるため、ここでは確認待ちにして毎tick
                 # (_check_opener_progress)確かめる。
                 opener.awaiting_since = time.monotonic()
-            return
 
-        if not self._opener_enabled:
+    def _maybe_start_opener(self, recognition: RecognitionResult) -> None:
+        """テンプレが進行中でなければ、始められる図を探す(毎tick)。
+
+        図を置き終えるのは固定の数tick後(確認待ちの解消時)で、その時点では
+        次のミノの手番が既に始まっている。要求のタイミングだけで探すと
+        次の図の最初の手を通常のAI提案で出してしまうため、毎tick確認する。
+        """
+        if self._opener is not None or not self._opener_enabled or not recognition.hold_known:
             return
-        board_empty = all(cell is None for row in recognition.board.grid for cell in row)
-        if not (board_empty and recognition.hold_known and recognition.hold_piece is None):
-            return
-        sequence = _first_bag_sequence(self._last_current_piece, recognition.next_queue)
+        board_cells = _non_garbage_cells(recognition.board)
+        if not board_cells:
+            # 盤面が空: 新しい対局。前のテンプレの続きは忘れる。
+            self._opener_continuing = None
+        if any(cell is not None and cell[0] is None for row in recognition.pending_grid for cell in row):
+            return  # 盤面がまだ確定していない(消えた行が残っている等)
+        sequence = known_sequence(self._last_current_piece, recognition.next_queue)
         if sequence is None:
             return
-        chosen = choose_opener(sequence)
-        if chosen is None:
-            self._log_opener(f"該当なし ミノ順={''.join(sequence)}")
-            return
-        template, steps = chosen
-        self._opener = _OpenerRun(template=template, steps=steps)
+        hold = recognition.hold_piece
+        if self._opener_continuing is not None:
+            chosen_form = choose_form(self._opener_continuing, board_cells, sequence, hold)
+            if chosen_form is None:
+                self._log_opener(
+                    f"次の図が見つからず終了 {self._opener_continuing.name_ja} ミノ順={''.join(sequence)} hold={hold}"
+                )
+                self._opener_continuing = None
+                return
+            template = self._opener_continuing
+            form, steps = chosen_form
+        else:
+            if board_cells or hold is not None:
+                return
+            chosen = choose_opener(sequence, hold, board_cells)
+            if chosen is None:
+                if self._opener_declined_sequence != sequence:
+                    self._opener_declined_sequence = sequence
+                    self._log_opener(f"該当なし ミノ順={''.join(sequence)}")
+                return
+            template, form, steps = chosen
+        self._opener = _OpenerRun(template=template, form=form, steps=steps, board=set(board_cells))
+        self._opener_continuing = None
+        # AIの提案を先に出していた場合でも、この手番からテンプレの手に切り替える。
+        self._committed_placement = None
+        self._committed_placement_tbp = None
+        self._committed_move = None
         self._log_opener(
-            f"開始 {template.name_ja} ミノ順={''.join(sequence)} 手順="
-            + " ".join(f"{s.piece}{'(H)' if s.use_hold else ''}" for s in steps)
+            f"開始 {template.name_ja} [{form.section}] ミノ順={''.join(sequence)} hold={hold} 手順="
+            + " ".join(f"{s.piece}{'(H)' if s.use_hold else ''}{'(spin)' if s.spin else ''}" for s in steps)
         )
 
     # 固定を検知してから、盤面が手順どおりになるのをこの秒数まで待つ。
@@ -3430,25 +3488,22 @@ class AssistWorker(QtCore.QThread):
         「期待するマスがすべて埋まっている」ことを確認できた時点で進め、
         期待と無関係なマスが1ミノ分以上(4マス以上)埋まったら別の場所に
         置いたとみなして中断する。どちらも確認できないまま一定時間が過ぎた
-        場合も中断する。
+        場合も中断する。Tスピン等でラインが消える手は、消去後の盤面
+        (apply_step)と比べる。図を置き終えたら次の図を探す(_update_opener)。
         """
         opener = self._opener
         if opener is None or opener.awaiting_since is None:
             return
-        # おじゃま(GARBAGE)はテンプレの形に関係ないので比較から外す。
-        actual = {
-            (r, c)
-            for r, row in enumerate(recognition.board.grid)
-            for c, cell in enumerate(row)
-            if cell is not None and cell != "GARBAGE"
-        }
-        expected = opener.expected_cells_after(opener.index + 1)
+        actual = _non_garbage_cells(recognition.board)
+        expected = opener.expected_after_current()
         extra = actual - expected
         if expected <= actual and len(extra) < 4:
+            opener.board = expected
             opener.index += 1
             opener.awaiting_since = None
             if opener.current_step() is None:
-                self._log_opener("完成")
+                self._log_opener(f"図を置き終えた [{opener.form.section}]")
+                self._opener_continuing = opener.template
                 self._opener = None
             return
         elapsed = time.monotonic() - opener.awaiting_since
@@ -3457,6 +3512,7 @@ class AssistWorker(QtCore.QThread):
                 f"中断(手順と異なる盤面 {elapsed:.1f}秒) 期待={sorted(expected)} 実際={sorted(actual)}"
             )
             self._opener = None
+            self._opener_continuing = None
 
     def _log_opener(self, text: str) -> None:
         if self._debug_log_file is not None:

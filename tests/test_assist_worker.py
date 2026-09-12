@@ -1820,6 +1820,34 @@ class TestAssistWorkerTickOnce(unittest.TestCase):
             sorted(worker._opener.steps[1].cells), sorted((r - 2, c) for r, c in second_before), "手順が上へずれていない"
         )
 
+    def test_opener_continues_into_the_second_bag_with_a_matching_form(self) -> None:
+        # 【2026-09-12実機】1巡目を置き終えると通常のAI提案に戻り、2巡目が
+        # テンプレと別物になっていた。置き終えた盤面に既存ブロックが一致する
+        # 次の図(2巡目)を同じテンプレから探して続けること。
+        from src.engine.openers import OPENER_TEMPLATES, apply_step, choose_opener
+
+        worker, received = self._opener_worker()
+        tpl, form, steps = choose_opener(list("ILSTZOJ"))
+        board: set = set()
+        for step in steps:
+            board = apply_step(board, step.cells)
+        # 1巡目を置き終えた直後の状態を作る: 続きを探すテンプレと、盤面・HOLD=J。
+        worker._opener_continuing = tpl
+        self.cold_clear.poll_suggestion.return_value = _move("T", landing_cells=[(11, 0), (11, 1), (11, 2), (10, 1)])
+        with patch("src.app.time.monotonic", return_value=1000.0):
+            with patch(
+                "src.app.recognize",
+                return_value=_recognition(
+                    current_piece="T", hold_piece="J", filled_cells=tuple(board), next_queue=("O", "S", "Z", "I", "J")
+                ),
+            ):
+                worker._tick_once(capture=MagicMock())
+        self.assertIsNotNone(worker._opener, "2巡目の図が始まっていない")
+        self.assertIn("2巡目", worker._opener.form.section)
+        shown = received[-1]
+        self.assertIn("2巡目", shown.label)
+        self.assertEqual(shown.piece, worker._opener.steps[0].piece)
+
     def test_opener_is_not_started_when_disabled(self) -> None:
         self.cold_clear.poll_suggestion.return_value = _move("I")
         with patch("src.app.recognize", return_value=_recognition(current_piece="I", next_queue=("L", "S", "T", "Z", "O"))):
