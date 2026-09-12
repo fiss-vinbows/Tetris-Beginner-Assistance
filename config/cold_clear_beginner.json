@@ -9,14 +9,14 @@
     "height_upper_quarter": -5.0,
     "tetris_well_depth": 0.3,
     "tslot": [
-      0.0,
-      0.0,
-      0.0,
-      0.0
+      0.1,
+      1.5,
+      2.0,
+      4.0
     ],
     "has_back_to_back": 0.5,
-    "wasted_t": 0.0,
-    "softdrop": -10.0,
+    "wasted_t": -1.5,
+    "softdrop": -0.2,
     "normal_clears": [
       0.0,
       -2.0,
@@ -32,8 +32,8 @@
     "spin_clears": [
       0.0,
       0.0,
-      0.0,
-      0.0
+      4.0,
+      6.0
     ],
     "back_to_back_clear": 1.0,
     "combo_attack": 1.5,

@@ -3374,10 +3374,22 @@ class AssistWorker(QtCore.QThread):
         """
         opener = self._opener
         if opener is not None:
-            if garbage_rise:
-                self._log_opener("中断(おじゃま)")
-                self._opener = None
-                return
+            if garbage_rise and recognition.board_key == self._last_board_key:
+                # 【2026-09-12・利用者の指示】おじゃまがせり上がっても、テンプレの
+                # 形はその上にそのまま載るので続行する。手順の座標をせり上がった
+                # 行数ぶん上へずらす(盤面の上端からはみ出すなら諦める)。
+                # せり上がりは基準の盤面(2tick確認済み)が更新されるまで毎tick
+                # 検知されるため、基準が今の盤面に更新されたtickだけで1回ずらす。
+                shifted: list[OpenerStep] = []
+                for step in opener.steps:
+                    cells = tuple((r - garbage_rise, c) for r, c in step.cells)
+                    if any(r < 0 for r, _c in cells):
+                        self._log_opener(f"中断(おじゃま{garbage_rise}行で盤面上端を超える)")
+                        self._opener = None
+                        return
+                    shifted.append(OpenerStep(step.piece, cells, step.use_hold))
+                opener.steps = shifted
+                self._log_opener(f"おじゃま{garbage_rise}行: 手順を上へずらして続行")
             if locked_now and opener.awaiting_since is None:
                 # 固定を検知した。盤面が手順どおりになったかは、光っている
                 # 置いたばかりのミノが読み切れていない等で同じtickには確定
@@ -3423,11 +3435,12 @@ class AssistWorker(QtCore.QThread):
         opener = self._opener
         if opener is None or opener.awaiting_since is None:
             return
+        # おじゃま(GARBAGE)はテンプレの形に関係ないので比較から外す。
         actual = {
             (r, c)
             for r, row in enumerate(recognition.board.grid)
             for c, cell in enumerate(row)
-            if cell is not None
+            if cell is not None and cell != "GARBAGE"
         }
         expected = opener.expected_cells_after(opener.index + 1)
         extra = actual - expected

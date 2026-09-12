@@ -64,22 +64,24 @@ class TestPlanParsing(unittest.TestCase):
 class TestBeginnerConfig(unittest.TestCase):
     """初心者向けの評価設定(config/cold_clear_beginner.json)の回帰テスト。
 
-    実機で「難しい操作で現実的でない」提示(横向きIの下へSを潜り込ませる手)
-    が報告された。ソフトドロップ距離への罰則を大きくし、Tスピン関連の
-    加点を0にすることで、回転→横移動→ハードドロップで到達できる手を
-    優先させる(自己対戦120手で潜り込み手 11件→0件)。
+    当初はソフトドロップへの罰則を大きくしてTスピンごと避けていたが、
+    利用者の方針「TSD/TSTは初心者でも身につけるべきなので推奨する」に
+    合わせ、既定の評価にTSS(1ライン)とミニスピンだけ加点しない形に戻した。
+    自己対戦480手の計測: 潜り込み(スピン以外)1件、TSD以上39件。
     """
 
-    def test_config_file_exists_and_penalizes_softdrop(self) -> None:
+    def test_config_file_recommends_tsd_and_tst_but_not_tss(self) -> None:
         import json
 
         from src.engine.cold_clear_client import COLD_CLEAR_CONFIG
 
         self.assertTrue(COLD_CLEAR_CONFIG.exists(), "初心者向け設定ファイルが無い")
         weights = json.loads(COLD_CLEAR_CONFIG.read_text(encoding="utf-8"))["freestyle_weights"]
-        self.assertLessEqual(weights["softdrop"], -5.0, "ソフトドロップの罰則が弱い")
-        self.assertEqual(weights["tslot"], [0.0, 0.0, 0.0, 0.0])
-        self.assertEqual(weights["spin_clears"], [0.0, 0.0, 0.0, 0.0])
+        self.assertEqual(weights["spin_clears"][1], 0.0, "TSSに加点している")
+        self.assertGreater(weights["spin_clears"][2], 0.0, "TSDに加点していない")
+        self.assertGreater(weights["spin_clears"][3], 0.0, "TSTに加点していない")
+        self.assertEqual(weights["mini_spin_clears"], [0.0, 0.0, 0.0])
+        self.assertGreater(weights["tslot"][3], 0.0, "Tスロットを作る評価が無い")
 
     def test_client_passes_the_config_to_the_process(self) -> None:
         from unittest.mock import patch

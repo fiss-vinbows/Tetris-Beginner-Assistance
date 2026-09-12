@@ -1781,6 +1781,45 @@ class TestAssistWorkerTickOnce(unittest.TestCase):
             worker._tick_once(capture=MagicMock())
         self.assertEqual(len(received[-1].plan_steps), 1, "表示手数2なら読み筋は1手だけ")
 
+    def test_opener_continues_after_a_garbage_rise_by_shifting_the_steps_up(self) -> None:
+        # 【2026-09-12・利用者の指示】おじゃまがせり上がってもテンプレの形は
+        # その上に載るので続行する。手順の座標をせり上がった行数ぶん上へずらす。
+        worker, received = self._opener_worker()
+        self.cold_clear.poll_suggestion.return_value = _move("I")
+        with patch("src.app.time.monotonic", return_value=1000.0):
+            with patch("src.app.recognize", return_value=_recognition(current_piece="I", next_queue=("L", "S", "T", "Z", "O"))):
+                worker._tick_once(capture=MagicMock())
+                worker._tick_once(capture=MagicMock())
+        first_cells = tuple(worker._opener.steps[0].cells)  # I: (19,0)〜(19,3)
+        with patch("src.app.time.monotonic", return_value=1000.5):
+            with patch(
+                "src.app.recognize",
+                return_value=_recognition(current_piece=None, filled_cells=first_cells, next_queue=("S", "T", "Z", "O", "J")),
+            ):
+                worker._tick_once(capture=MagicMock())
+                worker._tick_once(capture=MagicMock())  # 盤面を確定
+        self.assertEqual(worker._opener.index, 1)
+        second_before = worker._opener.steps[1].cells
+
+        # おじゃま2行: Iが2行上へ、最下2行はGARBAGE(1列だけ穴)
+        risen = _recognition(
+            current_piece="L", filled_cells=tuple((r - 2, c) for r, c in first_cells), next_queue=("S", "T", "Z", "O", "J")
+        )
+        for r in (18, 19):
+            for c in range(10):
+                if c != 4:
+                    risen.board.grid[r][c] = "GARBAGE"
+        from dataclasses import replace
+        risen = replace(risen, board_key=tuple(tuple(row) for row in risen.board.grid))
+        with patch("src.app.time.monotonic", return_value=1000.8):
+            with patch("src.app.recognize", return_value=risen):
+                worker._tick_once(capture=MagicMock())
+                worker._tick_once(capture=MagicMock())
+        self.assertIsNotNone(worker._opener, "おじゃまでテンプレが中断されている")
+        self.assertEqual(
+            sorted(worker._opener.steps[1].cells), sorted((r - 2, c) for r, c in second_before), "手順が上へずれていない"
+        )
+
     def test_opener_is_not_started_when_disabled(self) -> None:
         self.cold_clear.poll_suggestion.return_value = _move("I")
         with patch("src.app.recognize", return_value=_recognition(current_piece="I", next_queue=("L", "S", "T", "Z", "O"))):
