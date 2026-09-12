@@ -35,7 +35,11 @@ _ALL_PIECES = "IOTSZJL"
 class FormItem:
     piece: str
     cells: Cells
-    spin: bool = False  # Tスピンで入れる(ハードドロップでは入らない)
+    # ハードドロップでは入らない(既存ブロックの張り出しの下に入れる。
+    # Tスピンや回転入れ)。図の既存ブロックが同じ列の上にある場合に立てる。
+    spin: bool = False
+    # 図の他のミノをすべて置いた後にだけ置く('U'で描かれたTスピン)。
+    last: bool = False
 
 
 @dataclass(frozen=True)
@@ -44,6 +48,19 @@ class OpenerForm:
     existing: frozenset[tuple[int, int]]  # 既に置いてあるべきブロック
     items: tuple[FormItem, ...]  # この図で置くミノ
     text: str
+    # ハードドロップで入らなくても回転入れで置けるとページに明記されているミノ種。
+    tuck_pieces: frozenset[str] = frozenset()
+
+
+# ページの注記で「後から回転入れできる」とされているミノ。
+# (テンプレ名, セクション名) → ミノ種。左右反転の図では J↔L・S↔Z を読み替える。
+# 迷走砲: 「2巡目の%Lは%Zを置いた後でも回転入れすることができます。(左回転)」
+_TUCK_NOTES: dict[tuple[str, str], frozenset[str]] = {
+    ("迷走砲", "理想形 > 2巡目"): frozenset("L"),
+    ("迷走砲", "通常形 > %O>%Sの場合"): frozenset("L"),
+    ("迷走砲", "通常形 > %S>%Oの場合"): frozenset("L"),
+}
+_MIRROR_PIECE = {"J": "L", "L": "J", "S": "Z", "Z": "S"}
 
 
 @dataclass(frozen=True)
@@ -74,7 +91,7 @@ def _components(cells: list[tuple[int, int]]) -> list[Cells]:
     return groups
 
 
-def parse_form(text: str, section: str = "") -> OpenerForm | None:
+def parse_form(text: str, section: str = "", tuck_pieces: frozenset[str] = frozenset()) -> OpenerForm | None:
     """テキスト盤面図を解釈する。ミノが4マスの塊になっていない図はNone。"""
     lines = [line for line in text.splitlines() if line]
     if not lines or any(len(line) != BOARD_COLS for line in lines):
@@ -93,18 +110,26 @@ def parse_form(text: str, section: str = "") -> OpenerForm | None:
     items: list[FormItem] = []
     for symbol, cells in by_symbol.items():
         if symbol == "U":
-            piece, spin = "T", True
+            piece, last = "T", True
         elif symbol.upper() in _ALL_PIECES:
-            piece, spin = symbol.upper(), False
+            piece, last = symbol.upper(), False
         else:
             return None
         for group in _components(cells):
             if len(group) != 4:
                 return None
-            items.append(FormItem(piece, group, spin))
+            # 既存ブロックが同じ列の上にあるミノは、図の上ではハードドロップで
+            # 入らない(TSDのT、回転入れのLなど)。
+            group_set = set(group)
+            blocked = any(
+                (rr, c) in existing for r, c in group for rr in range(r) if (rr, c) not in group_set
+            )
+            items.append(FormItem(piece, group, spin=last or blocked, last=last))
     if not items:
         return None
-    return OpenerForm(section=section, existing=frozenset(existing), items=tuple(items), text=text)
+    return OpenerForm(
+        section=section, existing=frozenset(existing), items=tuple(items), text=text, tuck_pieces=tuck_pieces
+    )
 
 
 def mirror_form_text(text: str) -> str:
@@ -119,11 +144,13 @@ def _build_templates() -> tuple[OpenerTemplate, ...]:
         forms: list[OpenerForm] = []
         seen: set[str] = set()
         for section, text in source_forms:
-            for variant in (text, mirror_form_text(text)):
+            tuck = _TUCK_NOTES.get((name_ja, section), frozenset())
+            for mirrored, variant in ((False, text), (True, mirror_form_text(text))):
                 if variant in seen:
                     continue
                 seen.add(variant)
-                form = parse_form(variant, section)
+                pieces = frozenset(_MIRROR_PIECE.get(p, p) for p in tuck) if mirrored else tuck
+                form = parse_form(variant, section, pieces)
                 if form is not None:
                     forms.append(form)
         templates.append(OpenerTemplate(name_ja, name_en, url, tuple(forms)))
@@ -178,20 +205,22 @@ def plan_form(
     (空なら次のミノ)を置く」のどちらかを選ぶ。Tスピンの手('U')は他のミノを
     すべて置いた後にだけ置ける。図のミノをすべて置ける手順が無ければNone。
 
-    allow_tuck: 張り出しの下へ回転入れ・横入れするミノを許すか。Noneなら、
-    まずハードドロップだけで組める手順を探し、無ければ許して探し直す。
-    テトリス堂の図には「Lは左回転で後入れできる」のように、ハードドロップ
-    では入らない置き方を前提にした形があるため(迷走砲の2巡目など)。
+    allow_tuck: 張り出しの下へ回転入れするミノ(form.tuck_pieces)を許すか。
+    Noneなら、まずハードドロップだけで組める手順を探し、無ければ許して
+    探し直す。テトリス堂の図には「Lは左回転で後入れできる」のように
+    ハードドロップでは入らない置き方を前提にした形があるため(迷走砲の
+    2巡目)。ページに明記のないミノは、入れ方が実際にあるか分からない
+    (張り出しの下へ横から入れられるとは限らない)ので許さない。
     """
     if allow_tuck is None:
         strict = plan_form(form, sequence, hold, placed, allow_tuck=False)
-        if strict is not None:
+        if strict is not None or not form.tuck_pieces:
             return strict
         return plan_form(form, sequence, hold, placed, allow_tuck=True)
 
     placed_cells = set(placed) if placed is not None else set(form.existing)
     items = form.items
-    spin_count = sum(1 for it in items if it.spin)
+    last_count = sum(1 for it in items if it.last)
     # 分かっているミノ順の先に「種類不明のミノ」を2つ足す。図の最後の手が
     # ホールドしていたミノなら、次に来るミノが何であれホールドと入れ替えて
     # 置けるため(例: TをホールドしておいてTスピンを最後に打つ)、既知の
@@ -199,13 +228,15 @@ def plan_form(
     sequence = [*sequence, "?", "?"]
 
     def placeable(item: FormItem, current_placed: set[tuple[int, int]], done: frozenset[int]) -> bool:
+        if item.last and len(done) < len(items) - last_count:
+            return False
         if item.spin:
-            if len(done) < len(items) - spin_count:
-                return False
-            return all(cell not in current_placed for cell in item.cells)
+            # 図の時点で張り出しの下にあるミノ(TSD等)は、入れ方を問わず
+            # マスが空いていれば置ける扱い。他のミノの置き順には影響させない。
+            return _can_rest(current_placed, item.cells)
         if _can_hard_drop(current_placed, item.cells):
             return True
-        return allow_tuck and _can_rest(current_placed, item.cells)
+        return allow_tuck and item.piece in form.tuck_pieces and _can_rest(current_placed, item.cells)
 
     def candidates(piece: str, current_placed: set[tuple[int, int]], done: frozenset[int]) -> list[int]:
         return [
@@ -271,7 +302,7 @@ def choose_form(
     一致は「図の既存ブロックがすべて盤面にあり、盤面にそれ以外のマスが
     1ミノ分未満(3マス以下)」で判定する。置いたばかりのミノが光って
     余分なマスとして読まれた程度なら次の図へ進めるようにするため。余分な
-    マスは置けない場所として手順探索にも渡す。
+    マスは一時的な読み取りとみなし、手順の探索では無視する。
     """
     target = frozenset(board_cells)
     # 置くミノが多い図(ホールドに残さず7つ置く形)を優先する。迷走砲のように
@@ -280,7 +311,7 @@ def choose_form(
     for form in sorted(template.forms, key=lambda f: -len(f.items)):
         if not form.existing <= target or len(target - form.existing) >= 4:
             continue
-        steps = plan_form(form, sequence, hold, placed=set(target))
+        steps = plan_form(form, sequence, hold)
         if steps is not None:
             return form, steps
     return None

@@ -136,9 +136,27 @@ class TestPlanForm(unittest.TestCase):
         tpl, form, steps = choose_opener(list("SLIOJZT"))
         board, hold, _rest = _run_steps(steps, "SLIOJZT", None, set())
         with_noise = board | {(10, 5)}
-        second = choose_form(template, with_noise, list("ILTJSZO"), hold)
+        second = choose_form(template, with_noise, list("IOTSZJL"), hold)
         self.assertIsNotNone(second, "余分なマス1つで2巡目の図が見つからない")
-        self.assertIsNone(choose_form(template, board | {(10, 0), (10, 1), (10, 2), (10, 3)}, list("ILTJSZO"), hold))
+        self.assertIsNone(choose_form(template, board | {(10, 0), (10, 1), (10, 2), (10, 3)}, list("IOTSZJL"), hold))
+
+    def test_pieces_are_not_tucked_under_other_pieces_of_the_same_form(self) -> None:
+        # 【2026-09-12実機(録画19秒)】はちみつ砲の2巡目で、先に置くJの下へSを
+        # 入れる手順を出していた(Sを入れる方法が無い)。ページに回転入れの
+        # 明記が無いミノは、ハードドロップで入る置き順だけを認めること。
+        template = _template("はちみつ砲")
+        tpl, form, steps = choose_opener(list("TZLISOJ"))
+        board, hold, _rest = _run_steps(steps, "TZLISOJ", None, set())
+        self.assertEqual(hold, "J")
+        # T O L Z S J I の順では、TをJと入れ替えた時点でJを置くしかなく、その
+        # 下に入るSを後から置けない。図は組めないと判定する。
+        self.assertIsNone(choose_form(template, board, list("TOLZSJI"), hold))
+
+    def test_noted_tuck_is_still_allowed_for_stray_cannon(self) -> None:
+        # 迷走砲2巡目の「Lは左回転で後入れ」はページに明記があるので許す。
+        template = _template("迷走砲")
+        form = next(f for f in template.forms if f.section == "理想形 > 2巡目" and "L" in f.tuck_pieces)
+        self.assertIn("L", form.tuck_pieces)
 
     def test_spin_item_is_placed_last(self) -> None:
         form = parse_form("--z-------\n-zz----o--\n-zU----oU-\nccUU--ccUc\nccUcccccc-")

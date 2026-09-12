@@ -1890,7 +1890,7 @@ class TestAssistWorkerTickOnce(unittest.TestCase):
         with patch("src.app.time.monotonic", return_value=1000.0):
             with patch(
                 "src.app.recognize",
-                return_value=_recognition(current_piece="I", hold_piece="L", filled_cells=tuple(missing), next_queue=("L", "T", "J", "S", "Z")),
+                return_value=_recognition(current_piece="I", hold_piece="L", filled_cells=tuple(missing), next_queue=("O", "T", "S", "Z", "J")),
             ):
                 worker._tick_once(capture=MagicMock())
         self.assertIsNone(worker._opener)
@@ -1898,7 +1898,7 @@ class TestAssistWorkerTickOnce(unittest.TestCase):
         with patch("src.app.time.monotonic", return_value=1000.3):
             with patch(
                 "src.app.recognize",
-                return_value=_recognition(current_piece="I", hold_piece="L", filled_cells=tuple(board), next_queue=("L", "T", "J", "S", "Z")),
+                return_value=_recognition(current_piece="I", hold_piece="L", filled_cells=tuple(board), next_queue=("O", "T", "S", "Z", "J")),
             ):
                 worker._tick_once(capture=MagicMock())
         self.assertIsNotNone(worker._opener, "盤面が読めた後も2巡目が始まらない")
