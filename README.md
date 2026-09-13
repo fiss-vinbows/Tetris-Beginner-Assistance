@@ -138,3 +138,9 @@ venv\Scripts\python tools/cold_clear_self_play.py --seeds 5 --max-moves 100 --th
 - `bench_capture_strategy.py` — 画面キャプチャを1回にまとめる方式と、盤面/HOLD/NEXTの3回に分ける方式を比較する。
 
 実測では通信は1〜3ms程度でボトルネックにならず、`recognize()`側（特にmssの画面キャプチャが約18〜20ms）が支配的だった。キャプチャ回数を減らす方向（現行の1回にまとめる方式）が分割方式より高速であることを確認済み。GPUベースの高速キャプチャ（dxcam等のDesktop Duplication API）はメディアン1.5ms程度と大幅に速い一方、静止フレームで頻繁に`None`を返す不安定さと、全画面排他モードのゲームで動作しないことがある既知の制約があるため、現時点では採用を見送っている。
+
+## ライセンス
+
+TBA本体は[MIT License](LICENSE)。
+
+思考エンジンである[Cold Clear 2](https://github.com/MinusKelvin/cold-clear-2)はMIT/Apache-2.0のデュアルライセンスで、サブプロセス（`cold-clear-2.exe`）として実行時に呼び出す形で利用している。実行ファイル形式の配布物にはこのバイナリを同梱するため、`tools/build_exe.py`が`external/cold-clear-2/`のライセンス文（`LICENSE-MIT`・`LICENSE-APACHE`）を`dist/TBA/licenses/`にコピーし、再配布条件（著作権表示・許諾文の同梱）を満たしている。

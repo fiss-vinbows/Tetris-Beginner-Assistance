@@ -30,6 +30,14 @@ def main() -> None:
     if calibration.exists():
         shutil.copy2(calibration, DIST / "config" / "calibration.json")
     shutil.copy2(ROOT / "README.md", DIST / "README.md")
+    shutil.copy2(ROOT / "LICENSE", DIST / "LICENSE")
+
+    # cold-clear-2.exe(MIT/Apache-2.0デュアルライセンス)を同梱配布するため、
+    # 再配布条件(著作権表示・許諾文の同梱)を満たすようライセンス文も添付する。
+    cold_clear_licenses_dir = ROOT / "external" / "cold-clear-2"
+    (DIST / "licenses").mkdir(exist_ok=True)
+    for license_name in ("LICENSE-MIT", "LICENSE-APACHE"):
+        shutil.copy2(cold_clear_licenses_dir / license_name, DIST / "licenses" / license_name)
     print(f"配布物: {DIST}")
 
 
