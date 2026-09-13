@@ -8,9 +8,12 @@ a = Analysis(
     ["tba_launcher.py"],
     pathex=["."],
     binaries=[],
-    # ミノのテンプレート画像は読み取り専用データとして同梱する
-    # (src/paths.py の resource_root() から参照)。
-    datas=[("src/vision/templates/*.png", "src/vision/templates")],
+    # ミノのテンプレート画像・ウィンドウアイコンは読み取り専用データとして
+    # 同梱する(src/paths.py の resource_root() から参照)。
+    datas=[
+        ("src/vision/templates/*.png", "src/vision/templates"),
+        ("assets/icon.ico", "assets"),
+    ],
     hiddenimports=[],
     hookspath=[],
     runtime_hooks=[],
@@ -32,6 +35,7 @@ exe = EXE(
     upx=False,
     console=False,  # コンソールを出さない(以前の pythonw 起動と同じ)
     disable_windowed_traceback=False,
+    icon="assets/icon.ico",
 )
 coll = COLLECT(
     exe,

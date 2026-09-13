@@ -23,10 +23,6 @@
 - `tests/` — 単体テスト（自前思考ルーチン、盤面認識、`app.py`のミノ検出・状態遷移ロジック、Cold Clear 2座標変換・統合、オーバーレイ座標計算など）
 - `tools/` — 自己対戦シミュレーター、デバッグ用スクリプト
 
-## なぜ2つの思考エンジンがあるのか
-
-当初は`evaluator.py`/`solver.py`に自前のビームサーチ実装（穴・高さ・井戸などのヒューリスティック）を組んでいたが、T-spinやパーフェクトクリアといった現代テトリスの高度なテクニックを一切考慮できない設計だった。実戦で磨かれた強豪AIである Cold Clear 2 を統合し、現在の支援モードはこちらを使っている。自前実装は、テストや「思考ロジック単体の健全性を画像認識から切り離して検証する」ための土台として残っている。
-
 ## セットアップ
 
 ### 1. Python環境
@@ -72,6 +68,16 @@ cargo build --release
 ```bash
 venv\Scripts\pip install pyinstaller
 venv\Scripts\python.exe tools\build_exe.py
+```
+
+配布物では、実機の画面キャプチャを含むデバッグログ・画面録画機能(`src/paths.py`の
+`is_frozen()`で判定)を無効化しており、メイン画面にチェックボックス自体が
+表示されない。ソースから起動した場合(開発時)はこれまで通り利用できる。
+
+起動アイコン(`assets/icon.ico`、`TBA.spec`の`icon`から参照)を作り直す場合:
+
+```bash
+venv\Scripts\python.exe tools\generate_icon.py
 ```
 
 ### ソースから起動(開発時)

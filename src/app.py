@@ -67,7 +67,7 @@ from src.engine.openers import (
     known_sequence,
     shift_cells_for_clears,
 )
-from src.paths import APP_TITLE, app_root, is_frozen
+from src.paths import APP_TITLE, app_root, is_frozen, resource_root
 from src.overlay.renderer import (
     PLAN_DOT_ALPHA,
     PLAN_DOT_RADIUS_RATIO,
@@ -3836,30 +3836,37 @@ class MainWindow(QtWidgets.QWidget):
         self.assist_btn.clicked.connect(self._on_toggle_assist)
         layout.addWidget(self.assist_btn)
 
-        self.debug_log_checkbox = QtWidgets.QCheckBox(
-            f"認識結果をログに出力する ({DEBUG_LOG_PATH.name} / {DEBUG_FRAMES_DIR.name}\\)"
-        )
-        self.debug_log_checkbox.setToolTip(
-            "最善手が明らかにおかしいと感じた時、AIが実際に何を盤面として"
-            "認識していたかを突き合わせて確認するためのデバッグ用ログです。\n"
-            f"テキストログに加えて、実際にキャリブレーション座標で切り出した"
-            f"盤面・ホールド・ネクストの生画像を{DEBUG_FRAMES_DIR.name}フォルダに"
-            "直近1回分保存します（座標そのもののズレを画像で確認できます）。"
-        )
-        layout.addWidget(self.debug_log_checkbox)
+        # デバッグログ・画面録画は開発時の不具合調査用の機能であり、
+        # 実機の画面キャプチャを含むファイルを生成するため、配布物(exe)
+        # では機能自体を無効化する(チェックボックスを表示しない)。
+        if is_frozen():
+            self.debug_log_checkbox = None
+            self.record_video_checkbox = None
+        else:
+            self.debug_log_checkbox = QtWidgets.QCheckBox(
+                f"認識結果をログに出力する ({DEBUG_LOG_PATH.name} / {DEBUG_FRAMES_DIR.name}\\)"
+            )
+            self.debug_log_checkbox.setToolTip(
+                "最善手が明らかにおかしいと感じた時、AIが実際に何を盤面として"
+                "認識していたかを突き合わせて確認するためのデバッグ用ログです。\n"
+                f"テキストログに加えて、実際にキャリブレーション座標で切り出した"
+                f"盤面・ホールド・ネクストの生画像を{DEBUG_FRAMES_DIR.name}フォルダに"
+                "直近1回分保存します（座標そのもののズレを画像で確認できます）。"
+            )
+            layout.addWidget(self.debug_log_checkbox)
 
-        self.record_video_checkbox = QtWidgets.QCheckBox(
-            f"支援モード中の画面を録画する ({DEBUG_VIDEO_PATH.name}、暫定機能)"
-        )
-        self.record_video_checkbox.setToolTip(
-            "不具合報告のたびに別の画面録画ソフトで撮り直す手間を省くための"
-            "暫定機能です。キャリブレーション済みの範囲(盤面+HOLD+NEXT欄)を"
-            f"支援モード中ずっと{DEBUG_VIDEO_PATH.name}に録画します"
-            "(次回の支援モード開始時に上書きされます)。\n"
-            "画面キャプチャなので、オーバーレイの提案(色ドット)も"
-            "外部の画面録画ソフトと同様に映り込みます。"
-        )
-        layout.addWidget(self.record_video_checkbox)
+            self.record_video_checkbox = QtWidgets.QCheckBox(
+                f"支援モード中の画面を録画する ({DEBUG_VIDEO_PATH.name}、暫定機能)"
+            )
+            self.record_video_checkbox.setToolTip(
+                "不具合報告のたびに別の画面録画ソフトで撮り直す手間を省くための"
+                "暫定機能です。キャリブレーション済みの範囲(盤面+HOLD+NEXT欄)を"
+                f"支援モード中ずっと{DEBUG_VIDEO_PATH.name}に録画します"
+                "(次回の支援モード開始時に上書きされます)。\n"
+                "画面キャプチャなので、オーバーレイの提案(色ドット)も"
+                "外部の画面録画ソフトと同様に映り込みます。"
+            )
+            layout.addWidget(self.record_video_checkbox)
 
         self.opener_checkbox = QtWidgets.QCheckBox("開幕テンプレを提示する(はちみつ砲・迷走砲・山岳積み2号・オリーブ積み)")
         self.opener_checkbox.setChecked(True)
@@ -3958,8 +3965,12 @@ class MainWindow(QtWidgets.QWidget):
         self.assist_mode = True
         self.last_valid_draw_data = None
 
-        debug_log_path = DEBUG_LOG_PATH if self.debug_log_checkbox.isChecked() else None
-        record_video = self.record_video_checkbox.isChecked()
+        debug_log_path = (
+            DEBUG_LOG_PATH
+            if self.debug_log_checkbox is not None and self.debug_log_checkbox.isChecked()
+            else None
+        )
+        record_video = self.record_video_checkbox is not None and self.record_video_checkbox.isChecked()
         self.worker = AssistWorker(
             self.calibration,
             self.cold_clear,
@@ -4074,6 +4085,12 @@ def _log_uncaught_exception(exc_type, exc_value, exc_traceback) -> None:
 def main() -> None:
     sys.excepthook = _log_uncaught_exception
     app = QtWidgets.QApplication(sys.argv)
+    # exeファイル自体のアイコン(TBA.spec)とは別に、Qtはウィンドウの
+    # タイトルバー・Alt+Tabのアイコンをこちらの設定で決めるため、
+    # 明示的に設定しないとPythonのデフォルトアイコンのままになる。
+    icon_path = resource_root() / "assets" / "icon.ico"
+    if icon_path.exists():
+        app.setWindowIcon(QtGui.QIcon(str(icon_path)))
     window = MainWindow()
     window.show()
     app.exec()
