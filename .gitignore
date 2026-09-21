@@ -4,6 +4,7 @@ __pycache__/
 *.pyc
 
 # 実機デバッグの生成物(画面キャプチャを含むため公開しない)
+debug_logs/
 debug_log.txt
 debug_capture.mp4
 debug_frames/
