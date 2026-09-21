@@ -29,7 +29,7 @@ import statistics
 import sys
 import time
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from dataclasses import replace as dataclass_replace
 from typing import NamedTuple
 from datetime import datetime
@@ -56,6 +56,7 @@ from src.capture.calibrate import CONFIG_PATH, CalibrationResult, load_calibrati
 from src.capture.screen_capture import CaptureRegion, ScreenCapture
 from src.engine.board_state import BoardState
 from src.engine.cold_clear_client import ColdClearClient, ColdClearMove
+from src.engine.opener_recovery import RecoveryGate, RecoveryState, RecoveryStep, TurnState, find_recovery
 from src.engine.openers import (
     OpenerForm,
     OpenerStep,
@@ -97,9 +98,27 @@ COLD_CLEAR_ERRORS = (TimeoutError, OSError, ValueError, RuntimeError)
 # 何かトラブルで終了操作ができなくなった場合の保険。この時間が経つと自動的に通常モードへ戻る。
 SAFETY_TIMEOUT_MS = 10 * 60 * 1000  # 10分
 
-# 認識結果デバッグログの出力先。最善手が実際の盤面と食い違って見える時、
-# AIがそのtickで何を認識していたかを突き合わせて確認するために使う。
-DEBUG_LOG_PATH = app_root() / "debug_log.txt"
+# 認識結果デバッグログ・画面録画をまとめるフォルダ。
+# 【2026-09-13・利用者の指示】以前はdebug_log.txt/debug_capture.mp4を
+# app_root()直下に固定名で置き、支援モード開始のたびに上書きしていたが、
+# 前回の不具合報告の記録が次の起動で消えてしまう問題があった。支援モード
+# 開始ごとにタイムスタンプ付きの別ファイルとして残すよう変更し、
+# 置き場所もこのフォルダにまとめる(_new_debug_log_paths参照)。
+DEBUG_LOG_DIR = app_root() / "debug_logs"
+
+
+def _new_debug_log_paths() -> tuple[Path, Path]:
+    """支援モード開始のたびに呼び、上書きされない一意なログ・動画パスを返す。
+
+    ログと動画を同じタイムスタンプにすることで、あとから同じ支援モードの
+    記録同士を突き合わせやすくする。
+    """
+    DEBUG_LOG_DIR.mkdir(exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return (
+        DEBUG_LOG_DIR / f"debug_log_{timestamp}.txt",
+        DEBUG_LOG_DIR / f"debug_capture_{timestamp}.mp4",
+    )
 
 # このapp.pyモジュールが最初にimportされた（＝プロセスが起動した）時点での
 # app.py自身の最終更新時刻。モジュールレベルで一度だけ評価されるため、
@@ -121,11 +140,10 @@ _APP_MODULE_LOAD_TIME = datetime.fromtimestamp(
 # テキストログだけでは分からない「座標そのもののズレ」を画像で直接確認するため。
 DEBUG_FRAMES_DIR = app_root() / "debug_frames"
 
-# 支援モード中の画面録画(暫定機能)の保存先。実機での不具合報告のたびに
-# 別途画面録画ソフトで撮り直すのが手間だという要望を受け、キャリブレーション
-# 済みの撮影範囲(盤面+HOLD+NEXT欄)をアプリ自身で録画できるようにする。
-# 支援モード開始のたびに上書きする(直近1回分のみ保持)。
-DEBUG_VIDEO_PATH = app_root() / "debug_capture.mp4"
+# 支援モード中の画面録画(暫定機能)。実機での不具合報告のたびに別途画面
+# 録画ソフトで撮り直すのが手間だという要望を受け、キャリブレーション済みの
+# 撮影範囲(盤面+HOLD+NEXT欄)をアプリ自身で録画できるようにする。実際の
+# 保存先は支援モード開始のたびに_new_debug_log_paths()が生成する。
 
 # 画面録画の目標フレームレート。毎tick(IDLE_SLEEP_MS=8ms間隔)書き出すと
 # ファイルサイズ・エンコード負荷が過大になるため間引く。人間が後から見て
@@ -1636,9 +1654,46 @@ class _OpenerRun:
     # 固定を検知してから、盤面が手順どおりになったのをまだ確認できていない
     # 場合の検知時刻。Noneなら確認待ちではない。
     awaiting_since: float | None = None
+    # 【認識欠落後の復元(src.engine.opener_recovery参照)】
+    # 最後に確定したテンプレ状態(盤面・残り手順・手番)。手順を進めるたびに更新。
+    recovery_snapshot: RecoveryState | None = None
+    # 認識欠落(recognize()がNoneを返し続けて認識状態をリセットした)を経て、
+    # まだ手順位置を確認できていない。Trueの間は手順を表示せず復元を試みる。
+    recovery_pending: bool = False
+    # 復元待ちで、信頼できる観測(手番と盤面が確定した認識結果)が得られた
+    # 時間の累計。認識失敗・手番不明・盤面保留のtickは加算しない
+    # (【有識者レビュー2026-09-15】初回観測からの経過時間で期限を判定すると、
+    # 途中の認識不能時間まで復元待ち時間に含まれてしまう)。
+    recovery_observed_sec: float = 0.0
+    # 直前のtickが信頼できる観測だった場合、その時刻。無効な観測でNoneに戻す。
+    recovery_last_valid_at: float | None = None
+    recovery_gate: RecoveryGate = field(default_factory=RecoveryGate)
+
+    def note_invalid_observation(self) -> None:
+        """復元待ち中に信頼できない観測(認識失敗・手番不明・盤面保留)があった。
+
+        連続一致の回数を消し、時間の累計を一旦止める(候補A一致→無効観測→
+        候補A一致で確定しないように。【有識者レビュー2026-09-15】)。
+        """
+        self.recovery_last_valid_at = None
+        self.recovery_gate.reset()
 
     def current_step(self) -> OpenerStep | None:
         return self.steps[self.index] if self.index < len(self.steps) else None
+
+    def is_reduced(self) -> bool:
+        """図どおりに全部は組めず、必須ミノ(砲)だけに縮小した手順か。
+
+        plan_formは組めないミノ順だとform.requiredのミノだけの図で探し直す
+        (パフェは諦めて砲まで組む)。その場合も図(form)は元のままなので、
+        手順数が図のミノ数より少ないことで見分ける。【2026-09-14実機】
+        「パフェ狙い」の表示なのにTスピンだけの手が出て紛らわしかった。
+        """
+        return len(self.steps) < len(self.form.items)
+
+    def label_section(self) -> str:
+        section = self.form.section.split(" > ")[-1]
+        return f"{section}\n(砲のみ・パフェ等は断念)" if self.is_reduced() else section
 
     def expected_after_current(self) -> set[tuple[int, int]]:
         return apply_step(self.board, self.steps[self.index].cells)
@@ -1897,6 +1952,7 @@ class AssistWorker(QtCore.QThread):
         cold_clear: ColdClearClient,
         debug_log_path: Path | None,
         record_video: bool = False,
+        video_path: Path | None = None,
         opener_enabled: bool = False,
         plan_depth: int = 3,
     ) -> None:
@@ -1910,8 +1966,10 @@ class AssistWorker(QtCore.QThread):
         self._debug_log_path = debug_log_path
         self._debug_log_file = None
         # 画面録画(暫定機能)。有効な場合、支援モード中キャリブレーション
-        # 済みの範囲(盤面+HOLD+NEXT欄)をDEBUG_VIDEO_PATHへmp4で書き出す。
+        # 済みの範囲(盤面+HOLD+NEXT欄)をvideo_pathへmp4で書き出す。
+        # video_path省略時(テスト等)はDEBUG_LOG_DIR直下の固定名にフォールバックする。
         self._record_video = record_video
+        self._video_path = video_path or (DEBUG_LOG_DIR / "debug_capture.mp4")
         self._video_writer = None
         self._last_video_frame_time: float = 0.0
         # 【2026-09-07・暫定のデバッグ機能】next_debug_ready参照。
@@ -2071,6 +2129,14 @@ class AssistWorker(QtCore.QThread):
         self._opener_continue_since: float | None = None
         # 「該当なし」を同じミノ順で毎tick記録しないための控え。
         self._opener_declined_sequence: list[str] | None = None
+        # キャプチャごとに増える通し番号。復元の確定に「別のキャプチャで同じ
+        # 候補が一致した」ことを要求するための識別子(opener_recovery.RecoveryGate)。
+        self._tick_serial = 0
+        # 対局開始(盤面空・HOLD空)からテンプレどおりに固定を確認できた数。
+        # 「固定数 + HOLD占有なら1」が、最後にNEXTから配られたミノの通し番号
+        # になり、7の倍数ならそのミノが袋の先頭(known_sequence参照)。
+        # テンプレを中断・断念したらNone(袋の位置は分からない)。
+        self._opener_locks: int | None = None
 
     def stop(self) -> None:
         self._running = False
@@ -2078,6 +2144,7 @@ class AssistWorker(QtCore.QThread):
     def run(self) -> None:  # noqa: D102 - QThreadの規約通りの名前
         capture = ScreenCapture()
         if self._debug_log_path is not None:
+            self._debug_log_path.parent.mkdir(exist_ok=True)
             self._debug_log_file = open(self._debug_log_path, "a", encoding="utf-8")
             # _APP_MODULE_LOAD_TIME(モジュールがプロセスに読み込まれた時点の
             # app.py更新時刻。詳細は定義箇所のコメント参照)を記録する。
@@ -2123,6 +2190,7 @@ class AssistWorker(QtCore.QThread):
 
     def _tick_once(self, capture: ScreenCapture) -> None:
         tick_started = time.perf_counter()
+        self._tick_serial += 1
         if self._record_video:
             video_started = time.perf_counter()
             self._record_video_frame(capture)
@@ -2154,6 +2222,8 @@ class AssistWorker(QtCore.QThread):
         if recognition is None:
             self._consecutive_recognition_failures += 1
             self._note_recognition_failure()
+            if self._opener is not None and self._opener.recovery_pending:
+                self._opener.note_invalid_observation()
             if self._consecutive_recognition_failures >= MAX_CONSECUTIVE_RECOGNITION_FAILURES:
                 self._last_current_piece = None
                 self._expected_current_piece = None
@@ -2170,6 +2240,23 @@ class AssistWorker(QtCore.QThread):
                 self._last_stabilized_recognition = None
                 self._prev_hold_piece = "UNKNOWN"
                 self._disallow_hold_active = False
+                if self._opener is not None and not self._opener.recovery_pending:
+                    # 【2026-09-13実機】演出で盤面が読めない間も手は進む。認識
+                    # 状態をリセットしたので固定の検知は当てにできない。復帰後は
+                    # 最後に確定した状態から何手進んだかを復元する
+                    # (_recover_opener_position)。テンプレ用の確定状態
+                    # (recovery_snapshot)はこのリセットに巻き込まない。
+                    self._opener.recovery_pending = True
+                    self._opener.recovery_observed_sec = 0.0
+                    self._opener.note_invalid_observation()
+                    self._log_opener("認識欠落: 復帰後に手順位置を復元する")
+                    # 手順位置が不明になったので、表示中のテンプレの手は消す
+                    # (古いドットを信じて置く誤りを防ぐ。短い認識失敗では
+                    # 従来どおり保持する。【2026-09-15・利用者の決定】)。
+                    if self._last_valid_draw_data is not None:
+                        self._last_valid_draw_data = None
+                        self._last_draw_data_set_time = time.monotonic()
+                        self.draw_data_ready.emit(None)
                 # 【表示中の提案はここでは消さない】
                 # 仕様は「提示した配置は、実際にミノを置くまで変更しない」で
                 # あり、認識できないことは「置いた」ことを意味しない。
@@ -2813,6 +2900,10 @@ class AssistWorker(QtCore.QThread):
         # 「前後2つの提案が一瞬両方見える」不具合が実機で確認されたため。
         now = time.monotonic()
         should_poll = significant_change or (now - self._last_poll_time) >= self.POLL_INTERVAL_SEC
+        if self._opener is not None and self._opener.recovery_pending:
+            # 復元待ち(_recover_opener_position)は毎tickの観測で候補を照合し、
+            # 確定したtickで表示も更新したいので間引かない。
+            should_poll = True
         if not should_poll:
             # pollをスキップする場合でも、このtickで古い提案が無効と判定
             # されていれば、それだけは反映してから戻る（次にpollされる
@@ -2938,7 +3029,11 @@ class AssistWorker(QtCore.QThread):
 
         self._check_opener_progress(recognition)
         self._maybe_start_opener(recognition)
-        if self._opener is not None and self._opener.current_step() is not None:
+        if self._opener is not None and self._opener.recovery_pending:
+            # 復元待ち: 手順位置が確定していないので古い手も、テンプレの履歴と
+            # 食い違うAIの提案も出さない(表示中の提案は保持される)。
+            best = None
+        elif self._opener is not None and self._opener.current_step() is not None:
             # 開幕テンプレ進行中はAIの提案の代わりにテンプレの手を出す。
             # 以降の検査(実行可能なミノか、物理的に成立するか)は同じように通す。
             best = self._opener.as_move()
@@ -2988,7 +3083,7 @@ class AssistWorker(QtCore.QThread):
                 use_hold=best.use_hold,
                 plan_steps=_plan_steps_on_screen(recognition.board, best)[: self._plan_depth - 1],
                 label=(
-                    f"開幕テンプレ\n{self._opener.template.name_ja}\n{self._opener.form.section.split(' > ')[-1]}"
+                    f"開幕テンプレ\n{self._opener.template.name_ja}\n{self._opener.label_section()}"
                     if self._opener is not None
                     else _tspin_label(recognition.board, best)
                 ),
@@ -3022,7 +3117,7 @@ class AssistWorker(QtCore.QThread):
 
     def _record_video_frame(self, capture: ScreenCapture) -> None:
         """画面録画(暫定機能)。キャリブレーション済みの範囲(盤面+HOLD+NEXT欄)を
-        VIDEO_RECORD_FPSで間引きながらDEBUG_VIDEO_PATHへmp4として書き出す。
+        VIDEO_RECORD_FPSで間引きながらself._video_pathへmp4として書き出す。
 
         不具合報告のたびに別の画面録画ソフトで撮り直す手間をなくすための
         暫定対応。実画面をキャプチャするため、オーバーレイの提案(色ドット)
@@ -3039,9 +3134,10 @@ class AssistWorker(QtCore.QThread):
             frame = _grab_calibrated_region(self.calibration, capture)
             height, width = frame.shape[0], frame.shape[1]
             if self._video_writer is None:
+                self._video_path.parent.mkdir(exist_ok=True)
                 fourcc = cv2.VideoWriter_fourcc(*"mp4v")
                 self._video_writer = cv2.VideoWriter(
-                    str(DEBUG_VIDEO_PATH), fourcc, VIDEO_RECORD_FPS, (width, height)
+                    str(self._video_path), fourcc, VIDEO_RECORD_FPS, (width, height)
                 )
             bgr_frame = frame[:, :, ::-1].copy()
             # オーバーレイ自体は自己汚染防止のためこのフレームに映らないので、
@@ -3438,8 +3534,9 @@ class AssistWorker(QtCore.QThread):
 
         開始: 盤面が空・HOLDが空の手番では、1巡目のミノ順で組めるテンプレを
         探す。1つの図を置き終えた後は、同じテンプレの中から今の盤面に
-        既存ブロックが一致し、今のミノ順(操作ミノ+NEXT5枠、同じ袋なら
-        残り1つも確定)とホールドで組める図を探して続ける(2巡目以降)。
+        既存ブロックが一致し、今のミノ順(操作ミノ+NEXT5枠、袋の位置が
+        分かっていれば残り1つも確定)とホールドで組める図を探して続ける
+        (2巡目以降)。
         進行: 固定を検知したら確認待ちにし、_check_opener_progressで盤面が
         手順どおりになったか毎tick確かめる。
         """
@@ -3458,10 +3555,13 @@ class AssistWorker(QtCore.QThread):
                         self._log_opener(f"中断(おじゃま{garbage_rise}行で盤面上端を超える)")
                         self._opener = None
                         self._opener_continuing = None
+                        self._opener_locks = None
                         return
                     shifted.append(OpenerStep(step.piece, cells, step.use_hold, step.spin))
                 opener.steps = shifted
                 opener.board = {(r - garbage_rise, c) for r, c in opener.board}
+                if opener.recovery_snapshot is not None:
+                    opener.recovery_snapshot = self._snapshot_opener(opener, opener.recovery_snapshot.turn)
                 self._log_opener(f"おじゃま{garbage_rise}行: 手順を上へずらして続行")
             if locked_now and opener.awaiting_since is None:
                 # 固定を検知した。盤面が手順どおりになったかは、光っている
@@ -3480,15 +3580,20 @@ class AssistWorker(QtCore.QThread):
         if self._opener is not None or not self._opener_enabled or not recognition.hold_known:
             return
         board_cells = _non_garbage_cells(recognition.board)
+        hold = recognition.hold_piece
         if not board_cells:
             # 盤面が空: 新しい対局。前のテンプレの続きは忘れる。
             self._opener_continuing = None
+            # HOLDも空なら対局の最初の手番とみなし、袋の先頭から数え始める
+            # (全消去後や途中起動でも盤面は空になりうるが、その区別は
+            # 付けられないので、以前からの「空なら開幕」の前提を引き継ぐ)。
+            self._opener_locks = 0 if hold is None else None
         if any(cell is not None and cell[0] is None for row in recognition.pending_grid for cell in row):
             return  # 盤面がまだ確定していない(消えた行が残っている等)
-        sequence = known_sequence(self._last_current_piece, recognition.next_queue)
+        bag_position = None if self._opener_locks is None else self._opener_locks + (1 if hold is not None else 0)
+        sequence = known_sequence(self._last_current_piece, recognition.next_queue, hold, bag_position)
         if sequence is None:
             return
-        hold = recognition.hold_piece
         # 【2026-09-12・利用者の指示】おじゃまが来ていても図は続ける。図は
         # 盤面の最下段から描かれているので、おじゃま行の数だけ下へずらした
         # 座標で既存ブロックを照合し、手順は上へ戻す。
@@ -3508,6 +3613,7 @@ class AssistWorker(QtCore.QThread):
                     )
                     self._opener_continuing = None
                     self._opener_continue_since = None
+                    self._opener_locks = None
                 return
             template = self._opener_continuing
             form, steps = chosen_form
@@ -3529,8 +3635,18 @@ class AssistWorker(QtCore.QThread):
             if any(r < 0 for st in steps for r, _c in st.cells):
                 self._log_opener(f"おじゃま{garbage_rows}行で図が盤面上端を超えるため始めない")
                 self._opener_continuing = None
+                self._opener_locks = None
                 return
-        self._opener = _OpenerRun(template=template, form=form, steps=steps, board=set(board_cells))
+        # 【2026-09-15実機】基準の盤面は実盤面ではなく図の既存セルにする。
+        # choose_formは光っている残像などの余分なマス(3つまで)を許容して図に
+        # 一致させるが、それを実盤面ごと基準に取り込むと、幻のマスが期待盤面に
+        # 混入し、手順どおりに置いても「手順と異なる盤面」で中断した
+        # (山岳積み2号の3巡目)。余分なマスは従来どおり期待外(4未満)として扱う。
+        run_board = {(r - garbage_rows, c) for r, c in form.existing}
+        self._opener = _OpenerRun(template=template, form=form, steps=steps, board=run_board)
+        turn = self._observed_turn(recognition)
+        if turn is not None:
+            self._opener.recovery_snapshot = self._snapshot_opener(self._opener, turn)
         self._opener_continuing = None
         self._opener_continue_since = None
         # AIの提案を先に出していた場合でも、この手番からテンプレの手に切り替える。
@@ -3538,7 +3654,8 @@ class AssistWorker(QtCore.QThread):
         self._committed_placement_tbp = None
         self._committed_move = None
         self._log_opener(
-            f"開始 {template.name_ja} [{form.section}] ミノ順={''.join(sequence)} hold={hold} 手順="
+            f"開始 {template.name_ja} [{form.section}]{'(砲のみに縮小)' if self._opener.is_reduced() else ''}"
+            f" ミノ順={''.join(sequence)} hold={hold} 手順="
             + " ".join(f"{s.piece}{'(H)' if s.use_hold else ''}{'(spin)' if s.spin else ''}" for s in steps)
         )
 
@@ -3547,6 +3664,10 @@ class AssistWorker(QtCore.QThread):
     OPENER_CONFIRM_TIMEOUT_SEC = 1.5
     # 図を置き終えてから、次の図を探し続ける秒数。
     OPENER_CONTINUE_TIMEOUT_SEC = 3.0
+    # 認識欠落から復帰した後、手順位置を復元できるまで待つ秒数。信頼できる
+    # 観測が得られた時間の累計で数え、認識できない時間は含めない。超えたら
+    # 手順を見失ったとみなしてテンプレをやめる。
+    OPENER_RECOVERY_TIMEOUT_SEC = 3.0
 
     def _check_opener_progress(self, recognition: RecognitionResult) -> None:
         """固定後、盤面が手順どおりになったかを毎tick確認して手順を進める。
@@ -3561,10 +3682,42 @@ class AssistWorker(QtCore.QThread):
         (apply_step)と比べる。図を置き終えたら次の図を探す(_update_opener)。
         """
         opener = self._opener
-        if opener is None or opener.awaiting_since is None:
+        if opener is None:
+            return
+        if opener.recovery_pending:
+            # 認識欠落を経た直後。固定の検知(awaiting_since)自体を取り逃して
+            # いる可能性があるので、旧来の「期待外4マスで即中断」より前に
+            # 何手進んだかの復元を試みる。
+            self._recover_opener_position(recognition)
+            return
+        if opener.awaiting_since is None:
             return
         actual = _non_garbage_cells(recognition.board)
         expected = opener.expected_after_current()
+        board_confirmed = recognition.board_key == self._last_board_key
+        if not expected <= actual and board_confirmed:
+            # 【2026-09-15実機 迷走砲2巡目】固定とおじゃまのせり上がりが同じ
+            # フレームで観測されると、_detect_garbage_rise(全行がそのまま上へ
+            # 移動する条件)では検出できず、_update_openerの座標ずらしが働かない。
+            # ここでは「期待盤面をk行上へずらすと一致し、下k行以上がおじゃま」
+            # ならせり上がりとみなして手順をずらす(確認済みの盤面に限る)。
+            garbage_rows = _garbage_row_count(recognition.board)
+            for rise in range(1, min(_MAX_GARBAGE_RISE, garbage_rows) + 1):
+                shifted_expected = {(r - rise, c) for r, c in expected}
+                if shifted_expected <= actual and len(actual - shifted_expected) < 4:
+                    shifted_steps = [
+                        OpenerStep(st.piece, tuple((r - rise, c) for r, c in st.cells), st.use_hold, st.spin)
+                        for st in opener.steps
+                    ]
+                    if any(r < 0 for st in shifted_steps for r, _c in st.cells):
+                        break
+                    opener.steps = shifted_steps
+                    opener.board = {(r - rise, c) for r, c in opener.board}
+                    if opener.recovery_snapshot is not None:
+                        opener.recovery_snapshot = self._snapshot_opener(opener, opener.recovery_snapshot.turn)
+                    expected = opener.expected_after_current()
+                    self._log_opener(f"固定と同時におじゃま{rise}行: 手順を上へずらして続行")
+                    break
         extra = actual - expected
         if expected <= actual and len(extra) < 4:
             # 【2026-09-12実機】この手でラインが消えたら(TSD等)、図の残りの手は
@@ -3581,6 +3734,11 @@ class AssistWorker(QtCore.QThread):
             opener.board = expected
             opener.index += 1
             opener.awaiting_since = None
+            if self._opener_locks is not None:
+                self._opener_locks += 1
+            turn = self._observed_turn(recognition)
+            if turn is not None:
+                opener.recovery_snapshot = self._snapshot_opener(opener, turn)
             if opener.current_step() is None:
                 self._log_opener(f"図を置き終えた [{opener.form.section}]")
                 self._opener_continuing = opener.template
@@ -3588,12 +3746,115 @@ class AssistWorker(QtCore.QThread):
                 self._opener = None
             return
         elapsed = time.monotonic() - opener.awaiting_since
-        if len(extra) >= 4 or elapsed >= self.OPENER_CONFIRM_TIMEOUT_SEC:
+        # 【2026-09-15実機】期待外4マスの即中断は、盤面が2tick確認された
+        # ときだけ。おじゃまのせり上がりは確認後に手順の座標をずらす
+        # (_update_opener)ので、せり上がりを初めて観測した未確認のtickで
+        # 即中断すると、ずらす前に「手順と異なる盤面」になってしまった(迷走砲)。
+        if (len(extra) >= 4 and board_confirmed) or elapsed >= self.OPENER_CONFIRM_TIMEOUT_SEC:
             self._log_opener(
                 f"中断(手順と異なる盤面 {elapsed:.1f}秒) 期待={sorted(expected)} 実際={sorted(actual)}"
             )
             self._opener = None
             self._opener_continuing = None
+            self._opener_locks = None
+
+    def _observed_turn(self, recognition: RecognitionResult) -> TurnState | None:
+        """復元の照合に使う、今の手番の観測。操作ミノかHOLDが未確定ならNone。"""
+        current = self._last_current_piece
+        if current is None or not recognition.hold_known:
+            return None
+        return TurnState(current, recognition.hold_piece, tuple(recognition.next_queue), not self._disallow_hold_active)
+
+    @staticmethod
+    def _snapshot_opener(opener: _OpenerRun, turn: TurnState) -> RecoveryState:
+        """今の手順位置を復元の起点として保存する。
+
+        次の手が「HOLDして置く」で、観測上この手番のHOLDが既に済んでいる
+        (HOLD不可で操作ミノがその手のミノ)なら、HOLD指示を消して保存する。
+        観測と手順がずれたままの起点からは正しい候補を作れないため。
+        """
+        remaining = [RecoveryStep(st.piece, tuple(st.cells), st.use_hold, st.spin) for st in opener.steps[opener.index :]]
+        if remaining and remaining[0].use_hold and not turn.hold_allowed and turn.current == remaining[0].piece:
+            remaining[0] = dataclass_replace(remaining[0], use_hold=False)
+        return RecoveryState(frozenset(opener.board), tuple(remaining), turn)
+
+    def _recover_opener_position(self, recognition: RecognitionResult) -> None:
+        """認識欠落の後、最後の確定状態から何手進んだかを復元して手順を再開する。
+
+        同じ図の予定順序で0〜3手進めた候補のうち、盤面と手番(操作ミノ・HOLD・
+        NEXT・HOLD可否)が一致するものが1つだけで、それが連続する別の
+        キャプチャでも一致したときだけ確定する(opener_recovery参照。間に
+        信頼できない観測が挟まれば数え直す)。確定できないまま信頼できる
+        観測の累計がOPENER_RECOVERY_TIMEOUT_SECを超えたら、手順を見失った
+        とみなしてテンプレをやめる(認識できない時間は数えない)。
+        """
+        opener = self._opener
+        assert opener is not None
+        if opener.recovery_snapshot is None:
+            self._log_opener("中断(復元の起点となる確定状態が無い)")
+            self._abandon_opener()
+            return
+        if recognition.hold_known and recognition.hold_piece is None and not _non_garbage_cells(recognition.board):
+            # 盤面もHOLDも空: 新しい対局が始まった。3秒待たずに諦め、同じtickで
+            # 新しいテンプレを始められるようにする(【2026-09-15実機】メニューを
+            # 挟んで再開した対局の開始を復元待ちが3秒遅らせていた)。
+            self._log_opener("中断(復元待ち中に盤面とHOLDが空になった: 新しい対局)")
+            self._abandon_opener()
+            return
+        turn = self._observed_turn(recognition)
+        if turn is None:
+            opener.note_invalid_observation()
+            return  # 操作ミノ/HOLDが未確定: 観測を待つ
+        if any(cell is not None and cell[0] is None for row in recognition.pending_grid for cell in row):
+            opener.note_invalid_observation()
+            return  # 盤面がまだ確定していない(消えた行が残っている等)
+        now = time.monotonic()
+        if opener.recovery_last_valid_at is not None:
+            opener.recovery_observed_sec += now - opener.recovery_last_valid_at
+        opener.recovery_last_valid_at = now
+        board = frozenset(_non_garbage_cells(recognition.board))
+        result = find_recovery(opener.recovery_snapshot, board, turn)
+        candidate = opener.recovery_gate.accept(result, frame_id=self._tick_serial, trustworthy=True, observed_turn=turn)
+        if candidate is not None:
+            next_index = opener.index + candidate.consumed
+            rest = [OpenerStep(st.piece, st.cells, st.use_hold, st.spin) for st in candidate.state.remaining]
+            opener.steps = opener.steps[:next_index] + rest
+            opener.index = next_index
+            opener.board = set(candidate.state.board)
+            opener.awaiting_since = None
+            opener.recovery_pending = False
+            waited = opener.recovery_observed_sec
+            opener.recovery_observed_sec = 0.0
+            opener.note_invalid_observation()
+            opener.recovery_snapshot = RecoveryState(candidate.state.board, candidate.state.remaining, turn)
+            if self._opener_locks is not None:
+                self._opener_locks += candidate.consumed
+            # 置き終えた提案を再表示しない。テンプレの履歴でAIの探索木は進められない。
+            self._committed_placement = None
+            self._committed_placement_tbp = None
+            self._committed_move = None
+            self._cc_continuation = None
+            self._log_opener(
+                f"復元 {candidate.consumed}手進行{'(HOLD済み)' if candidate.pending_hold_applied else ''} "
+                f"index={next_index} 有効観測{waited:.1f}秒"
+            )
+            if opener.current_step() is None:
+                self._log_opener(f"図を置き終えた [{opener.form.section}]")
+                self._opener_continuing = opener.template
+                self._opener_continue_since = None
+                self._opener = None
+            return
+        if opener.recovery_observed_sec >= self.OPENER_RECOVERY_TIMEOUT_SEC:
+            self._log_opener(
+                f"中断(認識欠落後に手順位置を復元できず {result.status}/{result.reason} 有効観測{opener.recovery_observed_sec:.1f}秒) "
+                f"盤面={sorted(board)} current={turn.current} hold={turn.hold} next={''.join(turn.next_queue)}"
+            )
+            self._abandon_opener()
+
+    def _abandon_opener(self) -> None:
+        self._opener = None
+        self._opener_continuing = None
+        self._opener_locks = None
 
     def _log_opener(self, text: str) -> None:
         if self._debug_log_file is not None:
@@ -3844,11 +4105,13 @@ class MainWindow(QtWidgets.QWidget):
             self.record_video_checkbox = None
         else:
             self.debug_log_checkbox = QtWidgets.QCheckBox(
-                f"認識結果をログに出力する ({DEBUG_LOG_PATH.name} / {DEBUG_FRAMES_DIR.name}\\)"
+                f"認識結果をログに出力する ({DEBUG_LOG_DIR.name}\\debug_log_*.txt / {DEBUG_FRAMES_DIR.name}\\)"
             )
             self.debug_log_checkbox.setToolTip(
                 "最善手が明らかにおかしいと感じた時、AIが実際に何を盤面として"
                 "認識していたかを突き合わせて確認するためのデバッグ用ログです。\n"
+                f"支援モードを開始するたびに{DEBUG_LOG_DIR.name}フォルダへ新しい"
+                "日時付きのファイルとして保存され、前回までの記録は上書きされません。\n"
                 f"テキストログに加えて、実際にキャリブレーション座標で切り出した"
                 f"盤面・ホールド・ネクストの生画像を{DEBUG_FRAMES_DIR.name}フォルダに"
                 "直近1回分保存します（座標そのもののズレを画像で確認できます）。"
@@ -3856,13 +4119,14 @@ class MainWindow(QtWidgets.QWidget):
             layout.addWidget(self.debug_log_checkbox)
 
             self.record_video_checkbox = QtWidgets.QCheckBox(
-                f"支援モード中の画面を録画する ({DEBUG_VIDEO_PATH.name}、暫定機能)"
+                f"支援モード中の画面を録画する ({DEBUG_LOG_DIR.name}\\debug_capture_*.mp4、暫定機能)"
             )
             self.record_video_checkbox.setToolTip(
                 "不具合報告のたびに別の画面録画ソフトで撮り直す手間を省くための"
                 "暫定機能です。キャリブレーション済みの範囲(盤面+HOLD+NEXT欄)を"
-                f"支援モード中ずっと{DEBUG_VIDEO_PATH.name}に録画します"
-                "(次回の支援モード開始時に上書きされます)。\n"
+                f"支援モード中ずっと{DEBUG_LOG_DIR.name}フォルダの日時付きファイルに"
+                "録画します(支援モードを開始するたびに新しいファイルになり、"
+                "前回までの記録は上書きされません)。\n"
                 "画面キャプチャなので、オーバーレイの提案(色ドット)も"
                 "外部の画面録画ソフトと同様に映り込みます。"
             )
@@ -3965,17 +4229,19 @@ class MainWindow(QtWidgets.QWidget):
         self.assist_mode = True
         self.last_valid_draw_data = None
 
-        debug_log_path = (
-            DEBUG_LOG_PATH
-            if self.debug_log_checkbox is not None and self.debug_log_checkbox.isChecked()
-            else None
-        )
+        debug_log_enabled = self.debug_log_checkbox is not None and self.debug_log_checkbox.isChecked()
         record_video = self.record_video_checkbox is not None and self.record_video_checkbox.isChecked()
+        # 支援モード開始のたびに新しい日時付きファイルを使う(上書きしない)。
+        # ログ・動画を両方有効にした場合は同じ日時にして突き合わせやすくする。
+        new_log_path, new_video_path = _new_debug_log_paths() if (debug_log_enabled or record_video) else (None, None)
+        debug_log_path = new_log_path if debug_log_enabled else None
+        video_path = new_video_path if record_video else None
         self.worker = AssistWorker(
             self.calibration,
             self.cold_clear,
             debug_log_path,
             record_video=record_video,
+            video_path=video_path,
             opener_enabled=self.opener_checkbox.isChecked(),
             plan_depth=self.plan_depth_spin.value(),
         )

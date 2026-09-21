@@ -239,14 +239,18 @@ class TestAssistWorkerTickOnce(unittest.TestCase):
         # 不具合として確認された)。同じミノを操作中のHOLD欄の変化は
         # 常にノイズとして無視し、start_thinking自体を呼ばないべき。
         self.cold_clear.poll_suggestion.return_value = _move("A2")
-        with patch("src.app.recognize", return_value=_recognition(current_piece="A1", hold_piece=None)):
-            self.worker._tick_once(capture=MagicMock())  # 初回: hold=None
+        # 時刻は全tickで固定する。最後のtickだけ1000.0秒に固定していたため、
+        # PCの起動から1000秒未満(実時刻<1000)だと最後のtickが「未来」になり、
+        # タイムアウト保険が発火してstart_thinkingが呼ばれる(テストの不備)。
+        with patch("src.app.time.monotonic", return_value=1000.0):
+            with patch("src.app.recognize", return_value=_recognition(current_piece="A1", hold_piece=None)):
+                self.worker._tick_once(capture=MagicMock())  # 初回: hold=None
 
-        with patch(
-            "src.app.recognize",
-            return_value=_recognition(current_piece="B1", hold_piece="A1"),
-        ):
-            self.worker._tick_once(capture=MagicMock())  # ホールド直後: disallow_hold=Trueで確定
+            with patch(
+                "src.app.recognize",
+                return_value=_recognition(current_piece="B1", hold_piece="A1"),
+            ):
+                self.worker._tick_once(capture=MagicMock())  # ホールド直後: disallow_hold=Trueで確定
 
         self.cold_clear.start_thinking.reset_mock()
         with patch("src.app.time.monotonic", return_value=1000.0):
@@ -1740,6 +1744,9 @@ class TestAssistWorkerTickOnce(unittest.TestCase):
                 ),
             ):
                 worker._tick_once(capture=MagicMock())
+                self.assertIsNotNone(worker._opener, "未確認の盤面(1tick目)で即中断している")
+                with patch("src.app.time.monotonic", return_value=1000.7):
+                    worker._tick_once(capture=MagicMock())  # 盤面を確認(2tick目)
         self.assertIsNone(worker._opener, "手順と違う置き方なのにテンプレが続いている")
         shown = [d for d in received if d is not None]
         self.assertEqual(shown[-1].piece, "L", "AIの提案に戻っていない")
@@ -1788,6 +1795,349 @@ class TestAssistWorkerTickOnce(unittest.TestCase):
         with patch("src.app.recognize", return_value=_recognition(current_piece="T")):
             worker._tick_once(capture=MagicMock())
         self.assertEqual(len(received[-1].plan_steps), 1, "表示手数2なら読み筋は1手だけ")
+
+    def test_opener_tracks_the_bag_position_from_the_first_turn(self) -> None:
+        # 【有識者レビュー2026-09-14】7個目のミノは「袋の位置」が分かるときだけ
+        # 確定する。開幕(盤面空・HOLD空)を袋の先頭として固定数を数え、テンプレを
+        # 中断したら位置不明(None)に戻すこと。
+        worker, received = self._opener_worker()
+        self.cold_clear.poll_suggestion.return_value = _move("I")
+        with patch("src.app.time.monotonic", return_value=1000.0):
+            with patch("src.app.recognize", return_value=_recognition(current_piece="I", next_queue=("L", "S", "T", "Z", "O"))):
+                worker._tick_once(capture=MagicMock())
+                worker._tick_once(capture=MagicMock())
+        self.assertIsNotNone(worker._opener)
+        self.assertEqual(worker._opener_locks, 0, "開幕は袋の先頭")
+        first_cells = tuple(worker._opener.steps[0].cells)
+        with patch("src.app.time.monotonic", return_value=1000.5):
+            with patch(
+                "src.app.recognize",
+                return_value=_recognition(current_piece=None, filled_cells=first_cells, next_queue=("S", "T", "Z", "O", "J")),
+            ):
+                worker._tick_once(capture=MagicMock())
+                worker._tick_once(capture=MagicMock())  # 盤面を確定
+        self.assertEqual(worker._opener.index, 1)
+        self.assertEqual(worker._opener_locks, 1, "固定を確認するたびに数える")
+        # 手順と異なる場所に1ミノ置いた → 中断 → 袋の位置は不明に戻る
+        wrong = first_cells + ((17, 6), (17, 7), (16, 6), (16, 7))
+        with patch("src.app.time.monotonic", return_value=1001.0):
+            with patch(
+                "src.app.recognize",
+                return_value=_recognition(current_piece=None, filled_cells=wrong, next_queue=("T", "Z", "O", "J", "L")),
+            ):
+                worker._tick_once(capture=MagicMock())
+                with patch("src.app.time.monotonic", return_value=1001.2):
+                    worker._tick_once(capture=MagicMock())  # 盤面を確認
+        self.assertIsNone(worker._opener, "手順と異なる盤面で中断していない")
+        self.assertIsNone(worker._opener_locks, "中断後も袋の位置を覚えている")
+
+    def test_reduced_opener_form_is_labeled_as_cannon_only(self) -> None:
+        # 【2026-09-14実機】「パフェ狙い」の図なのにパフェにならない手が出た。
+        # 図どおりに組めないミノ順では必須ミノ(砲)だけに縮小した手順になるが
+        # (2026-09-12の方針)、図の名前がそのまま出て紛らわしい。縮小したことを
+        # ラベルとログで分かるようにする。実例は debug_log の迷走砲
+        # 「2巡目%I早の場合」(7ミノの図に対し手順が O I L T(spin) の4手)。
+        from src.engine import openers
+        from src.engine.openers import apply_step, choose_opener
+
+        meiso = next(t for t in openers.OPENER_TEMPLATES if t.name_ja == "迷走砲")
+        patcher = patch.object(openers, "OPENER_TEMPLATES", (meiso,))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        worker = AssistWorker(_make_calibration(), self.cold_clear, debug_log_path=None, opener_enabled=True)
+        received: list[object] = []
+        worker.draw_data_ready.connect(received.append)
+        tpl, form, steps = choose_opener(list("LJISTOZ"))
+        self.assertEqual(tpl.name_ja, "迷走砲")
+        board: set = set()
+        for step in steps:
+            board = apply_step(board, step.cells)
+        worker._opener_continuing = tpl
+        worker._opener_locks = len(steps)
+        self.cold_clear.poll_suggestion.return_value = _move("O", landing_cells=[(15, 0), (15, 1), (14, 0), (14, 1)])
+        with patch("src.app.time.monotonic", return_value=1000.0):
+            with patch(
+                "src.app.recognize",
+                return_value=_recognition(current_piece="O", filled_cells=tuple(board), next_queue=("I", "L", "T", "S", "J")),
+            ):
+                worker._tick_once(capture=MagicMock())
+        self.assertIsNotNone(worker._opener, "2巡目の図が始まっていない")
+        self.assertLess(len(worker._opener.steps), len(worker._opener.form.items), "縮小した手順になっていない")
+        self.assertTrue(worker._opener.is_reduced())
+        self.assertIn("砲のみ", received[-1].label)
+        self.assertIn(worker._opener.form.section.split(" > ")[-1], received[-1].label)
+
+    def _opener_after_first_lock(self):
+        """はちみつ砲(I L S T Z O J)を開始し、Iを置いて手順1まで進めた状態を作る。"""
+        from src.app import MAX_CONSECUTIVE_RECOGNITION_FAILURES
+
+        worker, received = self._opener_worker()
+        self.cold_clear.poll_suggestion.return_value = _move("I")
+        with patch("src.app.time.monotonic", return_value=1000.0):
+            with patch("src.app.recognize", return_value=_recognition(current_piece="I", next_queue=("L", "S", "T", "Z", "O"))):
+                worker._tick_once(capture=MagicMock())
+                worker._tick_once(capture=MagicMock())
+        steps = list(worker._opener.steps)
+        first_cells = tuple(steps[0].cells)
+        with patch("src.app.time.monotonic", return_value=1000.5):
+            with patch(
+                "src.app.recognize",
+                return_value=_recognition(current_piece=None, filled_cells=first_cells, next_queue=("S", "T", "Z", "O", "J")),
+            ):
+                worker._tick_once(capture=MagicMock())
+                worker._tick_once(capture=MagicMock())
+        self.assertEqual(worker._opener.index, 1)
+        self.assertIsNotNone(worker._opener.recovery_snapshot, "手順を進めた時点の状態が保存されていない")
+        # 演出で盤面が読めない(recognize()がNone)tickが続き、認識状態がリセットされる
+        with patch("src.app.time.monotonic", return_value=1001.0):
+            with patch("src.app.recognize", return_value=None):
+                for _ in range(MAX_CONSECUTIVE_RECOGNITION_FAILURES):
+                    worker._tick_once(capture=MagicMock())
+        self.assertIsNotNone(worker._opener, "認識欠落だけでテンプレを捨てている")
+        self.assertTrue(worker._opener.recovery_pending)
+        return worker, received, steps
+
+    def test_opener_recovers_steps_placed_during_a_recognition_gap(self) -> None:
+        # 【2026-09-13実機】ライン消去の演出で盤面が読めない間にL・Sの2手が進み、
+        # 演出明けの盤面が「次の1手(L)の期待盤面」と4マス以上ずれて即中断していた。
+        # 最後に確定した状態から2手進んだ候補が盤面・手番に一致するので、
+        # そこから手順を再開すること(別のキャプチャで2回一致してから確定)。
+        worker, received, steps = self._opener_after_first_lock()
+        placed = tuple(cell for st in steps[:3] for cell in st.cells)  # I, L, S
+        after_gap = _recognition(current_piece="T", filled_cells=placed, next_queue=("Z", "O", "J", "I", "L"))
+        with patch("src.app.time.monotonic", return_value=1002.0):
+            with patch("src.app.recognize", return_value=after_gap):
+                worker._tick_once(capture=MagicMock())
+                self.assertTrue(worker._opener.recovery_pending, "1回の観測だけで確定している")
+                worker._tick_once(capture=MagicMock())
+        self.assertIsNotNone(worker._opener, "復元できずにテンプレを捨てている")
+        self.assertFalse(worker._opener.recovery_pending)
+        self.assertEqual(worker._opener.index, 3, "L・Sの2手ぶん進んでいない")
+        self.assertEqual(worker._opener_locks, 3, "袋位置の固定数が復元ぶん進んでいない")
+        shown = received[-1]
+        self.assertEqual(shown.piece, steps[3].piece, "復元後の手(Z)が表示されていない")
+        self.assertEqual(sorted(shown.landing_cells), sorted(steps[3].cells))
+
+    def test_opener_recovers_three_steps_including_a_hold_during_the_gap(self) -> None:
+        # 演出中にL・S、さらに「TをHOLDしてZを置く」まで進んだ(探索上限の3手)。
+        # HOLDの中身とNEXTの消費(空のHOLDへの格納で1つ余分に進む)まで一致すること。
+        worker, received, steps = self._opener_after_first_lock()
+        placed = tuple(cell for st in steps[:4] for cell in st.cells)  # I, L, S, Z
+        after_gap = _recognition(current_piece="O", hold_piece="T", filled_cells=placed, next_queue=("J", "I", "L", "S", "Z"))
+        with patch("src.app.time.monotonic", return_value=1002.0):
+            with patch("src.app.recognize", return_value=after_gap):
+                worker._tick_once(capture=MagicMock())
+                worker._tick_once(capture=MagicMock())
+        self.assertIsNotNone(worker._opener)
+        self.assertFalse(worker._opener.recovery_pending)
+        self.assertEqual(worker._opener.index, 4)
+        self.assertEqual(received[-1].piece, "O")
+
+    def test_recovery_timeout_counts_only_trustworthy_observation_time(self) -> None:
+        # 【有識者レビュー2026-09-15 4-1】有効観測1回→長い認識失敗→復帰、で
+        # 認識できなかった時間を理由に中断しない(有効観測の累計で判定する)。
+        worker, received, steps = self._opener_after_first_lock()
+        wrong = tuple(steps[0].cells) + ((17, 6), (17, 7), (16, 6), (16, 7))
+        bad = _recognition(current_piece="S", filled_cells=wrong, next_queue=("T", "Z", "O", "J", "I"))
+        with patch("src.app.time.monotonic", return_value=1002.0):
+            with patch("src.app.recognize", return_value=bad):
+                worker._tick_once(capture=MagicMock())
+        with patch("src.app.time.monotonic", return_value=1003.0):
+            with patch("src.app.recognize", return_value=None):
+                for _ in range(3):
+                    worker._tick_once(capture=MagicMock())
+        with patch("src.app.time.monotonic", return_value=1010.0):  # 実時間は8秒経過
+            with patch("src.app.recognize", return_value=bad):
+                worker._tick_once(capture=MagicMock())
+        self.assertIsNotNone(worker._opener, "認識できなかった時間を復元待ち時間に含めて中断している")
+        self.assertEqual(worker._opener.recovery_observed_sec, 0.0)
+        with patch("src.app.time.monotonic", return_value=1011.0):
+            with patch("src.app.recognize", return_value=bad):
+                worker._tick_once(capture=MagicMock())
+        self.assertAlmostEqual(worker._opener.recovery_observed_sec, 1.0)
+        self.assertIsNotNone(worker._opener)
+        with patch("src.app.time.monotonic", return_value=1013.0):
+            with patch("src.app.recognize", return_value=bad):
+                worker._tick_once(capture=MagicMock())
+        self.assertIsNone(worker._opener, "有効観測が累計3秒続いても中断していない")
+
+    def test_recovery_confirmation_requires_consecutive_trustworthy_frames(self) -> None:
+        # 【有識者レビュー2026-09-15 4-2】候補A一致→無効観測(認識失敗)→候補A一致
+        # では確定せず、改めて連続2回の一致を要求する。
+        worker, received, steps = self._opener_after_first_lock()
+        placed = tuple(cell for st in steps[:3] for cell in st.cells)
+        after_gap = _recognition(current_piece="T", filled_cells=placed, next_queue=("Z", "O", "J", "I", "L"))
+        with patch("src.app.time.monotonic", return_value=1002.0):
+            with patch("src.app.recognize", return_value=after_gap):
+                worker._tick_once(capture=MagicMock())
+            with patch("src.app.recognize", return_value=None):
+                worker._tick_once(capture=MagicMock())
+            with patch("src.app.recognize", return_value=after_gap):
+                worker._tick_once(capture=MagicMock())
+            self.assertTrue(worker._opener.recovery_pending, "無効観測を挟んだ一致で確定している")
+            with patch("src.app.recognize", return_value=after_gap):
+                worker._tick_once(capture=MagicMock())
+        self.assertFalse(worker._opener.recovery_pending)
+        self.assertEqual(worker._opener.index, 3)
+
+    def test_recovery_log_reports_the_observed_wait(self) -> None:
+        # 【有識者レビュー2026-09-15 4-4】成功ログの待ち時間が常に0秒になっていた。
+        worker, received, steps = self._opener_after_first_lock()
+        logs: list[str] = []
+        worker._log_opener = logs.append
+        placed = tuple(cell for st in steps[:3] for cell in st.cells)
+        after_gap = _recognition(current_piece="T", filled_cells=placed, next_queue=("Z", "O", "J", "I", "L"))
+        with patch("src.app.time.monotonic", return_value=1002.0):
+            with patch("src.app.recognize", return_value=after_gap):
+                worker._tick_once(capture=MagicMock())
+        with patch("src.app.time.monotonic", return_value=1002.4):
+            with patch("src.app.recognize", return_value=after_gap):
+                worker._tick_once(capture=MagicMock())
+        self.assertFalse(worker._opener.recovery_pending)
+        self.assertTrue(any("復元 2手進行" in t and "有効観測0.4秒" in t for t in logs), logs)
+
+    def test_opener_recovers_when_nothing_was_placed_during_the_gap(self) -> None:
+        # 演出中に手が進んでいなければ、同じ位置から続ける(誤って中断しない)。
+        worker, received, steps = self._opener_after_first_lock()
+        same = _recognition(current_piece="L", filled_cells=tuple(steps[0].cells), next_queue=("S", "T", "Z", "O", "J"))
+        with patch("src.app.time.monotonic", return_value=1002.0):
+            with patch("src.app.recognize", return_value=same):
+                worker._tick_once(capture=MagicMock())
+                worker._tick_once(capture=MagicMock())
+        self.assertIsNotNone(worker._opener)
+        self.assertFalse(worker._opener.recovery_pending)
+        self.assertEqual(worker._opener.index, 1)
+        self.assertEqual(received[-1].piece, "L")
+
+    def test_opener_gives_up_after_a_gap_when_the_board_does_not_match_any_candidate(self) -> None:
+        # 演出中に手順と違う場所へ置いた: どの候補にも一致しない。即断せず、
+        # 信頼できる観測が一定時間続いてから中断する。
+        worker, received, steps = self._opener_after_first_lock()
+        wrong = tuple(steps[0].cells) + ((17, 6), (17, 7), (16, 6), (16, 7))
+        bad = _recognition(current_piece="S", filled_cells=wrong, next_queue=("T", "Z", "O", "J", "I"))
+        with patch("src.app.time.monotonic", return_value=1002.0):
+            with patch("src.app.recognize", return_value=bad):
+                worker._tick_once(capture=MagicMock())
+                worker._tick_once(capture=MagicMock())
+        self.assertIsNotNone(worker._opener, "不一致を1〜2回見ただけで中断している")
+        self.assertTrue(worker._opener.recovery_pending)
+        with patch("src.app.time.monotonic", return_value=1002.0 + worker.OPENER_RECOVERY_TIMEOUT_SEC):
+            with patch("src.app.recognize", return_value=bad):
+                worker._tick_once(capture=MagicMock())
+        self.assertIsNone(worker._opener, "復元できないまま時間が過ぎても中断していない")
+        self.assertIsNone(worker._opener_locks)
+
+    def test_stale_template_move_is_not_shown_while_recovery_is_pending(self) -> None:
+        # 【2026-09-15・利用者の決定】復元待ち(手順位置が不明)に入った時点で
+        # 表示中のドットを消し、復元が確定するまで新しい手も出さない。
+        worker, received, steps = self._opener_after_first_lock()
+        self.assertIsNone(received[-1], "復元待ちに入ったのに古い手(L)を表示したままにしている")
+        placed = tuple(cell for st in steps[:3] for cell in st.cells)
+        after_gap = _recognition(current_piece="T", filled_cells=placed, next_queue=("Z", "O", "J", "I", "L"))
+        with patch("src.app.time.monotonic", return_value=1002.0):
+            with patch("src.app.recognize", return_value=after_gap):
+                worker._tick_once(capture=MagicMock())
+        self.assertTrue(worker._opener.recovery_pending)
+        self.assertIsNone(received[-1], "復元が確定する前に手を出している")
+
+    def test_opener_start_ignores_tolerated_extra_cells_in_its_base_board(self) -> None:
+        # 【2026-09-15実機 山岳積み2号3巡目】図を選ぶときに許容した余分なマス
+        # (TSD直後の光っている残像など、色不明のブロック3つ)を基準の盤面に
+        # 取り込んでいたため、手順どおりに置いても期待盤面(幻のマス入り)と
+        # 一致せず中断した。基準は図の既存セルにし、余分なマスは期待外として扱う。
+        from src.engine.openers import apply_step, choose_opener
+
+        worker, received = self._opener_worker()
+        tpl, form, steps = choose_opener(list("ILSTZOJ"))
+        board: set = set()
+        for step in steps:
+            board = apply_step(board, step.cells)
+        worker._opener_continuing = tpl
+        worker._opener_locks = len(steps)
+        phantom = {(10, 4), (10, 5), (11, 3)}  # 図に無い余分なマス(3つまで許容)
+        self.cold_clear.poll_suggestion.return_value = _move("T", landing_cells=[(11, 0), (11, 1), (11, 2), (10, 1)])
+        with patch("src.app.time.monotonic", return_value=1000.0):
+            with patch(
+                "src.app.recognize",
+                return_value=_recognition(
+                    current_piece="T", hold_piece="J", filled_cells=tuple(board | phantom), next_queue=("O", "S", "Z", "I", "J")
+                ),
+            ):
+                worker._tick_once(capture=MagicMock())
+        self.assertIsNotNone(worker._opener, "余分なマス3つで2巡目の図が見つからない")
+        self.assertEqual(worker._opener.board, board, "基準の盤面に幻のマスが混入している")
+        # 提案どおりに1手目を置いた(幻のマスは消えた) → 手順が進む(中断しない)
+        first = worker._opener.steps[0]
+        after = apply_step(board, first.cells)
+        with patch("src.app.time.monotonic", return_value=1000.5):
+            with patch(
+                "src.app.recognize",
+                return_value=_recognition(current_piece=None, hold_piece="J", filled_cells=tuple(after), next_queue=("S", "Z", "I", "J", "L")),
+            ):
+                worker._tick_once(capture=MagicMock())
+            with patch("src.app.time.monotonic", return_value=1000.7):
+                with patch(
+                    "src.app.recognize",
+                    return_value=_recognition(current_piece=None, hold_piece="J", filled_cells=tuple(after), next_queue=("S", "Z", "I", "J", "L")),
+                ):
+                    worker._tick_once(capture=MagicMock())
+        self.assertIsNotNone(worker._opener, "手順どおりに置いたのに中断した")
+        self.assertEqual(worker._opener.index, 1)
+
+    def test_opener_is_not_abandoned_on_the_first_tick_of_a_garbage_rise(self) -> None:
+        # 【2026-09-15実機 迷走砲2巡目】確認待ち中におじゃまが1段せり上がると、
+        # 座標をずらす前(未確認の1tick目)に期待外4マス以上で即中断していた。
+        # 未確認の盤面では即中断せず、確認後にずらしてから手順を進めること。
+        from dataclasses import replace
+
+        worker, received = self._opener_worker()
+        self.cold_clear.poll_suggestion.return_value = _move("I")
+        with patch("src.app.time.monotonic", return_value=1000.0):
+            with patch("src.app.recognize", return_value=_recognition(current_piece="I", next_queue=("L", "S", "T", "Z", "O"))):
+                worker._tick_once(capture=MagicMock())
+                worker._tick_once(capture=MagicMock())
+        steps = list(worker._opener.steps)
+        first_cells = tuple(steps[0].cells)  # I: (19,0)〜(19,3)
+        with patch("src.app.time.monotonic", return_value=1000.5):
+            with patch(
+                "src.app.recognize",
+                return_value=_recognition(current_piece=None, filled_cells=first_cells, next_queue=("S", "T", "Z", "O", "J")),
+            ):
+                worker._tick_once(capture=MagicMock())
+                worker._tick_once(capture=MagicMock())  # 盤面を確定
+        self.assertEqual(worker._opener.index, 1)
+        third_before = worker._opener.steps[2].cells
+        # Lを提案どおりに置いた瞬間に1段せり上がった盤面が観測される(行19はGARBAGE)
+        placed = first_cells + tuple(steps[1].cells)
+        risen = _recognition(
+            current_piece=None, filled_cells=tuple((r - 1, c) for r, c in placed), next_queue=("T", "Z", "O", "J", "L")
+        )
+        for c in range(10):
+            if c != 4:
+                risen.board.grid[19][c] = "GARBAGE"
+        risen = replace(risen, board_key=tuple(tuple(row) for row in risen.board.grid))
+        # 固定+せり上がりは「あり得ない変化」として盤面の信頼判定に弾かれ、
+        # BOARD_TRUST_TIMEOUT_SEC(1秒)後に強制受理される(実機ログと同じ流れ)。
+        with patch("src.app.recognize", return_value=risen):
+            for t in (1001.0, 1001.2, 1002.1, 1002.3):
+                with patch("src.app.time.monotonic", return_value=t):
+                    worker._tick_once(capture=MagicMock())
+                self.assertIsNotNone(worker._opener, f"せり上がり後 t={t} で中断している")
+        self.assertEqual(worker._opener.index, 2, "せり上がり後に手順が進んでいない")
+        self.assertEqual(sorted(worker._opener.steps[2].cells), sorted((r - 1, c) for r, c in third_before), "手順が上へずれていない")
+
+    def test_recovery_gives_up_immediately_when_a_new_game_starts(self) -> None:
+        # 【2026-09-15実機 はちみつ砲】復元待ち中にメニューを挟んで新しい対局が
+        # 始まった(盤面空・HOLD空)。3秒待たずに諦め、同じtickで新しいテンプレを始める。
+        worker, received, steps = self._opener_after_first_lock()
+        self.cold_clear.poll_suggestion.return_value = _move("I")
+        with patch("src.app.time.monotonic", return_value=1002.0):
+            with patch("src.app.recognize", return_value=_recognition(current_piece="I", next_queue=("L", "S", "T", "Z", "O"))):
+                worker._tick_once(capture=MagicMock())
+        self.assertIsNotNone(worker._opener)
+        self.assertFalse(worker._opener.recovery_pending, "新しい対局なのに復元待ちのまま")
+        self.assertEqual(worker._opener.index, 0, "新しいテンプレが始まっていない")
+        self.assertEqual(worker._opener_locks, 0)
 
     def test_opener_continues_after_a_garbage_rise_by_shifting_the_steps_up(self) -> None:
         # 【2026-09-12・利用者の指示】おじゃまがせり上がってもテンプレの形は
@@ -1839,8 +2189,10 @@ class TestAssistWorkerTickOnce(unittest.TestCase):
         board: set = set()
         for step in steps:
             board = apply_step(board, step.cells)
-        # 1巡目を置き終えた直後の状態を作る: 続きを探すテンプレと、盤面・HOLD=J。
+        # 1巡目を置き終えた直後の状態を作る: 続きを探すテンプレと、盤面・HOLD=J、
+        # 1巡目で固定した数(HOLDのJと合わせて袋1個ぶん=7個を配り終えた)。
         worker._opener_continuing = tpl
+        worker._opener_locks = len(steps)
         self.cold_clear.poll_suggestion.return_value = _move("T", landing_cells=[(11, 0), (11, 1), (11, 2), (10, 1)])
         with patch("src.app.time.monotonic", return_value=1000.0):
             with patch(
@@ -1868,6 +2220,7 @@ class TestAssistWorkerTickOnce(unittest.TestCase):
             board = apply_step(board, step.cells)
         risen = {(r - 2, c) for r, c in board}  # おじゃま2行ぶん上へ
         worker._opener_continuing = tpl
+        worker._opener_locks = len(steps)
         rec = _recognition(current_piece="T", hold_piece="J", filled_cells=tuple(risen), next_queue=("O", "S", "Z", "I", "J"))
         for r in (18, 19):
             for c in range(10):
@@ -1887,18 +2240,22 @@ class TestAssistWorkerTickOnce(unittest.TestCase):
         # 見つからなくても諦めず、読めた時点で次の図を始めること。
         from src.engine.openers import apply_step, choose_opener
 
+        # 局面は test_opener_continues_into_the_second_bag_with_a_matching_form と同じ
+        # (以前は1巡目SLIOJZT・HOLD=Lだったが、その局面は袋2の7種がすべて判明
+        # 済みで、旧known_sequenceが根拠なく足していた架空のLがないと組めない)。
         worker, received = self._opener_worker()
-        tpl, form, steps = choose_opener(list("SLIOJZT"))
+        tpl, form, steps = choose_opener(list("ILSTZOJ"))
         board: set = set()
         for step in steps:
             board = apply_step(board, step.cells)
         worker._opener_continuing = tpl
-        self.cold_clear.poll_suggestion.return_value = _move("I", landing_cells=[(9, 0), (9, 1), (9, 2), (9, 3)])
-        missing = set(board) - set(steps[-1].cells)  # 最後に置いたTがまだ読めていない
+        worker._opener_locks = len(steps)
+        self.cold_clear.poll_suggestion.return_value = _move("T", landing_cells=[(11, 0), (11, 1), (11, 2), (10, 1)])
+        missing = set(board) - set(steps[-1].cells)  # 最後に置いたミノがまだ読めていない
         with patch("src.app.time.monotonic", return_value=1000.0):
             with patch(
                 "src.app.recognize",
-                return_value=_recognition(current_piece="I", hold_piece="L", filled_cells=tuple(missing), next_queue=("O", "T", "S", "Z", "J")),
+                return_value=_recognition(current_piece="T", hold_piece="J", filled_cells=tuple(missing), next_queue=("O", "S", "Z", "I", "J")),
             ):
                 worker._tick_once(capture=MagicMock())
         self.assertIsNone(worker._opener)
@@ -1906,7 +2263,7 @@ class TestAssistWorkerTickOnce(unittest.TestCase):
         with patch("src.app.time.monotonic", return_value=1000.3):
             with patch(
                 "src.app.recognize",
-                return_value=_recognition(current_piece="I", hold_piece="L", filled_cells=tuple(board), next_queue=("O", "T", "S", "Z", "J")),
+                return_value=_recognition(current_piece="T", hold_piece="J", filled_cells=tuple(board), next_queue=("O", "S", "Z", "I", "J")),
             ):
                 worker._tick_once(capture=MagicMock())
         self.assertIsNotNone(worker._opener, "盤面が読めた後も2巡目が始まらない")

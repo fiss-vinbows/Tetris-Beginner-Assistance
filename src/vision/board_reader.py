@@ -154,7 +154,20 @@ def _classify_as_garbage_or_empty(patch: np.ndarray, previous_label: str | None 
     # 直前に実際にミノが確定していたセルは、光エフェクトによる一時的な
     # 誤読の可能性が高いため、空扱いにせず直前の判定を維持する。
     if float(chroma.max()) >= _MIN_PIECE_CHROMA:
-        if previous_label is not None and previous_label != "GARBAGE":
+        median = np.median(patch_f.reshape(-1, 3), axis=0)
+        if (
+            previous_label is not None
+            and previous_label != "GARBAGE"
+            and float(median.max()) >= _MIN_UNKNOWN_BLOCK_BRIGHTNESS
+        ):
+            # 【2026-09-15実機・録画で確認】維持するのはセル全体が明るい場合
+            # だけ。閃光中の本物のブロックは中央値の明るさが250前後あるのに
+            # 対し、落下中ミノのゴースト(着地位置の表示)は内部が暗く(75前後)
+            # 縁のピクセルだけ彩度が高い。ゴーストにもこの救済が効いていた
+            # ため、ライン消去の閃光で誤読された/消去前の行に残った古い
+            # ラベルが、消去後に同じ位置へ来たゴーストの下で10フレーム以上
+            # 「置いたブロック」として生き残り、AIと開幕テンプレの両方に
+            # 幻の4マス入りの盤面が渡っていた(TSD直後の中断の直接原因)。
             return previous_label
         # 【種類は分からないが「何かある」ことは分かる場合】
         # セル全体を代表する色(中央値)が鮮やかで明るいなら、そこには
@@ -169,7 +182,6 @@ def _classify_as_garbage_or_empty(patch: np.ndarray, previous_label: str | None 
         # 種類が分からないままAIへ渡せるのは、着地済み盤面については
         # 占有情報だけあれば足りるため(GARBAGEはTBPでも「何かある」を
         # 表す)。分からないものを「空」と決めつけない、という方針に沿う。
-        median = np.median(patch_f.reshape(-1, 3), axis=0)
         if float(median.max() - median.min()) >= _MIN_PIECE_CHROMA and float(
             median.max()
         ) >= _MIN_UNKNOWN_BLOCK_BRIGHTNESS:

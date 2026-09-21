@@ -118,6 +118,30 @@ class TestClassifyAsGarbageOrEmpty(unittest.TestCase):
         patch = self._solid_patch((0, 200, 255))
         self.assertEqual(_classify_as_garbage_or_empty(patch, previous_label="L"), "L")
 
+    def test_dark_ghost_piece_does_not_keep_the_previous_label(self) -> None:
+        # 【2026-09-15実機・録画 debug_capture_20260915_193825.mp4 フレーム246〜262】
+        # TSD直後、消去前の行に残った/閃光で誤読されたラベルが、消去後に同じ
+        # 位置へ来た落下中Iのゴースト(着地位置の表示)の下で12フレーム
+        # 「置いたブロック」として生き残り、幻の4マス(行17列3〜6)が
+        # AIとテンプレに渡った。ゴーストは内部が暗く縁だけ彩度が高い。
+        # 直前判定の維持は、閃光中の本物のブロックのように明るいセルに限ること。
+        import numpy as np
+        from pathlib import Path
+
+        data = np.load(Path(__file__).with_name("fixtures") / "cell_patches_20260915_tsd.npz")
+        for name, previous in (("ghost_17_3", "O"), ("ghost_17_4", "I"), ("ghost_17_5", UNKNOWN_BLOCK), ("ghost_17_6", "L")):
+            self.assertIsNone(
+                _classify_as_garbage_or_empty(data[name], previous_label=previous),
+                f"{name}: ゴーストなのに直前の判定{previous}を維持している",
+            )
+        # 閃光に覆われた本物のブロックは、従来どおり直前の判定を維持する
+        for name, previous in (("flash_real_17_3", "O"), ("flash_real_17_6", "L"), ("flash_real_16_3", "O"), ("flash_real_17_9", "I")):
+            self.assertEqual(
+                _classify_as_garbage_or_empty(data[name], previous_label=previous),
+                previous,
+                f"{name}: 閃光中の本物のブロックの判定が維持されていない",
+            )
+
     def test_previous_garbage_label_does_not_block_the_occupied_decision(self) -> None:
         # previous_labelがGARBAGEの場合、直前値による救済の対象外である
         # (救済は7色のミノに限定)。それでも、今見えている色が鮮やかで明るい

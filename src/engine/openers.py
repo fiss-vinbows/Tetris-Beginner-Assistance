@@ -164,6 +164,14 @@ def _mark_required_items(forms: list[OpenerForm]) -> list[OpenerForm]:
     Tスピンが同じ図に描かれている場合はその行から、はちみつ砲のように
     Tスピンだけ別の図(U)になっている場合は同じセクションのその図から、
     消える行を求める。
+
+    【2026-09-14実機】別図のTスピンは、その図のTを「途中でも置けるスピン手」
+    として合流させる。はちみつ砲の2巡目でミノ順 O L S J T Z I・HOLD=Jの
+    とき、Tは図に無く、HOLDのJもZの後でないと置けないためTを消費する手が
+    なく、手順が組めずに提示を放棄していた。実際にはTが来た時点でTSTを
+    打ち、消えた後にZ・I・Jを置いてパフェまで組めていた。合流させると
+    O L S J T(spin) Z I J(H) の手順が見つかる。消去後の残り手順の座標は
+    実行側(_check_opener_progress)が下へずらす。
     """
     result: list[OpenerForm] = []
     spin_only = [f for f in forms if f.is_spin_only()]
@@ -180,7 +188,17 @@ def _mark_required_items(forms: list[OpenerForm]) -> list[OpenerForm]:
         partner = next(
             (u for u in spin_only if u.section == form.section and u.existing <= completed), None
         )
-        result.append(_with_required(form, partner.spin_rows()) if partner is not None else form)
+        if partner is None:
+            result.append(form)
+            continue
+        merged = OpenerForm(
+            form.section,
+            form.existing,
+            form.items + tuple(FormItem(it.piece, it.cells, spin=True, last=False) for it in partner.items),
+            form.text,
+            form.tuck_pieces,
+        )
+        result.append(_with_required(merged, partner.spin_rows()))
     return result
 
 
@@ -331,21 +349,41 @@ def plan_form(
     return search(0, hold, placed_cells, frozenset())
 
 
-def known_sequence(current_piece: str | None, next_queue: tuple[str, ...]) -> list[str] | None:
+def known_sequence(
+    current_piece: str | None,
+    next_queue: tuple[str, ...],
+    hold_piece: str | None = None,
+    bag_position: int | None = None,
+) -> list[str] | None:
     """操作ミノ+NEXT5枠から、分かる範囲のミノ順を返す。
 
-    6つがすべて異なる種類なら同じ袋(7-bag)なので残り1つも確定できる。
-    種類が重なる(袋の境目をまたぐ)場合は6つだけを返す。
+    bag_position: 「最後にNEXTから配られたミノ」(直前にHOLDしていなければ
+    操作ミノ、HOLDした直後ならHOLD欄のミノ)の、対局開始からの通し番号。
+    Noneなら袋(7-bag)の位置が不明。
+
+    7個目は、袋の位置が分かっていて(bag_positionが7の倍数=そのミノが
+    袋の先頭)、その袋の6個が判明しているときだけ確定する。以前は
+    「6種類がすべて異なれば同じ袋」とみなして補っていたが、この推論は
+    成立しない。例: 前袋 T S Z J L I O / 次袋 T S Z J I L O で、前袋末尾の
+    Iを操作中・NEXTが次袋先頭のO T S Z Jだと6種類はすべて異なるが、
+    7個目は不足しているLではなく次袋のI。袋の境目をまたいだ観測に
+    誤った7個目を渡すと、組めない図を提示してしまう。
     """
     if current_piece is None or len(next_queue) != 5:
         return None
     seen = [current_piece, *next_queue]
     if not set(seen) <= set(_ALL_PIECES):
         return None
-    if len(set(seen)) == 6:
-        (missing,) = set(_ALL_PIECES) - set(seen)
-        return [*seen, missing]
-    return seen
+    if bag_position is None or bag_position % 7 != 0 or len(set(next_queue)) != 5:
+        return seen
+    # 袋の先頭のミノは、操作ミノかHOLD欄のどちらか(HOLDした直後なら後者)。
+    # NEXT5個と同じ袋なので種類が重ならないはず。どちらか一方に絞れた
+    # ときだけ、袋の残り1種類を7個目として確定する。
+    heads = {p for p in (current_piece, hold_piece) if p is not None and p not in next_queue}
+    if len(heads) != 1:
+        return seen
+    (missing,) = set(_ALL_PIECES) - heads - set(next_queue)
+    return [*seen, missing]
 
 
 def choose_form(
