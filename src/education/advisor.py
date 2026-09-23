@@ -15,13 +15,12 @@
 
 from __future__ import annotations
 
-import copy
 import time
-from collections import deque
 from dataclasses import dataclass, field, replace
 
-from src.education.rules import COLS, HIDDEN_ROWS, NEXT_VISIBLE, ROWS, SPAWN_COL, SPAWN_ROW, Cell, GameState
+from src.education.rules import COLS, HIDDEN_ROWS, NEXT_VISIBLE, ROWS, Cell, GameState
 from src.engine.board_state import BoardState
+from src.engine.srs_reach import find_path
 from src.engine.openers import (
     OpenerForm,
     OpenerStep,
@@ -66,63 +65,6 @@ def _board20(board: tuple | list) -> set[tuple[int, int]]:
 
 def _to22(cells) -> tuple[Cell, ...]:
     return tuple((r + HIDDEN_ROWS, c) for r, c in cells)
-
-
-def find_path(state: GameState, piece: str, target: tuple[Cell, ...]) -> tuple[str, ...] | None:
-    """出現位置からtargetへハードドロップで置く操作手順(通常SRS)。無ければNone。
-
-    幅優先探索で最短の手順を求める。左右移動・左右回転・ソフトドロップ(1マス)の
-    組み合わせで、ハードドロップしたときにtargetの4マスになる位置を探す。
-    """
-    sim = copy.copy(state)
-    sim.game_over = False
-    goal = frozenset(target)
-    start = (0, SPAWN_ROW, SPAWN_COL)
-    sim.current, sim.orient, sim.row, sim.col = piece, *start
-    if not sim._fits(piece, 0, SPAWN_ROW, SPAWN_COL):
-        return None
-    ops = (("←", "move_left"), ("→", "move_right"), ("左回転", "rotate_ccw"), ("右回転", "rotate_cw"), ("↓", "soft_drop"))
-    prev: dict[tuple[int, int, int], tuple[tuple[int, int, int], str] | None] = {start: None}
-    queue = deque([start])
-    while queue:
-        pos = queue.popleft()
-        sim.orient, sim.row, sim.col = pos
-        if frozenset(_ghost_cells(sim)) == goal:
-            path: list[str] = []
-            node = pos
-            while prev[node] is not None:
-                node, label = prev[node]
-                path.append(label)
-            return _compress(list(reversed(path)) + ["ハードドロップ"])
-        for label, method in ops:
-            sim.orient, sim.row, sim.col = pos
-            if getattr(sim, method)():
-                nxt = (sim.orient, sim.row, sim.col)
-                if nxt not in prev:
-                    prev[nxt] = (pos, label)
-                    queue.append(nxt)
-    return None
-
-
-def _ghost_cells(sim: GameState) -> tuple[Cell, ...]:
-    row = sim.ghost_row()
-    saved = sim.row
-    sim.row = row
-    cells = sim.current_cells()
-    sim.row = saved
-    return cells
-
-
-def _compress(path: list[str]) -> tuple[str, ...]:
-    """同じ操作の連続を「→×2」のようにまとめる。"""
-    out: list[str] = []
-    count = 0
-    for i, op in enumerate(path):
-        count += 1
-        if i + 1 == len(path) or path[i + 1] != op:
-            out.append(f"{op}×{count}" if count > 1 else op)
-            count = 0
-    return tuple(out)
 
 
 def board_state_for_engine(state: GameState) -> BoardState:
@@ -259,7 +201,7 @@ class Advisor:
             use_hold=use_hold,
             cells=cells,
             source=f"開幕テンプレ {track.template.name_ja} / {section}",
-            steps=self._steps(state, step.piece, cells, use_hold),
+            steps=self._steps(state, step.piece, cells, use_hold, spin_entry=step.spin and step.piece == "T"),
         )
 
     # ---- CC2 ----
@@ -319,8 +261,11 @@ class Advisor:
         self.status = f"AIを使えません: {exc}"
 
     @staticmethod
-    def _steps(state: GameState, piece: str, cells: tuple[Cell, ...], use_hold: bool) -> tuple[str, ...] | None:
-        path = find_path(state, piece, cells)
+    def _steps(
+        state: GameState, piece: str, cells: tuple[Cell, ...], use_hold: bool, spin_entry: bool = False
+    ) -> tuple[str, ...] | None:
+        # Tスピンの手は、最後の操作が回転で収まる手順(=Tスピンになる手順)を示す
+        path = find_path(state, piece, cells, spin_entry=spin_entry)
         if path is None:
             return None
         return (("ホールド",) if use_hold else ()) + path

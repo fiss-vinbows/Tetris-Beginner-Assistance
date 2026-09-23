@@ -1833,39 +1833,21 @@ class TestAssistWorkerTickOnce(unittest.TestCase):
 
     def test_reduced_opener_form_is_labeled_as_cannon_only(self) -> None:
         # 【2026-09-14実機】「パフェ狙い」の図なのにパフェにならない手が出た。
-        # 図どおりに組めないミノ順では必須ミノ(砲)だけに縮小した手順になるが
-        # (2026-09-12の方針)、図の名前がそのまま出て紛らわしい。縮小したことを
-        # ラベルとログで分かるようにする。実例は debug_log の迷走砲
-        # 「2巡目%I早の場合」(7ミノの図に対し手順が O I L T(spin) の4手)。
-        from src.engine import openers
-        from src.engine.openers import apply_step, choose_opener
+        # 必須ミノ(砲)だけに縮小した手順では、ラベルとログに縮小を明示する。
+        # (2026-09-23以降、Tスピンの手はSRSで入れられる順番だけを採用するので、
+        # 屋根を省く縮小手順は実際にはほぼ成立しない。表示の仕組みだけを確かめる)
+        from src.app import _OpenerRun
+        from src.engine.openers import OPENER_TEMPLATES
 
-        meiso = next(t for t in openers.OPENER_TEMPLATES if t.name_ja == "迷走砲")
-        patcher = patch.object(openers, "OPENER_TEMPLATES", (meiso,))
-        patcher.start()
-        self.addCleanup(patcher.stop)
-        worker = AssistWorker(_make_calibration(), self.cold_clear, debug_log_path=None, opener_enabled=True)
-        received: list[object] = []
-        worker.draw_data_ready.connect(received.append)
-        tpl, form, steps = choose_opener(list("LJISTOZ"))
-        self.assertEqual(tpl.name_ja, "迷走砲")
-        board: set = set()
-        for step in steps:
-            board = apply_step(board, step.cells)
-        worker._opener_continuing = tpl
-        worker._opener_locks = len(steps)
-        self.cold_clear.poll_suggestion.return_value = _move("O", landing_cells=[(15, 0), (15, 1), (14, 0), (14, 1)])
-        with patch("src.app.time.monotonic", return_value=1000.0):
-            with patch(
-                "src.app.recognize",
-                return_value=_recognition(current_piece="O", filled_cells=tuple(board), next_queue=("I", "L", "T", "S", "J")),
-            ):
-                worker._tick_once(capture=MagicMock())
-        self.assertIsNotNone(worker._opener, "2巡目の図が始まっていない")
-        self.assertLess(len(worker._opener.steps), len(worker._opener.form.items), "縮小した手順になっていない")
-        self.assertTrue(worker._opener.is_reduced())
-        self.assertIn("砲のみ", received[-1].label)
-        self.assertIn(worker._opener.form.section.split(" > ")[-1], received[-1].label)
+        meiso = next(t for t in OPENER_TEMPLATES if t.name_ja == "迷走砲")
+        form = next(f for f in meiso.forms if "パフェ" in f.section)
+        run = _OpenerRun(template=meiso, form=form, steps=[], board=set())
+        run.steps = [object()] * (len(form.items) - 1)
+        self.assertTrue(run.is_reduced())
+        self.assertIn("砲のみ", run.label_section())
+        run.steps = [object()] * len(form.items)
+        self.assertFalse(run.is_reduced())
+        self.assertNotIn("砲のみ", run.label_section())
 
     def _opener_after_first_lock(self):
         """はちみつ砲(I L S T Z O J)を開始し、Iを置いて手順1まで進めた状態を作る。"""

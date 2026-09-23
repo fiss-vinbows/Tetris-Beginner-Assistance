@@ -37,3 +37,7 @@ dist/
 
 # 教育モードの個人設定(キー・コントローラー割り当て、リピート速度)
 config/education_*.json
+
+# パフェDB試作: solution-finder本体(配布物をそのまま展開)と生成したDB
+tools/sfinder/
+tools/pc_db/*.sqlite

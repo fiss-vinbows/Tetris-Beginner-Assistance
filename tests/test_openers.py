@@ -68,6 +68,26 @@ def _run_steps(steps, sequence, hold, board):
     return board, hold, seq
 
 
+def _assert_all_steps_reachable(test, steps, board) -> None:
+    """手順の各手が、その時点の盤面で通常SRSで実際に入れられること(Tスピンは回転で収まること)。"""
+    from src.engine.srs_reach import reachable20
+
+    board = set(board)
+    steps = list(steps)
+    for n, st in enumerate(steps):
+        spin_entry = st.spin and st.piece == "T"
+        test.assertTrue(
+            reachable20(frozenset(board), st.piece, tuple(st.cells), spin_entry),
+            f"{n}手目 {st.piece}{st.cells} はSRSで入れられない",
+        )
+        cleared = full_rows_after(board, st.cells)
+        board = apply_step(board, st.cells)
+        if cleared:
+            steps[n + 1 :] = [
+                OpenerStep(x.piece, shift_cells_for_clears(x.cells, cleared), x.use_hold, x.spin) for x in steps[n + 1 :]
+            ]
+
+
 def _cells_of(text: str) -> set[tuple[int, int]]:
     """図の'c'のマスを盤面座標の集合にする(ミノを含まない図はparse_formがNoneを返すため)。"""
     lines = text.split("\n")
@@ -140,28 +160,31 @@ class TestPlanForm(unittest.TestCase):
         board, hold, rest = _run_steps(steps2, "TOSZIJL" + "O", hold, board)
         self.assertEqual(board, _AFTER_HONEY_TST, "2巡目+TSTの後に図どおりの残り形になる")
 
-    def test_honey_cup_tst_can_be_taken_mid_sequence(self) -> None:
-        # 【2026-09-14実機 debug_log_20260914_192846】1巡目 O Z I(H) L S(H) T の
-        # 後、2巡目のミノ順 O L S J T Z I・HOLD=J で「次の図が見つからず終了」に
-        # なった。Tは2巡目の図に無く、HOLDのJもZの後でないと置けないので、
-        # Tを消費する手が無かった。実機ではTが来た時点でTSTを打ち、消えた後に
-        # Z・I・Jを置いてパフェまで達成していた。
+    def test_honey_cup_tst_can_be_taken_mid_sequence_only_when_a_real_tst_is_possible(self) -> None:
+        # 【2026-09-14実機】O L S J T Z I・HOLD=J で2巡目の図が見つからなかった。
+        # この順では、2つ目のJはZの上に載るのでZより後、TもHOLDのJも行き場が無く、
+        # TSTを打てる順番が存在しない。9/14はTを先に穴へ置いて後で揃える手順で
+        # 組んでいたが、Tスピンにならないため教育用として誤り(2026-09-23)。
+        # 組めない扱いにしてAIの推奨手に任せる。
         template = _template("はちみつ砲")
         board = {
             (16, 1), (16, 2), (17, 0), (17, 1), (17, 2), (17, 7), (18, 0), (18, 1), (18, 2), (18, 4),
             (18, 5), (18, 6), (18, 7), (18, 8), (18, 9), (19, 0), (19, 1), (19, 2), (19, 3), (19, 5),
             (19, 6), (19, 7), (19, 8), (19, 9),
         }
-        for sequence, hold in (("OLSJTZI", "J"), ("JLSJTZI", "O")):  # HOLD交換の前後
-            second = choose_form(template, set(board), list(sequence), hold)
-            self.assertIsNotNone(second, f"2巡目の図が見つからない: {sequence} hold={hold}")
-            form2, steps2 = second
-            pieces = [s.piece for s in steps2]
-            self.assertIn("T", pieces)
-            self.assertTrue(steps2[pieces.index("T")].spin, "TはTSTとして置く")
-            self.assertLess(pieces.index("T"), pieces.index("Z"), "TSTはZより前に打つ(Zの後はTを消費できない)")
-            board2, _hold, _rest = _run_steps(steps2, sequence + "O", hold, set(board))  # +次の袋の先頭
-            self.assertEqual(board2, _AFTER_HONEY_TST, "2巡目+TSTの後に図どおりの残り形になる")
+        # (2026-09-23) 回転入れ(SRSで実際に入れられるもの)を許すと、この順でも組める。
+        # その場合もTSTのTは回転で収まり、全手が実行できること。
+        got = choose_form(template, set(board), list("OLSJTZI"), "J")
+        if got is not None:
+            _assert_all_steps_reachable(self, got[1], board)
+        # Tが途中に来ても、HOLDして最後にTSTを打てる順なら組める
+        second = choose_form(template, set(board), list("OLSJZIJ"), "T")
+        self.assertIsNotNone(second)
+        steps2 = second[1]
+        self.assertEqual(steps2[-1].piece, "T")
+        self.assertTrue(steps2[-1].spin)
+        board2, _hold, _rest = _run_steps(steps2, "OLSJZIJ" + "O", "T", set(board))
+        self.assertEqual(board2, _AFTER_HONEY_TST, "2巡目+TSTの後に図どおりの残り形になる")
 
     def test_stray_cannon_connects_first_bag_to_second_bag(self) -> None:
         # 【2026-09-12実機】迷走砲で「次の図が見つからず終了」になった。
@@ -196,6 +219,48 @@ class TestPlanForm(unittest.TestCase):
         self.assertIsNotNone(second, "余分なマス1つで2巡目の図が見つからない")
         self.assertIsNone(choose_form(template, board | {(10, 0), (10, 1), (10, 2), (10, 3)}, list("IOTSZJL"), hold))
 
+    def test_honey_cup_tst_is_not_placed_before_its_rows_can_clear(self) -> None:
+        # 【2026-09-23・教育モードの実画面】2巡目の最初(操作ミノT、HOLD=J、NEXT J Z O L I)で、
+        # TSTの穴へいきなりTを置く手を推奨した。周りの形ができる前に置いても
+        # Tスピンにならない。TSTが打てる順があるなら、Tは行が揃う最後に置く。
+        import itertools
+
+        template = _template("はちみつ砲")
+        board = hold = None
+        for perm in itertools.permutations("IOTSZJL"):
+            chosen = choose_form(template, set(), list(perm), None)
+            if chosen is None:
+                continue
+            b, h, _rest = _run_steps(chosen[1], "".join(perm), None, set())
+            if h == "J":
+                board, hold = b, h
+                break
+        self.assertIsNotNone(board)
+        second = choose_form(template, board, list("TJZOLIS"), hold)
+        if second is None:
+            return  # TSTを打てる順が無い: 組めない扱い(AIの推奨手へ)で正しい
+        steps = second[1]
+        # TSTのT(Tスピンの手)を置く時点では、その3行がすべて揃っていること
+        placed = set(board)
+        for st in steps:
+            if st.piece == "T" and st.spin:
+                after = placed | set(st.cells)
+                rows = {r for r, _c in st.cells}
+                self.assertTrue(all((r, c) in after for r in rows for c in range(10)), f"形ができる前にTを置いている: {steps}")
+            placed |= set(st.cells)
+
+    def test_honey_cup_second_bag_with_srs_tuck(self) -> None:
+        # 【2026-09-23・教育モードの実画面 配列#1325240777】1巡目 S I Z T O J L で
+        # Lを残し、2巡目 J L T I S Z O・HOLD=L で図が見つからずAIに切り替わった。
+        # Jの下へSを回転入れする前提の順番でしか組めない(ページに明記は無いが、
+        # 「いずれかの形に組むことで必ずTSTを打てる」)。SRSで入れられる回転入れを許す。
+        template = _template("はちみつ砲")
+        board = _cells_of("----------\n-------cc-\n--c----ccc\ncccccc-ccc\nccccc-cccc")
+        got = choose_form(template, board, list("JLTISZO"), "L")
+        self.assertIsNotNone(got, "2巡目の図が見つからない")
+        self.assertTrue(any(st.piece == "T" and st.spin for st in got[1]), "TSTが含まれない")
+        _assert_all_steps_reachable(self, got[1], board)
+
     def test_pieces_are_not_tucked_under_other_pieces_of_the_same_form(self) -> None:
         # 【2026-09-12実機(録画19秒)】はちみつ砲の2巡目で、先に置くJの下へSを
         # 入れる手順を出していた(Sを入れる方法が無い)。ページに回転入れの
@@ -204,14 +269,11 @@ class TestPlanForm(unittest.TestCase):
         tpl, form, steps = _choose_with("はちみつ砲", "TZLISOJ")
         board, hold, _rest = _run_steps(steps, "TZLISOJ", None, set())
         self.assertEqual(hold, "J")
-        # T O L Z S J I の順で、Jの下に入るSをJより後に置く手順を出さないこと
-        # (TはTSTの位置に先に置けるので図自体は組める)。
-        second = choose_form(template, board, list("TOLZSJI"), hold)
-        self.assertIsNotNone(second)
-        form2, steps2 = second
-        under_j = next(i for i, st in enumerate(steps2) if st.piece == "S" and (15, 1) in st.cells)
-        over_s = next(i for i, st in enumerate(steps2) if st.piece == "J" and (14, 1) in st.cells)
-        self.assertLess(under_j, over_s, "Jの下に入るSをJより後に置いている")
+        # T O L Z S J I の順: ハードドロップで入らない位置へのSは、SRSで実際に
+        # 入れられる場合だけ認める(2026-09-23)。組めた場合は全手が実行できること。
+        got = choose_form(template, board, list("TOLZSJI"), hold)
+        if got is not None:
+            _assert_all_steps_reachable(self, got[1], board)
 
     def test_noted_tuck_is_still_allowed_for_stray_cannon(self) -> None:
         # 迷走砲2巡目の「Lは左回転で後入れ」はページに明記があるので許す。
@@ -219,25 +281,28 @@ class TestPlanForm(unittest.TestCase):
         form = next(f for f in template.forms if f.section == "理想形 > 2巡目" and "L" in f.tuck_pieces)
         self.assertIn("L", form.tuck_pieces)
 
-    def test_cannon_is_built_even_when_the_top_pieces_cannot_follow_the_figure(self) -> None:
-        # 【2026-09-12・利用者の方針】2巡目の図どおりに全部置けないミノ順でも、
-        # Tスピンで消える行に掛かるミノだけ置いてTST/TSDの形までは組む
-        # (上に積むパフェ用のミノは省略してよい)。
+    def test_every_t_spin_step_is_reachable_by_srs(self) -> None:
+        # 【2026-09-23・教育モード】Tスピンの手を「マスが空いていて支えがある」だけで
+        # 置ける扱いにしていたため、屋根が早すぎて入らない・屋根が無くてTスピンに
+        # ならない順番を推奨していた。手順中のTスピンの手は、その時点の盤面で
+        # 通常SRSで回転して収まること(=実際にTスピンを打てること)。
+        from src.engine.srs_reach import reachable20
+
         template = _template("はちみつ砲")
         tpl, form, steps = _choose_with("はちみつ砲", "TIJSLZO")
         board, hold, _rest = _run_steps(steps, "TIJSLZO", None, set())
-        # (以前は I O T S L J Z を使っていたが、TSTのTを図に合流させてからは
-        # この順でも全部置けるようになったので、組めない順に変更)
-        second = choose_form(template, board, list("IOTSJZL"), hold)
-        self.assertIsNotNone(second, "砲だけの手順も見つからない")
-        form2, steps2 = second
-        self.assertLess(len(steps2), len(form2.items), "全部置く手順は組めないはず")
-        placed = {cell for st in steps2 for cell in st.cells}
-        required_cells = {cell for i in form2.required for cell in form2.items[i].cells}
-        self.assertTrue(required_cells <= placed, "砲に必要なミノが省略されている")
-        # 縮小した手順にもTST(スピン手)が含まれる(TSTのTは必須ミノ)
-        self.assertEqual([st.piece for st in steps2 if st.spin], ["T"])
-        _run_steps(steps2, "IOTSJZL", hold, board)
+        checked = 0
+        for perm in itertools.islice(itertools.permutations("IOTSZJL"), 0, 5040, 7):
+            got = choose_form(template, board, list(perm), hold)
+            if got is None:
+                continue
+            placed = set(board)
+            for st in got[1]:
+                if st.spin and st.piece == "T":
+                    self.assertTrue(reachable20(frozenset(placed), "T", tuple(st.cells), True), f"{perm}: Tスピンを打てない順番")
+                    checked += 1
+                placed |= set(st.cells)
+        self.assertGreater(checked, 0)
 
     def test_spin_item_is_placed_last(self) -> None:
         form = parse_form("--z-------\n-zz----o--\n-zU----oU-\nccUU--ccUc\nccUcccccc-")
@@ -291,3 +356,17 @@ class TestPlanForm(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestFirstBagAvoidsSoftDrop(unittest.TestCase):
+    def test_first_bag_uses_hard_drops_only(self) -> None:
+        # 【2026-09-23・利用者の指示】1巡目はソフトドロップ(回転入れ)を極力避ける。
+        # ハードドロップだけで組めるテンプレを優先して選ぶ(並び順より優先)。
+        from src.engine.openers import tuck_count
+
+        for perm in itertools.islice(itertools.permutations("IOTSZJL"), 0, 5040, 5):
+            chosen = choose_opener(list(perm))
+            if chosen is None:
+                continue
+            _tpl, form, steps = chosen
+            self.assertEqual(tuck_count(form.existing, steps), 0, f"{''.join(perm)}: 1巡目に回転入れがある")

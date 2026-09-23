@@ -160,3 +160,71 @@ class TestAdvisorOpener(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTemplateTSpinsAreExecutable(unittest.TestCase):
+    """【2026-09-23】テンプレのTスピンの手が、実際には回転で入れられない順番で
+    推奨され(操作手順が見つからない)、利用者が従えずAIへ切り替わっていた。"""
+
+    def _follow(self, name: str, seed: int, moves: int = 24) -> list[str]:
+        import src.engine.openers as openers
+
+        saved = openers.OPENER_TEMPLATES
+        openers.OPENER_TEMPLATES = tuple(t for t in saved if t.name_ja == name)
+        self.addCleanup(lambda: setattr(openers, "OPENER_TEMPLATES", saved))
+        state = GameState.new(seed)
+        advisor = Advisor(engine_factory=FakeEngine)
+        clears: list[str] = []
+        ops = {"←": state.move_left, "→": state.move_right, "左回転": state.rotate_ccw, "右回転": state.rotate_cw, "↓": state.soft_drop}
+        for _ in range(moves):
+            rec = advisor.update(state, now=0.0)
+            if rec is None:
+                break
+            self.assertIsNotNone(rec.steps, f"{rec.source}: {rec.piece}の操作手順が無い(入れられない位置)")
+            if rec.use_hold:
+                state.use_hold()
+            for step in rec.steps:
+                if step in ("ホールド", "ハードドロップ"):
+                    continue
+                name_, _, times = step.partition("×")
+                for _ in range(int(times or 1)):
+                    self.assertTrue(ops[name_]())
+            state.hard_drop()
+            self.assertEqual(set(state.last_lock[1]), set(rec.cells))
+            if state.last_clear:
+                clears.append(state.last_clear)
+        return clears
+
+    def test_honey_cup_tst_and_tsd_are_performed(self) -> None:
+        # 修正前は配列12でTST、配列16で3巡目のTSDの操作手順が見つからなかった
+        for seed in (12, 16):
+            clears = self._follow("はちみつ砲", seed)
+            self.assertTrue(any(c.startswith(("TST", "TSD")) for c in clears), f"配列{seed}: {clears}")
+
+
+class TestFewerTucksArePreferred(unittest.TestCase):
+    def test_second_bag_prefers_the_form_with_fewest_soft_drops(self) -> None:
+        # 【2026-09-23・教育モードの実画面 配列#637142134】2巡目で、ハードドロップで
+        # 置ける別の図があるのに、回転入れ(ソフトドロップ)が3回要る図を推奨した。
+        # 組める図・手順の中から回転入れの少ないものを選ぶ。
+        state = GameState.new(637142134)
+        advisor = Advisor(engine_factory=FakeEngine)
+        ops = {"←": state.move_left, "→": state.move_right, "左回転": state.rotate_ccw, "右回転": state.rotate_cw, "↓": state.soft_drop}
+        soft_drop_moves = []
+        for _ in range(14):
+            rec = advisor.update(state, now=0.0)
+            self.assertIsNotNone(rec)
+            if any(step.startswith("↓") for step in rec.steps) and not rec.piece == "T":
+                soft_drop_moves.append((len(state.history), rec.piece))
+            if rec.use_hold:
+                state.use_hold()
+            for step in rec.steps:
+                if step in ("ホールド", "ハードドロップ"):
+                    continue
+                name, _, times = step.partition("×")
+                for _ in range(int(times or 1)):
+                    self.assertTrue(ops[name]())
+            state.hard_drop()
+        self.assertEqual(state.last_clear, "TST(Tスピントリプル)")
+        self.assertLessEqual(len(soft_drop_moves), 1, f"回転入れが多い: {soft_drop_moves}")
+        self.assertTrue(all(turn >= 6 for turn, _p in soft_drop_moves), "1巡目でソフトドロップしている")
