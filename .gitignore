@@ -34,3 +34,6 @@ RELEASE_NOTES_*.md
 build/
 dist/
 開発記録_*.md
+
+# 教育モードの個人設定(キー・コントローラー割り当て、リピート速度)
+config/education_*.json
