@@ -370,11 +370,13 @@ class PracticeWindow(QtWidgets.QWidget):
         self._pad_find_countdown = 0
         self._clock = QtCore.QElapsedTimer()
         self._clock.start()
-        self.advisor = advisor if advisor is not None else Advisor()
+        # 画面ではパフェ探索を別スレッドで行い、ホールド等の操作で画面を止めない
+        self.advisor = advisor if advisor is not None else Advisor(pc_async=True)
         self.view_path = keybindings.VIEW_PATH
         self.view = keybindings.load_view(self.view_path)
         self.advisor.prefer_ai = self.view["prefer_ai"]
         self._last_advisor_status = ""
+        self._last_pc_pending = False
         self.pad_timer = QtCore.QTimer(self)
         self.pad_timer.timeout.connect(self._on_tick)
         self.pad_timer.start(PAD_POLL_MS)
@@ -447,7 +449,7 @@ class PracticeWindow(QtWidgets.QWidget):
     def _refresh_candidates(self) -> None:
         candidates = self.advisor.candidates()
         active = self.advisor.active_id
-        sig = tuple((c.source_id, c.mark) for c in candidates) + (active,)
+        sig = tuple((c.source_id, c.mark) for c in candidates) + (active, self.advisor.pc_pending)
         if sig != self._candidate_sig:
             self._candidate_sig = sig
             for btn in self.candidate_buttons:
@@ -473,6 +475,8 @@ class PracticeWindow(QtWidgets.QWidget):
         if scope:
             lines.append(f"難度の範囲: {scope}")
         lines.append("◎=ソフトドロップなし ○=1回 △=2回以上")
+        if self.advisor.pc_pending:
+            lines.append("パフェ探索中…")
         if preferred is not None and preferred != active:
             lines.append(f"({preferred}が組めない間はAIで提示)")
         self.candidate_scope.setText("<br>".join(lines))
@@ -589,8 +593,14 @@ class PracticeWindow(QtWidgets.QWidget):
 
     def _update_recommendation(self) -> None:
         rec = self.advisor.update(self.state)
-        if rec != self.board_view.recommendation or self.advisor.status != self._last_advisor_status:
+        pending = self.advisor.pc_pending
+        if (
+            rec != self.board_view.recommendation
+            or self.advisor.status != self._last_advisor_status
+            or pending != self._last_pc_pending  # パフェ探索が終わった(候補欄に分岐が出る)
+        ):
             self._last_advisor_status = self.advisor.status
+            self._last_pc_pending = pending
             self.refresh()
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:

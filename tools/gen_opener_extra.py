@@ -129,5 +129,6 @@ def emit(name_ja, name_en, url, forms):
     return "\n".join(out)
 
 
-print(emit("開幕パフェ積み", "PC Opener", PCO_URL, pc_opener()))
-print(emit("DPC", "DPC", DPC_URL, dpc()))
+if __name__ == "__main__":
+    print(emit("開幕パフェ積み", "PC Opener", PCO_URL, pc_opener()))
+    print(emit("DPC", "DPC", DPC_URL, dpc()))

@@ -39,6 +39,13 @@ OPENER_SOURCE_FORMS: tuple[tuple[str, str, str, tuple[tuple[str, str], ...]], ..
             ("理想形 > 3巡目 - パフェ狙い", "\n".join(('----------', 'sllootiiii', 'ssloozcccc', 'cslczzcccc', 'cccczttccc', 'ccccctcccc'))),
             ("理想形 > 3巡目 - パフェ狙い", "\n".join(('----------', 'oojjjtiiii', 'oossjzcccc', 'cssczzcccc', 'cccczttccc', 'ccccctcccc'))),
             ("理想形 > 3巡目 - パフェ狙い", "\n".join(('----------', 'oossltiiii', 'oolllzcccc', 'czzczzcccc', 'cccczttccc', 'ccccctcccc'))),
+            # 【2026-09-24】通常形(%O>%J)。文献にあるが取り込まれていなかった(実画面 practice_20260924_195802)
+            ("通常形 > %O>%Sの場合", "\n".join(("-jj-------", "-js------i", "-jss--zz-i", "-oos---zzi", "coolllUcci", "ccclcUUccc", "ccccccUccc", "ccccc-cccc"))),
+            ("通常形 > %O>%Sの場合 > 3巡目 - パフェ狙い", "\n".join(("iccslloojj", "iccssloojc", "icccslccjc", "icccUUUccc", "cccccUcccc"))),
+            ("通常形 > %O>%Sの場合 > TSTドネイト", "\n".join(("----------", "-oo-----ll", "-ooj-----l", "iccjjjssUl", "icczzssUUc", "iccczzccUc", "iccc---ccc", "ccccc-cccc"))),
+            ("通常形 > %O>%Sの場合 > TSTドネイト後", "\n".join(("----------", "--------ll", "ioo-----zl", "ioos---zzl", "iccss-jzcc", "icccs-jjjc", "ccccUUUccc", "cccccUcccc"))),
+            ("通常形 > %S>%Oの場合", "\n".join(("----------", "-joo-----i", "-joo--zz-i", "jjss---zzi", "csslllUZZi", "ccclcUUcZZ", "ccccccUccc", "ccccc-cccc"))),
+            ("通常形 > %S>%Oの場合 > 3巡目", "\n".join(("----------", "---jj---s-", "iooj----ss", "iooj-zzlls", "iccc--zzlc", "iccc--cclc", "ccccUUUccc", "cccccUcccc"))),
             ("別パターン > 2巡目%I早の場合", "\n".join(('--------jj', '--s-----ji', '--ss--zzji', '-oos---zzi', 'coolllUcci', 'ccclcUUccc', 'ccccccUccc', 'ccccc-cccc'))),
             ("別パターン > 2巡目%I早の場合", "\n".join(('----------', 'ijjslloocc', 'ijcssloocc', 'ijccslcccc', 'icccUUUccc', 'cccccUcccc'))),
             ("別パターン > 2巡目%I早の場合", "\n".join(('----------', 'ijjzzloocc', 'ijcllloocc', 'ijcczzcccc', 'icccUUUccc', 'cccccUcccc'))),

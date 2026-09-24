@@ -16,10 +16,11 @@ import time
 from collections import deque
 from dataclasses import dataclass
 
-from src.education.rules import COLS, HIDDEN_ROWS, ROWS, SPAWN_COL, SPAWN_ROW, GameState, PieceSequence
+from functools import lru_cache
 
-MAX_PIECES = 5
-TIME_LIMIT_SEC = 0.8  # 1手ごとに探すので画面を止めない長さにする
+from src.education.rules import _KICKS_I, _KICKS_JLSTZ, _SHAPES, COLS, HIDDEN_ROWS, ROWS, SPAWN_COL, SPAWN_ROW
+
+TIME_LIMIT_SEC = 0.8  # 同期で探すとき(テスト等)の上限。画面では別スレッドで長めに探す
 TIMEOUT = "timeout"
 
 Board = frozenset  # 22行座標の占有マス
@@ -36,37 +37,48 @@ class _Timeout(Exception):
     pass
 
 
-def _sim(board: Board) -> GameState:
-    sim = GameState(sequence=PieceSequence(0))
-    sim.board = [[None] * COLS for _ in range(ROWS)]
-    for r, c in board:
-        sim.board[r][c] = "X"
-    return sim
+@lru_cache(maxsize=200_000)
+def placements(board: Board, piece: str) -> tuple[tuple[tuple[int, int], ...], ...]:
+    """出現位置からSRSで届く、固定できる位置(4マス)の一覧。
 
+    【2026-09-24・利用者の指摘】ホールドを切り替えたときに動作が重かった。以前は
+    rules.GameStateの移動・回転を1手ずつ呼んで調べていたため遅かった(空の盤面で
+    パフェを探すと時間の上限0.8秒まで画面が止まった)。同じ通常SRS(rules の形と
+    補正表)を、占有マスの集合で直接調べる。結果は盤面とミノごとに覚えて使い回す。
+    """
+    shapes = _SHAPES[piece]
+    kicks = _KICKS_I if piece == "I" else _KICKS_JLSTZ
 
-def placements(board: Board, piece: str) -> list[tuple[tuple[int, int], ...]]:
-    """出現位置からSRSで届く、固定できる位置(4マス)の一覧。"""
-    sim = _sim(board)
-    if not sim._fits(piece, 0, SPAWN_ROW, SPAWN_COL):
-        return []
-    sim.current = piece
+    def fits(orient: int, row: int, col: int) -> bool:
+        for dr, dc in shapes[orient]:
+            r, c = row + dr, col + dc
+            if not (0 <= r < ROWS and 0 <= c < COLS) or (r, c) in board:
+                return False
+        return True
+
+    if not fits(0, SPAWN_ROW, SPAWN_COL):
+        return ()
     start = (0, SPAWN_ROW, SPAWN_COL)
     seen = {start}
     queue = deque([start])
     result: set[tuple[tuple[int, int], ...]] = set()
     while queue:
         orient, row, col = queue.popleft()
-        sim.orient, sim.row, sim.col = orient, row, col
-        if sim.is_grounded():
-            result.add(tuple(sorted(sim.current_cells())))
-        for method in ("move_left", "move_right", "rotate_ccw", "rotate_cw", "soft_drop"):
-            sim.orient, sim.row, sim.col = orient, row, col
-            if getattr(sim, method)():
-                node = (sim.orient, sim.row, sim.col)
-                if node not in seen:
-                    seen.add(node)
-                    queue.append(node)
-    return sorted(result)
+        nexts = [(orient, row, col - 1), (orient, row, col + 1), (orient, row + 1, col)]
+        if not fits(orient, row + 1, col):
+            result.add(tuple(sorted((row + dr, col + dc) for dr, dc in shapes[orient])))
+        if piece != "O":
+            for direction in (-1, 1):
+                new = (orient + direction) % 4
+                for dx, dy in kicks[(orient, new)]:
+                    if fits(new, row - dy, col + dx):
+                        nexts.append((new, row - dy, col + dx))
+                        break
+        for node in nexts:
+            if node not in seen and fits(*node):
+                seen.add(node)
+                queue.append(node)
+    return tuple(sorted(result))
 
 
 def _lock(board: Board, cells) -> tuple[Board, int]:
@@ -107,14 +119,20 @@ def find_perfect_clear(
     sequence: list[str],
     hold: str | None,
     *,
-    max_pieces: int = MAX_PIECES,
+    max_pieces: int | None = None,
     time_limit: float = TIME_LIMIT_SEC,
     can_hold: bool = True,
+    cancel=None,
 ):
     """パフェの手順(PCStepのリスト)。無ければNone、時間切れならTIMEOUT。
 
+    max_pieces: 使うミノ数の上限。Noneなら見えているミノ(操作ミノ・NEXT・HOLD)をすべて使える。
+    【2026-09-24・実画面 practice_20260924_195905】以前は5手・6段までに限っていたため、
+    見えている7個でちょうど埋まる迷走砲の8段パフェを探さなかった。
+
     sequence: 先頭が操作ミノの、分かっているミノ順。hold: 今のHOLD。
     can_hold: この手番でまだHOLDできるか(HOLD済みなら最初の1手はHOLDしない)。
+    cancel: 別スレッドで探すときの打ち切りの合図(threading.Event)。立ったらTIMEOUTを返す。
     盤面が空でも探す(パフェ直後の2段パフェ等)。
     【2026-09-24・実画面 practice_20260924_193201】以前は空の盤面を「パフェ済み」として
     探さず、O・HOLD I・NEXT J L O J S で取れる2段パフェが1手置くまで出なかった。
@@ -124,23 +142,19 @@ def find_perfect_clear(
         return None
     filled = len(board)
     stack_height = ROWS - min(r for r, _c in board) if board else 0
-    available = min(max_pieces, len(sequence) + (1 if hold is not None else 0))
+    available = len(sequence) + (1 if hold is not None else 0)
+    if max_pieces is not None:
+        available = min(available, max_pieces)
     deadline = time.monotonic() + time_limit
-    cache: dict[tuple, list] = {}
     failed: set[tuple] = set()
-
-    def moves(b: Board, piece: str):
-        key = (b, piece)
-        if key not in cache:
-            cache[key] = placements(b, piece)
-        return cache[key]
+    moves = placements
 
     def dfs(b: Board, index: int, held: str | None, height: int, left: int):
         # 高さ以下の空きマスは常に4×残り手数(はみ出しを禁じているため)、
         # 置き終えて盤面が空になったときだけ成功
         if left == 0:
             return [] if not b else None
-        if time.monotonic() > deadline:
+        if time.monotonic() > deadline or (cancel is not None and cancel.is_set()):
             raise _Timeout
         key = (b, index, held, height, left)
         if key in failed:
@@ -172,7 +186,7 @@ def find_perfect_clear(
         return None
 
     try:
-        for height in range(max(stack_height, 1), 7):
+        for height in range(max(stack_height, 1), ROWS - HIDDEN_ROWS + 1):
             empty = height * COLS - filled
             if empty <= 0 or empty % 4:
                 continue

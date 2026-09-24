@@ -19,7 +19,9 @@
 
 from __future__ import annotations
 
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 
 import src.engine.openers as openers
@@ -114,7 +116,9 @@ def candidate_templates() -> tuple[OpenerTemplate, ...]:
     )
 
 
-def startable_template(template: OpenerTemplate, hold: str | None, bag_head: bool) -> OpenerTemplate:
+def startable_template(
+    template: OpenerTemplate, hold: str | None, bag_head: bool, continuing: bool = False
+) -> OpenerTemplate:
     """今の手番から使える図だけのテンプレ。
 
     【2026-09-24・実画面 practice_20260924_190040】パフェ後(操作ミノは袋の先頭、HOLD=Z)
@@ -122,12 +126,19 @@ def startable_template(template: OpenerTemplate, hold: str | None, bag_head: boo
     7種1巡からずれた組み方なので、空の盤面から組む1巡目の図(既存ブロックの無い図)は、
     通常のテンプレではHOLDが空で操作ミノが袋の先頭のときだけ使う。DPCは逆に、
     パフェ後にHOLDへ繰り越したミノがあり、操作ミノが袋の先頭のときだけ使う。
+
+    【2026-09-24・実画面 practice_20260924_195905】Tスピンだけの図(はちみつ砲のTST等)は
+    一致判定がゆるく、同じTSTの形を持つ迷走砲の盤面にも一致して「はちみつ砲」と表示した。
+    Tスピンだけの図は、そのテンプレを続けてきた場合(continuing)だけ使う。
     """
     carry = template.name_ja in CARRY_TEMPLATES
     allow_empty = bag_head and ((hold is not None) if carry else (hold is None))
-    if allow_empty:
-        return template
-    return replace(template, forms=tuple(f for f in template.forms if f.existing))
+    forms = template.forms
+    if not allow_empty:
+        forms = tuple(f for f in forms if f.existing)
+    if not continuing:
+        forms = tuple(f for f in forms if not f.is_spin_only())
+    return template if forms == template.forms else replace(template, forms=forms)
 
 
 def rejoin_form(
@@ -193,10 +204,21 @@ class Advisor:
     _tracks: dict[str, dict[int, _OpenerTrack | None]] = field(default_factory=dict)
     _practice_id: int | None = None
     _auto_id: str | None = None  # 自動選択で提示中のテンプレ(組める間は切り替えない)
-    _pc_rec: Recommendation | None = None  # 5手以内のパフェの1手目
+    _pc_rec: Recommendation | None = None  # 見えているミノで取れるパフェの1手目
     pc_timed_out: bool = False  # パフェ探索が時間切れ(未判定)
+    # 【2026-09-24・利用者の指摘】ホールド時に重かった。画面ではパフェ探索を別スレッドで
+    # 行い、画面を止めない(pc_async=True)。テスト等では同期で探す。
+    pc_async: bool = False
+    pc_pending: bool = False  # 別スレッドで探索中
+    _pc_future: object = None
+    _pc_cancel: object = None
+    _executor: object = None
 
     def close(self) -> None:
+        self._cancel_pc()
+        if self._executor is not None:
+            self._executor.shutdown(wait=False)
+            self._executor = None
         if self._engine is not None and hasattr(self._engine, "close"):
             try:
                 self._engine.close()
@@ -219,8 +241,12 @@ class Advisor:
             self._ai_rec = None
             self._requested_at = None
             self._template_recs = self._compute_template_recs(state) if self.opener_enabled else {}
-            self._pc_rec = self._compute_pc(state) if self.opener_enabled else None
+            self._pc_rec = None
+            if self.opener_enabled:
+                self._start_pc(state)
             self._select()
+        if self._pc_future is not None and self._pc_future.done():
+            self._finish_pc(state)
         if self.active_id == PC_ID:
             return self._pc_rec
         if self.active_id == AI_ID:
@@ -311,9 +337,8 @@ class Advisor:
                 recs[template.name_ja] = rec
         return recs
 
-    def _compute_pc(self, state: GameState) -> Recommendation | None:
-        """見えているミノで5手以内に取れるパフェの1手目(ソフトドロップの多さは問わない)。"""
-        self.pc_timed_out = False
+    def _pc_inputs(self, state: GameState):
+        """パフェ探索に渡す(盤面, ミノ順, HOLD, HOLDできるか)。見えている範囲だけ。"""
         sequence, _hold, _board = self._turn_sequence(state)
         if sequence is None:
             return None
@@ -323,7 +348,51 @@ class Advisor:
             rest = sequence[2:] if snap.hold is None else sequence[1:]
             sequence = [state.current, *rest]
         board = frozenset((r, c) for r in range(ROWS) for c in range(COLS) if state.board[r][c] is not None)
-        found = find_perfect_clear(board, sequence, state.hold, can_hold=not state.hold_used)
+        return board, sequence, state.hold, not state.hold_used
+
+    def _start_pc(self, state: GameState) -> None:
+        self._cancel_pc()
+        self.pc_timed_out = False
+        inputs = self._pc_inputs(state)
+        if inputs is None:
+            return
+        board, sequence, hold, can_hold = inputs
+        if not self.pc_async:
+            self._pc_rec = self._pc_recommendation(
+                state, find_perfect_clear(board, sequence, hold, can_hold=can_hold)
+            )
+            return
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pc_search")
+        self._pc_cancel = threading.Event()
+        self._pc_future = self._executor.submit(
+            find_perfect_clear, board, sequence, hold, can_hold=can_hold, time_limit=3.0, cancel=self._pc_cancel
+        )
+        self.pc_pending = True
+
+    def _cancel_pc(self) -> None:
+        """局面が変わった: 古い探索を打ち切り、結果を使わない。"""
+        if self._pc_cancel is not None:
+            self._pc_cancel.set()
+        self._pc_future = None
+        self._pc_cancel = None
+        self.pc_pending = False
+
+    def _finish_pc(self, state: GameState) -> None:
+        """別スレッドの探索結果を受け取る(同じ局面の依頼の結果だけが残っている)。"""
+        future, self._pc_future = self._pc_future, None
+        self._pc_cancel = None
+        self.pc_pending = False
+        try:
+            found = future.result()
+        except Exception:  # noqa: BLE001 - 探索の失敗で画面を止めない
+            return
+        self._pc_rec = self._pc_recommendation(state, found)
+        if self._pc_rec is not None:
+            self._select()
+
+    def _pc_recommendation(self, state: GameState, found) -> Recommendation | None:
+        """パフェ探索の結果から1手目の推奨を作る(ソフトドロップの多さは問わない)。"""
         if found == TIMEOUT:
             self.pc_timed_out = True  # 未判定(無いとは断定しない)
             return None
@@ -377,12 +446,14 @@ class Advisor:
         sequence = known_sequence(snap.current, nexts, None, snap.sequence_index - 1)
         return sequence, snap.hold, _board20(snap.board)
 
-    def _start_track(self, state: GameState, template: OpenerTemplate, rejoin: bool = False) -> _OpenerTrack | None:
+    def _start_track(
+        self, state: GameState, template: OpenerTemplate, rejoin: bool = False, continuing: bool = False
+    ) -> _OpenerTrack | None:
         sequence, hold, board = self._turn_sequence(state)
         if sequence is None:
             return None
         bag_head = (state.turn_start.sequence_index - 1) % 7 == 0
-        got = choose_form(startable_template(template, hold, bag_head), board, sequence, hold)
+        got = choose_form(startable_template(template, hold, bag_head, continuing), board, sequence, hold)
         if got is None:
             # 盤面エディタで図の途中形を作って始めた場合も、ここで合流する
             got = rejoin_form(template, board, sequence, hold)
@@ -405,7 +476,7 @@ class Advisor:
         track = _OpenerTrack(prev.template, prev.form, prev.steps[: prev.index + 1] + rest, prev.index + 1, prev.rejoined)
         if track.current() is None:
             # 図を置き終えた: 同じテンプレの続きの図(2巡目以降)を探す
-            return self._start_track(state, prev.template)
+            return self._start_track(state, prev.template, continuing=True)
         return track
 
     def _from_track(self, state: GameState, track: _OpenerTrack | None) -> Recommendation | None:

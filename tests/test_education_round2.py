@@ -124,10 +124,14 @@ class TestPerfectClearSearch(unittest.TestCase):
         self.assertEqual(board, set(), "パフェになっていない")
 
     def test_no_pc_and_timeout(self) -> None:
-        self.assertIsNone(find_perfect_clear(frozenset(), list("IOTSZJ"), None), "空の盤面はパフェ済み")
+        self.assertIsNone(find_perfect_clear(frozenset(), list("IOTSZJ"), None), "このミノ順では2段パフェにならない")
         tall = frozenset((r, 0) for r in range(ROWS - 8, ROWS))  # 8段の柱: 5手では消し切れない
         self.assertIsNone(find_perfect_clear(tall, list("IOTSZJ"), None))
-        self.assertEqual(find_perfect_clear(_pc_opener_board(), list("IOTSZJ"), None, time_limit=0.0), TIMEOUT)
+        import threading
+
+        cancel = threading.Event()
+        cancel.set()  # 局面が変わって打ち切られた探索は「未判定」を返す
+        self.assertEqual(find_perfect_clear(_pc_opener_board(), list("IOTSZJ"), None, cancel=cancel), TIMEOUT)
 
     def test_cannot_hold_first_when_hold_used(self) -> None:
         steps = find_perfect_clear(_pc_opener_board(), list("IOTSZJ"), "L", can_hold=False)
@@ -299,3 +303,86 @@ class TestToggles(unittest.TestCase):
         advisor._pc_rec = None
         advisor._select()
         self.assertEqual(advisor.active_id, AI_ID)
+
+
+# 実画面 practice_20260924_195802 / 195905(迷走砲の1巡目をZも置く形で組み、HOLD=T)
+MEISOU_FIRST_BAG_ROWS = ("i------zz-", "ils-t--jzz", "ilsstt-joo", "illst-jjoo")
+# 195905: 通常形(%O>%S)の2巡目をTスピンの前まで組んだ盤面
+MEISOU_NORMAL_ROWS = ("-jj-------", "-js------i", "-jss--zz-i", "-oos---zzi", "coolllUcci", "ccclcUUccc", "ccccccUccc", "ccccc-cccc")
+
+
+def _board_rows(rows) -> list[list[str | None]]:
+    board = [[None] * COLS for _ in range(ROWS)]
+    for i, line in enumerate(rows):
+        for c, ch in enumerate(line):
+            if ch not in "-U":
+                board[ROWS - len(rows) + i][c] = GARBAGE
+    return board
+
+
+class TestMeisouNormalForm(unittest.TestCase):
+    def test_meisou_continues_when_o_comes_before_j(self) -> None:
+        # 修正前は通常形(%O>%J)の図がデータに無く、理想形を組めない順番だとAIへ移っていた
+        state = GameState.new(1, ("IZLSTJO", "TOZJLSI", "IJLOSTZ"), _board_rows(MEISOU_FIRST_BAG_ROWS), ("O", "T", 9))
+        advisor = Advisor(engine_factory=FakeEngine)
+        rec = advisor.update(state, now=0.0)
+        self.assertEqual(advisor.active_id, "迷走砲")
+        self.assertIn("%O>%Sの場合", rec.source)
+
+    def test_honey_cup_spin_only_form_does_not_claim_a_meisou_board(self) -> None:
+        # 修正前ははちみつ砲の「TSTだけの図」が迷走砲の盤面に一致し「はちみつ砲」と表示した
+        state = GameState.new(1, None, _board_rows(MEISOU_NORMAL_ROWS), ("L", "T", 15))
+        advisor = Advisor(engine_factory=FakeEngine)
+        rec = advisor.update(state, now=0.0)
+        ids = [c.source_id for c in advisor.candidates()]
+        self.assertNotIn("はちみつ砲", ids)
+        self.assertEqual(advisor.active_id, "迷走砲")
+        self.assertIn("迷走砲", rec.source)
+
+
+class TestTallPerfectClear(unittest.TestCase):
+    def test_eight_line_pc_is_searched(self) -> None:
+        # 修正前は6段までしか探さなかった。TST→I J O L Z Tの順なら8段パフェになる
+        board = frozenset((r, c) for r, row in enumerate(_board_rows(MEISOU_NORMAL_ROWS)) for c, v in enumerate(row) if v)
+        steps = find_perfect_clear(board, list("TIJOLZT"), None, can_hold=False)
+        self.assertIsInstance(steps, list)
+        self.assertEqual(len(steps), 7)
+        # 実際の順番(HOLD=T, L Z I O J T)ではTが最後になりパフェにならない(順番の制約)
+        self.assertIsNone(find_perfect_clear(board, list("LZIOJTS"), "T"))
+
+
+class TestFastPlacements(unittest.TestCase):
+    def test_every_placement_is_reachable_by_srs(self) -> None:
+        from src.engine.srs_reach import find_path
+
+        board = frozenset((r, c) for r, row in enumerate(_board_rows(MEISOU_NORMAL_ROWS)) for c, v in enumerate(row) if v)
+        state = GameState.new(1, None, _board_rows(MEISOU_NORMAL_ROWS))
+        for piece in "IJLOSTZ":
+            found = placements(board, piece)
+            self.assertTrue(found)
+            for cells in found:
+                self.assertIsNotNone(find_path(state, piece, cells), f"{piece}{cells}はSRSで届かない")
+
+
+class TestAsyncPerfectClear(unittest.TestCase):
+    def test_pc_search_runs_in_background_and_is_discarded_on_new_turn(self) -> None:
+        import time
+
+        board = [[None] * COLS for _ in range(ROWS)]
+        for r, c in _pc_opener_board():
+            board[r][c] = GARBAGE
+        state = GameState.new(1, ("IJLOSTZ", "IOTSZJL", "IJLOSTZ"), board, ("I", None, 8))
+        advisor = Advisor(engine_factory=FakeEngine, pc_async=True)
+        self.addCleanup(advisor.close)
+        advisor.update(state, now=0.0)
+        self.assertTrue(advisor.pc_pending, "別スレッドで探していない")
+        deadline = time.monotonic() + 5
+        while advisor.pc_pending and time.monotonic() < deadline:
+            time.sleep(0.01)
+            rec = advisor.update(state, now=0.0)
+        self.assertEqual(advisor.active_id, PC_ID)
+        self.assertIn("パフェ", rec.source)
+        # 局面が変わったら古い探索の結果は使わない
+        state.use_hold()
+        advisor.update(state, now=0.0)
+        self.assertIsNone(advisor._pc_rec)
