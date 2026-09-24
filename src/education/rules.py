@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import itertools
 import random
 from dataclasses import dataclass, field
 
@@ -108,15 +109,35 @@ def piece_cells(piece: str, orient: int, row: int, col: int) -> tuple[Cell, ...]
     return tuple((row + r, col + c) for r, c in _SHAPES[piece][orient % 4])
 
 
+CONFIGURABLE_BAGS = 3  # ツモ順を指定できる巡の数(1〜3巡目)
+GARBAGE = "GARBAGE"  # おじゃまブロックのセルの値
+
+
+def validate_bags(bags) -> tuple[tuple[str, ...], ...]:
+    """1〜3巡目のツモ順の指定を検証する。各巡は7種類を1個ずつ(通常の7-bag)。"""
+    result = tuple(tuple(bag) for bag in bags)
+    if len(result) != CONFIGURABLE_BAGS:
+        raise ValueError("1〜3巡目の3巡分を指定してください")
+    for number, bag in enumerate(result, 1):
+        if len(bag) != len(PIECES) or set(bag) != set(PIECES):
+            raise ValueError(f"{number}巡目は7種類を1個ずつにしてください")
+    return result
+
+
 class PieceSequence:
     """7-bag方式のミノ列。シードが同じなら同じ列になる(同一配列の再現用)。
 
     練習中の推奨手にはvisible_next()の範囲(NEXT5)だけを渡すこと。
     peek()で先を覗けるのは、同一配列リセット・教材生成などの内部用途に限る。
+
+    【2026-09-24・利用者の要望】bagsで1〜3巡目(21個)のツモ順を指定できる。
+    4巡目以降は同じシードの元の配列と同じ(指定しても乱数の消費は変わらない)。
     """
 
-    def __init__(self, seed: int) -> None:
+    def __init__(self, seed: int, bags=None) -> None:
         self.seed = seed
+        self.bags = None if bags is None else validate_bags(bags)
+        self._prefix = () if self.bags is None else tuple(p for bag in self.bags for p in bag)
         self._rng = random.Random(seed)
         self._pieces: list[str] = []
 
@@ -127,8 +148,15 @@ class PieceSequence:
             self._pieces.extend(bag)
 
     def peek(self, index: int) -> str:
+        if index < 0:
+            raise ValueError("配列位置は0以上です")
         self._ensure(index + 1)
-        return self._pieces[index]
+        return self._prefix[index] if index < len(self._prefix) else self._pieces[index]
+
+    def seed_bags(self) -> tuple[tuple[str, ...], ...]:
+        """指定が無い場合の(シードどおりの)1〜3巡目の並び。"""
+        self._ensure(len(PIECES) * CONFIGURABLE_BAGS)
+        return tuple(tuple(self._pieces[i * 7 : i * 7 + 7]) for i in range(CONFIGURABLE_BAGS))
 
 
 @dataclass(frozen=True)
@@ -179,11 +207,38 @@ class GameState:
     # 最後に成功した回転で使った補正の番号(0=補正なし)。直後に移動・落下
     # すればNoneに戻る。Tスピン判定(第2段階以降)の準備。
     last_rotation_kick: int | None = None
+    # 盤面エディタで作った開始盤面(Noneなら空)。同一配列・別配列リセットで再現する。
+    start_board: tuple[tuple[str | None, ...], ...] | None = None
+    # 途中局面から始めた練習の(操作ミノ, HOLD, 次に出るミノの通し番号)。Noneなら配列の先頭から。
+    # 【2026-09-24・利用者の要望】ツモ状況を保ったまま盤面だけ編集する。
+    start_position: tuple[str, str | None, int] | None = None
+    # 練習ごとの通し番号。同じシードでも盤面・ツモ順を変えたら別の練習として扱う
+    # (推奨手の追跡状態を引き継がないため)。
+    practice_id: int = 0
 
     @classmethod
-    def new(cls, seed: int) -> "GameState":
-        state = cls(sequence=PieceSequence(seed))
-        state._begin_turn(state._take_next())
+    def new(cls, seed: int, bags=None, board=None, position=None) -> "GameState":
+        """新しい練習。bags=1〜3巡目のツモ順、board=開始盤面(22行×10列)、
+        position=途中局面の(操作ミノ, HOLD, 次に出るミノの通し番号)。
+
+        開始盤面が不正(上端2行にブロック・揃った行・出現位置が塞がる)ならValueError。
+        """
+        start = None if board is None else validate_start_board(board)
+        state = cls(sequence=PieceSequence(seed, bags), start_board=start, practice_id=next(_PRACTICE_IDS))
+        if start is not None:
+            state.board = [list(row) for row in start]
+        if position is None:
+            state._begin_turn(state._take_next())
+        else:
+            current, hold, index = position
+            if current not in PIECES or (hold is not None and hold not in PIECES) or index < 1:
+                raise ValueError("ツモ状況が不正です")
+            state.start_position = (current, hold, index)
+            state.hold = hold
+            state.sequence_index = index
+            state._begin_turn(current)
+        if state.game_over:
+            raise ValueError("出現位置が塞がっています")
         return state
 
     # ---- 参照 ----
@@ -236,7 +291,7 @@ class GameState:
         self.last_lock = None
         overflow = any(cell is not None for row in self.board[:count] for cell in row)
         self.board = self.board[count:] + [
-            ["GARBAGE" if c != hole else None for c in range(COLS)] for hole in holes
+            [GARBAGE if c != hole else None for c in range(COLS)] for hole in holes
         ]
         while not self._fits(self.current, self.orient, self.row, self.col) and self.row > -4:
             self.row -= 1
@@ -340,14 +395,18 @@ class GameState:
         self.turn_start = snap
 
     def reset_same_sequence(self) -> "GameState":
-        """同じミノ列(未表示の将来分も含む)で開始状態に戻す。"""
-        return GameState.new(self.sequence.seed)
+        """同じミノ列(未表示の将来分・指定したツモ順も含む)と開始盤面で開始状態に戻す。"""
+        return GameState.new(self.sequence.seed, self.sequence.bags, self.start_board, self.start_position)
 
     def reset_new_sequence(self, seed: int | None = None) -> "GameState":
-        """新しいミノ列で開始する。"""
+        """新しいミノ列で開始する。
+
+        【2026-09-24・利用者の指示】盤面エディタで作った開始盤面は残す(同じ盤面を
+        別のツモで練習できるように)。ツモ順の指定は解除する。
+        """
         if seed is None:
             seed = random.SystemRandom().randrange(1 << 31)
-        return GameState.new(seed)
+        return GameState.new(seed, None, self.start_board)
 
     # ---- 内部 ----
     def _snapshot(self) -> Snapshot:
@@ -414,6 +473,28 @@ class GameState:
         return False
 
 
+_PRACTICE_IDS = itertools.count(1)
+
+
+def validate_start_board(board) -> tuple[tuple[str | None, ...], ...]:
+    """盤面エディタの開始盤面を検証して固定する。
+
+    上端の非表示2行は、推奨手(テンプレ・AI)が可視20行しか扱えないため使えない。
+    揃った行は勝手に消さず、直してもらう。
+    """
+    result = tuple(tuple(row) for row in board)
+    if len(result) != ROWS or any(len(row) != COLS for row in result):
+        raise ValueError(f"盤面は{ROWS}行×{COLS}列で指定してください")
+    if any(cell is not None and cell not in PIECES and cell != GARBAGE for row in result for cell in row):
+        raise ValueError("盤面に未対応のセル値があります")
+    if any(cell is not None for row in result[:HIDDEN_ROWS] for cell in row):
+        raise ValueError("上端の非表示2行にはブロックを置けません")
+    full = [ROWS - r for r, row in enumerate(result) if all(cell is not None for cell in row)]
+    if full:
+        raise ValueError(f"揃っている行があります(下から{', '.join(map(str, sorted(full)))}段目)")
+    return result
+
+
 def visible_board(state: GameState) -> list[list[str | None]]:
     """可視20行の盤面(非表示行を除く)。"""
     return [list(row) for row in state.board[HIDDEN_ROWS:]]
@@ -421,6 +502,8 @@ def visible_board(state: GameState) -> list[list[str | None]]:
 
 __all__ = [
     "COLS",
+    "CONFIGURABLE_BAGS",
+    "GARBAGE",
     "HIDDEN_ROWS",
     "NEXT_VISIBLE",
     "PIECES",
@@ -429,5 +512,7 @@ __all__ = [
     "PieceSequence",
     "Snapshot",
     "piece_cells",
+    "validate_bags",
+    "validate_start_board",
     "visible_board",
 ]

@@ -31,6 +31,10 @@ ACTIONS: dict[str, str] = {
     "undo": "一手戻す",
     "reset_same": "同一配列でリセット",
     "reset_new": "別配列でリセット",
+    "cycle_candidate": "次の候補",
+    "screenshot": "画像を保存",
+    "toggle_hints": "提示の表示/非表示",
+    "toggle_priority": "テンプレ優先/AI優先",
 }
 
 # 初期割り当て(仕様書では未決。利用者と合意した仮置き 2026-09-22)
@@ -45,6 +49,11 @@ DEFAULT_BINDINGS: dict[str, str] = {
     "undo": "Backspace",
     "reset_same": "R",
     "reset_new": "Shift+R",
+    # 【2026-09-24】仮の初期キー(設定ファイルで変更できる)
+    "cycle_candidate": "F2",
+    "screenshot": "F12",
+    "toggle_hints": "F3",
+    "toggle_priority": "F4",
 }
 
 _MODIFIERS = {
@@ -117,5 +126,29 @@ def load_repeat(path: Path = REPEAT_PATH) -> dict[str, int]:
 
 
 def save_repeat(settings: dict[str, int], path: Path = REPEAT_PATH) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+# ---- 表示の設定(提示の表示/非表示、テンプレ優先/AI優先) ----
+# 【2026-09-24・利用者の要望】トグルで切り替え、次回も同じ状態で開く
+VIEW_PATH = app_root() / "config" / "education_view.json"
+DEFAULT_VIEW = {"show_hints": True, "prefer_ai": False}
+
+
+def load_view(path: Path = VIEW_PATH) -> dict[str, bool]:
+    settings = dict(DEFAULT_VIEW)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        for key in DEFAULT_VIEW:
+            value = data.get(key) if isinstance(data, dict) else None
+            if isinstance(value, bool):
+                settings[key] = value
+    except (OSError, ValueError):
+        pass
+    return settings
+
+
+def save_view(settings: dict[str, bool], path: Path = VIEW_PATH) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")

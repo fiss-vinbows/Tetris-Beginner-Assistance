@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .opener_data import OPENER_SOURCE_FORMS
+from .opener_data import EDUCATION_SOURCE_FORMS, OPENER_SOURCE_FORMS
 
 BOARD_ROWS = 20
 BOARD_COLS = 10
@@ -205,9 +205,9 @@ def _mark_required_items(forms: list[OpenerForm]) -> list[OpenerForm]:
     return result
 
 
-def _build_templates() -> tuple[OpenerTemplate, ...]:
+def _build_templates(sources=OPENER_SOURCE_FORMS) -> tuple[OpenerTemplate, ...]:
     templates = []
-    for name_ja, name_en, url, source_forms in OPENER_SOURCE_FORMS:
+    for name_ja, name_en, url, source_forms in sources:
         forms: list[OpenerForm] = []
         seen: set[str] = set()
         for section, text in source_forms:
@@ -225,6 +225,8 @@ def _build_templates() -> tuple[OpenerTemplate, ...]:
 
 
 OPENER_TEMPLATES: tuple[OpenerTemplate, ...] = _build_templates()
+# 教育モードだけで使うテンプレ(開幕パフェ積み・DPC)。画像認識側の選択には使わない。
+EDUCATION_TEMPLATES: tuple[OpenerTemplate, ...] = _build_templates(EDUCATION_SOURCE_FORMS)
 
 
 @dataclass(frozen=True)

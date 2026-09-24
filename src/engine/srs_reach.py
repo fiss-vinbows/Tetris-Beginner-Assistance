@@ -13,6 +13,8 @@
 from __future__ import annotations
 
 import copy
+import heapq
+import itertools
 from collections import deque
 from functools import lru_cache
 
@@ -62,6 +64,69 @@ def find_path(
                     prev[nxt] = (node, label)
                     queue.append(nxt)
     return None
+
+
+def find_path_min_soft(
+    state: GameState, piece: str, target: tuple[Cell, ...], *, spin_entry: bool = False
+) -> tuple[tuple[str, ...], int] | None:
+    """ソフトドロップの区間数が最も少ない操作手順と、その区間数。無ければNone。
+
+    【2026-09-24・利用者の要望】推奨手の難度(◎○△)をソフトドロップの回数で示す。
+    1回=連続したソフトドロップの1区間(「↓×16」は1回、「↓→回転→↓」は2回)。
+    Tスピンに必要な下降も数える。find_path(操作数が最短)ではソフトドロップが
+    最少とは限らないため、(区間数, 操作数)の小さい順に探す。
+    """
+    sim = copy.copy(state)
+    sim.game_over = False
+    goal = frozenset(target)
+    sim.current = piece
+    if not sim._fits(piece, 0, SPAWN_ROW, SPAWN_COL):
+        return None
+    # 向き・行・列・直前の操作が回転か・直前の操作がソフトドロップか
+    start = (0, SPAWN_ROW, SPAWN_COL, False, False)
+    best: dict[tuple, tuple[int, int]] = {start: (0, 0)}
+    prev: dict[tuple, tuple[tuple, str] | None] = {start: None}
+    order = itertools.count()
+    heap = [(0, 0, next(order), start)]
+    while heap:
+        sections, ops, _n, node = heapq.heappop(heap)
+        if best.get(node) != (sections, ops):
+            continue  # もっと良い経路で到達済み
+        orient, row, col, rotated, _soft = node
+        sim.orient, sim.row, sim.col = orient, row, col
+        if spin_entry:
+            done = rotated and frozenset(sim.current_cells()) == goal and sim.is_grounded()
+        else:
+            done = frozenset(_ghost_cells(sim)) == goal
+        if done:
+            path: list[str] = []
+            while prev[node] is not None:
+                node, label = prev[node]
+                path.append(label)
+            return _compress(list(reversed(path)) + ["ハードドロップ"]), sections
+        for label, method in _OPS:
+            sim.orient, sim.row, sim.col = orient, row, col
+            if getattr(sim, method)():
+                is_soft = label == "↓"
+                nxt = (sim.orient, sim.row, sim.col, "回転" in label, is_soft)
+                cost = (sections + (1 if is_soft and not node[4] else 0), ops + 1)
+                if nxt not in best or cost < best[nxt]:
+                    best[nxt] = cost
+                    prev[nxt] = (node, label)
+                    heapq.heappush(heap, (cost[0], cost[1], next(order), nxt))
+    return None
+
+
+def soft_drop_sections(steps: tuple[str, ...]) -> int:
+    """操作手順(「↓×3」のように圧縮済み)の中の、連続したソフトドロップの区間数。"""
+    return sum(1 for i, step in enumerate(steps) if step.startswith("↓") and (i == 0 or not steps[i - 1].startswith("↓")))
+
+
+def difficulty_mark(sections: int | None) -> str:
+    """ソフトドロップの区間数を難度の記号にする(0回=◎、1回=○、2回以上=△)。"""
+    if sections is None:
+        return "評価待ち"
+    return "◎" if sections == 0 else "○" if sections == 1 else "△"
 
 
 def _ghost_cells(sim: GameState) -> tuple[Cell, ...]:

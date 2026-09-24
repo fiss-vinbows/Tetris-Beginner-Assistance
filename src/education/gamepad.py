@@ -33,6 +33,10 @@ DEFAULT_PAD_BINDINGS: dict[str, list[str]] = {
     "undo": ["Button7"],
     "reset_same": ["Button8"],
     "reset_new": [],
+    "cycle_candidate": [],
+    "screenshot": [],
+    "toggle_hints": [],
+    "toggle_priority": [],
 }
 
 _AXIS_THRESHOLD = 0.5  # 中心からの割合がこれを超えたら倒したとみなす

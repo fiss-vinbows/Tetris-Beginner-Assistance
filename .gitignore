@@ -41,3 +41,6 @@ config/education_*.json
 # パフェDB試作: solution-finder本体(配布物をそのまま展開)と生成したDB
 tools/sfinder/
 tools/pc_db/*.sqlite
+
+# 教育モードのスクリーンショット(練習画面の画像)
+screenshots/
