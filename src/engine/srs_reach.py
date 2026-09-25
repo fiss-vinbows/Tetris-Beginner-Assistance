@@ -18,7 +18,7 @@ import itertools
 from collections import deque
 from functools import lru_cache
 
-from src.education.rules import COLS, HIDDEN_ROWS, ROWS, SPAWN_COL, SPAWN_ROW, GameState
+from src.education.rules import _KICKS_I, _KICKS_JLSTZ, _SHAPES, COLS, HIDDEN_ROWS, ROWS, SPAWN_COL, SPAWN_ROW, GameState
 
 Cell = tuple[int, int]
 
@@ -150,12 +150,62 @@ def _compress(path: list[str]) -> tuple[str, ...]:
 
 
 @lru_cache(maxsize=200_000)
+def lock_positions(board: frozenset[Cell], piece: str) -> tuple[frozenset, frozenset]:
+    """22行座標の盤面boardで、出現位置からSRSで届き固定できる位置(4マスの組)の集合。
+
+    戻り値は(すべての固定位置, 最後の操作が回転で収まる固定位置=Tスピンの入れ方)。
+    find_path(操作手順の探索)と同じ動き(左右移動・左右回転・1マスずつの落下)を、
+    GameStateを使わず占有マスの集合で直接調べる(【2026-09-24】パフェ直後にDPCの図の
+    到達判定で画面が約0.23秒止まっていたため)。結果は盤面とミノごとに覚えて使い回す。
+    """
+    shapes = _SHAPES[piece]
+    kicks = _KICKS_I if piece == "I" else _KICKS_JLSTZ
+
+    def fits(orient: int, row: int, col: int) -> bool:
+        for dr, dc in shapes[orient]:
+            r, c = row + dr, col + dc
+            if not (0 <= r < ROWS and 0 <= c < COLS) or (r, c) in board:
+                return False
+        return True
+
+    def cells_of(orient: int, row: int, col: int) -> tuple[Cell, ...]:
+        return tuple(sorted((row + dr, col + dc) for dr, dc in shapes[orient]))
+
+    if not fits(0, SPAWN_ROW, SPAWN_COL):
+        return frozenset(), frozenset()
+    start = (0, SPAWN_ROW, SPAWN_COL)
+    seen = {start}
+    queue = deque([start])
+    plain: set[tuple[Cell, ...]] = set()
+    spin: set[tuple[Cell, ...]] = set()
+    while queue:
+        orient, row, col = queue.popleft()
+        if not fits(orient, row + 1, col):
+            plain.add(cells_of(orient, row, col))
+        nexts = [(orient, row, col - 1), (orient, row, col + 1), (orient, row + 1, col)]
+        for node in nexts:
+            if node not in seen and fits(*node):
+                seen.add(node)
+                queue.append(node)
+        if piece == "O":
+            continue
+        for direction in (-1, 1):
+            new = (orient + direction) % 4
+            for dx, dy in kicks[(orient, new)]:
+                node = (new, row - dy, col + dx)
+                if fits(*node):
+                    if not fits(new, node[1] + 1, node[2]):
+                        spin.add(cells_of(*node))  # 回転して接地した(最後の操作が回転)
+                    if node not in seen:
+                        seen.add(node)
+                        queue.append(node)
+                    break
+    return frozenset(plain), frozenset(spin)
+
+
 def reachable20(placed: frozenset[Cell], piece: str, cells: tuple[Cell, ...], spin_entry: bool) -> bool:
     """20行座標の盤面placedに対し、pieceをcellsへSRSで置けるか(openers用)。"""
-    state = GameState.new(0)
-    state.board = [[None] * COLS for _ in range(ROWS)]
-    for r, c in placed:
-        if 0 <= r + HIDDEN_ROWS < ROWS:
-            state.board[r + HIDDEN_ROWS][c] = "X"
-    target = tuple((r + HIDDEN_ROWS, c) for r, c in cells)
-    return find_path(state, piece, target, spin_entry=spin_entry) is not None
+    board = frozenset((r + HIDDEN_ROWS, c) for r, c in placed if 0 <= r + HIDDEN_ROWS < ROWS)
+    target = tuple(sorted((r + HIDDEN_ROWS, c) for r, c in cells))
+    plain, spin = lock_positions(board, piece)
+    return target in (spin if spin_entry else plain)
