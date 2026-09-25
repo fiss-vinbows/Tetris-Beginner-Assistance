@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import colorsys
 import ctypes
+import itertools
 import shutil
 import statistics
 import sys
@@ -769,6 +770,81 @@ def _is_plausible_board_transition(
     # 置いたミノのマス数ぶん(0〜4)を足せば列数の倍数になる減少は正常とみなす。
     decrease = previous_filled - candidate_filled
     return any((decrease + added) % width == 0 for added in range(_PIECE_CELL_COUNT + 1))
+
+
+# ライン消去直後、役名の文字等に隠れて空と読まれてよいマスの上限(これを超えたら予測しない)
+_MAX_HIDDEN_AFTER_CLEAR = 2
+
+
+def _predict_board_after_line_clear(
+    previous_board_key: tuple[tuple[str | None, ...], ...] | None,
+    candidate_board_key: tuple[tuple[str | None, ...], ...],
+) -> tuple[tuple[str | None, ...], ...] | None:
+    """ライン消去の直後なら、ゲームのルールから予測した消去後の盤面を返す(消去でなければNone)。
+
+    【2026-09-26・実画面 debug_capture_20260926_075054 の22秒】テトリスの直後、盤面に重なる
+    「TETRIS」の文字の下の赤いブロックが空と読まれ(文字の部分は別の列でUNKNOWN)、その盤面で
+    AIに質問したためOが既存ブロックと重なる位置に提示された。数の上では「1マス減って1マス
+    増えた」ので_is_plausible_board_transitionもすり抜けた。
+
+    ライン消去では「消えた行より上のマスが、消えた行数だけ下にずれる」以外の変化は起きない。
+    直前に確定した盤面(previous_board_key)の、ほぼ埋まった行(置いたミノで埋まる空きが合計
+    4マス以内)の組み合わせを消えた行の候補とし、ずらした盤面が今回の読み取りと最もよく合う
+    ものを選ぶ。「消去なし」の仮説より合うときだけ採用し、予測を正とする:
+    - 予測では埋まっているのに読み取りで空のマス(文字等に隠れたブロック)は埋まっているとする
+    - 予測に無いのに読み取りで現れたマス(文字等)は空とする
+    ただし置いたミノのうち消えた行の外に残るマス(4 - 消えた行の空きの数)は正当に増えるので、
+    その数までの余分なマスは読み取りのまま残す。それより多い場合は判断せずNoneを返す
+    (従来どおりの処理に任せる)。
+    """
+    if previous_board_key is None:
+        return None
+    rows = len(previous_board_key)
+    cols = len(previous_board_key[0]) if rows else 0
+    prev_filled = [[cell is not None for cell in row] for row in previous_board_key]
+    new_filled = {(r, c) for r in range(rows) for c in range(cols) if candidate_board_key[r][c] is not None}
+    # 消えた行の候補は空きが1〜4マスの行(揃った行は確定盤面にはあり得ない。置いたミノで埋まる)
+    near_full = [r for r in range(rows) if 0 < cols - sum(prev_filled[r]) <= _PIECE_CELL_COUNT]
+
+    def predict(cleared: tuple[int, ...]) -> list[tuple[str | None, ...]]:
+        kept = [previous_board_key[r] for r in range(rows) if r not in cleared]
+        return [tuple([None] * cols)] * len(cleared) + kept
+
+    def score(board: list[tuple[str | None, ...]]) -> tuple[int, list[tuple[int, int]]]:
+        occupied = {(r, c) for r in range(rows) for c in range(cols) if board[r][c] is not None}
+        return len(occupied - new_filled), sorted(new_filled - occupied)
+
+    no_clear_missing, no_clear_extra = score(list(previous_board_key))
+    no_clear_mismatch = no_clear_missing + len(no_clear_extra)
+    best: tuple[int, tuple[int, ...], list[tuple[str | None, ...]], list[tuple[int, int]]] | None = None
+    for size in range(1, 5):
+        for cleared in itertools.combinations(near_full, size):
+            gaps = sum(cols - sum(prev_filled[r]) for r in cleared)
+            if gaps > _PIECE_CELL_COUNT:
+                continue  # 1つのミノでは埋まらない
+            board = predict(cleared)
+            missing, extra = score(board)
+            leftover = _PIECE_CELL_COUNT - gaps  # 置いたミノのうち消えた行の外に残るマス
+            mismatch = missing + max(0, len(extra) - leftover)
+            if leftover == 0:
+                kept: list[tuple[int, int]] | None = []  # 余分なマスはすべて誤読(文字等)
+            elif len(extra) <= leftover:
+                kept = extra  # 置いたミノの残り
+            else:
+                kept = None  # どれが置いたミノの残りか区別できない
+            if missing > _MAX_HIDDEN_AFTER_CLEAR:
+                continue  # 予測と読み取りが離れすぎ: 消去ではなく誤読(ノイズ)の可能性が高い
+            if best is None or mismatch < best[0]:
+                best = (mismatch, cleared, board, kept)
+    if best is None:
+        return None
+    mismatch, _cleared, board, kept_extra = best
+    if mismatch >= no_clear_mismatch or mismatch > _PIECE_CELL_COUNT or kept_extra is None:
+        return None
+    grid = [list(row) for row in board]
+    for r, c in kept_extra:
+        grid[r][c] = candidate_board_key[r][c]
+    return tuple(tuple(row) for row in grid)
 
 
 def _drop_cells_not_connected_to(grid: list[list[str | None]], anchor_row: int) -> None:
@@ -2002,6 +2078,8 @@ class AssistWorker(QtCore.QThread):
         # スポーン行しきい値・NEXT欄先頭比較がすべて同時に機能しなくなる
         # 場面（後述）でも新規スポーンを取りこぼさないための最終手段として使う。
         self._last_board_key: tuple[tuple[str | None, ...], ...] | None = None
+        # 表示中の提示が既存ブロックと一部重なったtickの連続数(2tick続いたら取り消す)
+        self._interference_ticks = 0
         # board_key変化を2tick連続で確認するためのデバウンス用候補値。
         self._pending_board_key: tuple[tuple[str | None, ...], ...] | None = None
         # 直近tickで信頼した「着地済み領域の最上段行」(settled_top_row、
@@ -2521,6 +2599,32 @@ class AssistWorker(QtCore.QThread):
         # 妥当性検証(下記)用に、このtickでの更新前の基準値を保持しておく。
         previous_confirmed_board_key = self._last_board_key
 
+        # 【2026-09-26・実画面 debug_capture_20260926_075054 の22秒】ライン消去の直後は、盤面に
+        # 重なる役名の文字(TETRIS等)の下のブロックが空と読まれることがある。消去ではルール上
+        # 「消えた行より上のマスが下にずれる」以外の変化は起きないので、予測した盤面を正とする
+        # (_predict_board_after_line_clear参照)。以降の処理はすべて補正後の盤面を使う。
+        board_predicted = False
+        predicted_key = _predict_board_after_line_clear(previous_confirmed_board_key, recognition.board_key)
+        if predicted_key is not None:
+            board_predicted = True
+            if predicted_key != recognition.board_key:
+                if self._debug_log_file is not None:
+                    fixed = [
+                        (r, c, old, new)
+                        for r, (old_row, new_row) in enumerate(zip(recognition.board_key, predicted_key))
+                        for c, (old, new) in enumerate(zip(old_row, new_row))
+                        if old != new
+                    ]
+                    self._debug_log_file.write(
+                        "----- ライン消去後の盤面をルールで補正: "
+                        + ",".join(f"({r},{c}):{old}->{new}" for r, c, old, new in fixed)
+                        + " -----\n"
+                    )
+                    self._debug_log_file.flush()
+                corrected = recognition.board.clone()
+                corrected.grid = [list(row) for row in predicted_key]
+                recognition = dataclass_replace(recognition, board=corrected, board_key=predicted_key)
+
         # 「前回確定したboard_key(基準値)」との差分が2tick連続で同じ値に
         # なった時だけ、基準値そのものを更新して変化を確定する。基準値を
         # 毎tick無条件で最新値に更新してしまうと、1回目の差分がそのまま
@@ -2669,7 +2773,8 @@ class AssistWorker(QtCore.QThread):
         # 対象にするとほぼ毎手番で保留が発生し、盤面信頼のタイムアウト
         # (0.3秒)まで要求が止まった(3回目の実機ログ: 保留61回、タイムアウト
         # 67回)。占有が変わらない色の変化はAIの判断に影響しない。
-        board_settling = any(
+        # ライン消去を予測で補正した手番は、消えた行の確定を待たなくてよい(予測が消去後の盤面)
+        board_settling = not board_predicted and any(
             cell is not None and cell[0] is None for row in recognition.pending_grid for cell in row
         )
         if board_settling and board_data_trustworthy:
@@ -2730,6 +2835,35 @@ class AssistWorker(QtCore.QThread):
                 recognition = dataclass_replace(recognition, board=cleaned)
         if board_data_trustworthy:
             self._last_board_trustworthy_time = now_board_trust
+
+        # 【2026-09-26・利用者の承認(「最善手は切り替えない」の例外)】表示中の提示が、信用できる
+        # 盤面の既存ブロックと一部だけ重なっていたら、明らかな誤りなので取り消して計算し直す。
+        # 4マスすべて埋まった場合は提示どおりに置いた(stale_suggestion_detectedの担当)ので対象外。
+        # 置いた瞬間の光で一部だけ読める一瞬を誤検知しないよう、2tick続いたときだけ取り消す。
+        shown = self._last_valid_draw_data
+        overlap = (
+            sum(recognition.board.grid[r][c] is not None for r, c in shown.landing_cells)
+            if shown is not None and shown.landing_cells
+            else 0
+        )
+        if board_data_trustworthy and shown is not None and 0 < overlap < len(shown.landing_cells):
+            self._interference_ticks += 1
+        else:
+            self._interference_ticks = 0
+        if self._interference_ticks >= 2:
+            self._interference_ticks = 0
+            if self._debug_log_file is not None:
+                self._debug_log_file.write(
+                    f"----- 提示が既存ブロックと重なったため取り消して再計算: 提案={shown.piece} "
+                    f"cells={list(shown.landing_cells)} -----\n"
+                )
+                self._debug_log_file.flush()
+            self._committed_placement = None
+            self._committed_move = None
+            self._last_valid_draw_data = None
+            self._last_draw_data_set_time = time.monotonic()
+            self.draw_data_ready.emit(None)
+            significant_change = True
 
         if significant_change and not board_data_trustworthy:
             # 【2026-09-11・実機ログで判明】このtickの盤面が信用できず要求を
