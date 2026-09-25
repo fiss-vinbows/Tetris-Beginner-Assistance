@@ -91,11 +91,11 @@ class TestFirstBagFormsNeedAlignedBag(unittest.TestCase):
         mountain = next(t for t in OPENER_TEMPLATES if t.name_ja == "山岳積み2号")
         dpc = next(t for t in EDUCATION_TEMPLATES if t.name_ja == "DPC")
         has_empty = lambda t: any(not f.existing for f in t.forms)  # noqa: E731
-        self.assertTrue(has_empty(startable_template(mountain, None, True)))
-        self.assertFalse(has_empty(startable_template(mountain, "Z", True)), "HOLDがあるのに1巡目の図を使う")
-        self.assertFalse(has_empty(startable_template(mountain, None, False)), "袋の途中から1巡目の図を使う")
-        self.assertTrue(has_empty(startable_template(dpc, "S", True)))
-        self.assertFalse(has_empty(startable_template(dpc, None, True)), "繰り越しミノが無いのにDPC")
+        self.assertTrue(has_empty(startable_template(mountain, None, "開幕")))
+        self.assertFalse(has_empty(startable_template(mountain, "Z", "DPC")), "前の袋のミノを繰り越して1巡目の図を使う")
+        self.assertFalse(has_empty(startable_template(mountain, None, "袋ずれ")), "袋の途中から1巡目の図を使う")
+        self.assertTrue(has_empty(startable_template(dpc, "S", "DPC")))
+        self.assertFalse(has_empty(startable_template(dpc, None, "開幕")), "繰り越しミノが無いのにDPC")
 
 
 class TestEducationOnlyTemplates(unittest.TestCase):
@@ -124,9 +124,9 @@ class TestPerfectClearSearch(unittest.TestCase):
         self.assertEqual(board, set(), "パフェになっていない")
 
     def test_no_pc_and_timeout(self) -> None:
-        self.assertIsNone(find_perfect_clear(frozenset(), list("IOTSZJ"), None), "このミノ順では2段パフェにならない")
+        self.assertIsNone(find_perfect_clear(frozenset(), list("IOTSZJ"), None, time_limit=30), "このミノ順では2段パフェにならない")
         tall = frozenset((r, 0) for r in range(ROWS - 8, ROWS))  # 8段の柱: 5手では消し切れない
-        self.assertIsNone(find_perfect_clear(tall, list("IOTSZJ"), None))
+        self.assertIsNone(find_perfect_clear(tall, list("IOTSZJ"), None, time_limit=30))
         import threading
 
         cancel = threading.Event()
@@ -344,11 +344,14 @@ class TestTallPerfectClear(unittest.TestCase):
     def test_eight_line_pc_is_searched(self) -> None:
         # 修正前は6段までしか探さなかった。TST→I J O L Z Tの順なら8段パフェになる
         board = frozenset((r, c) for r, row in enumerate(_board_rows(MEISOU_NORMAL_ROWS)) for c, v in enumerate(row) if v)
-        steps = find_perfect_clear(board, list("TIJOLZT"), None, can_hold=False)
+        steps = find_perfect_clear(board, list("TIJOLZT"), None, can_hold=False, time_limit=10)
         self.assertIsInstance(steps, list)
         self.assertEqual(len(steps), 7)
-        # 実際の順番(HOLD=T, L Z I O J T)ではTが最後になりパフェにならない(順番の制約)
-        self.assertIsNone(find_perfect_clear(board, list("LZIOJTS"), "T"))
+        # 実際の順番(HOLD=T, L Z I O J T S)でも、TST→L→HOLDしてI→O→J→Z→Tで取れる
+        # (実画面 practice_20260924_201639〜201701。以前は取れないと誤判定していた)
+        steps = find_perfect_clear(board, list("LZIOJTS"), "T", time_limit=10)
+        self.assertIsInstance(steps, list)
+        self.assertEqual(len(steps), 7)
 
 
 class TestFastPlacements(unittest.TestCase):
@@ -386,3 +389,253 @@ class TestAsyncPerfectClear(unittest.TestCase):
         state.use_hold()
         advisor.update(state, now=0.0)
         self.assertIsNone(advisor._pc_rec)
+
+
+class TestPerfectClearAfterTst(unittest.TestCase):
+    """【実画面 practice_20260924_201639〜201701】TST後(HOLD空、L Z I O J T)で、人間はL→HOLDして
+    I→O→J→Z→Tでパフェを取れたが、候補に出なかった。原因は2つ:
+    ・4の倍数でない空きマスの塊を打ち切っていた(Jを置いたときに1行消えて塊がつながる)
+    ・見えている範囲の最後で、次のミノと入れ替えてHOLDのミノを置く手を認めていなかった"""
+
+    def _after_tst(self) -> frozenset:
+        from src.education.pc_search import _lock
+
+        rows = MEISOU_NORMAL_ROWS
+        board = frozenset((r, c) for r, row in enumerate(_board_rows(rows)) for c, v in enumerate(row) if v)
+        top = ROWS - len(rows)
+        slot = tuple((top + i, c) for i, line in enumerate(rows) for c, ch in enumerate(line) if ch == "U")
+        return _lock(board, slot)[0]
+
+    def test_pc_is_found_with_only_visible_pieces(self) -> None:
+        steps = find_perfect_clear(self._after_tst(), list("LZIOJT"), None)
+        self.assertIsInstance(steps, list)
+        self.assertEqual([s.piece for s in steps][-1], "T", "最後はHOLDのTを次のミノと入れ替えて置く")
+        self.assertTrue(steps[-1].use_hold)
+
+    def test_human_line_including_a_mid_line_clear_is_valid(self) -> None:
+        # 人間の手順(L, I, O, Jで1行消える, Z, T)が探索の置き方と一致して実際にパフェになる
+        from src.education.pc_search import _lock
+
+        b = self._after_tst()
+        for piece, cells in (
+            ("L", ((17, 5), (18, 3), (18, 4), (18, 5))),
+            ("I", ((17, 0), (18, 0), (19, 0), (20, 0))),
+            ("O", ((17, 6), (17, 7), (18, 6), (18, 7))),
+            ("J", ((17, 8), (17, 9), (18, 8), (19, 8))),
+        ):
+            self.assertIn(cells, placements(b, piece))
+            b = _lock(b, cells)[0]
+        self.assertEqual(find_perfect_clear(b, list("ZT"), None, can_hold=False)[-1].piece, "T")
+
+    def test_advisor_offers_the_pc_after_tst(self) -> None:
+        board = [[None] * COLS for _ in range(ROWS)]
+        for r, c in self._after_tst():
+            board[r][c] = GARBAGE
+        state = GameState.new(1, None, board, ("L", None, 15))
+        state.sequence._prefix = tuple("IJLOSTZIJLOSTZ") + tuple("LZIOJTS")
+        advisor = Advisor(engine_factory=FakeEngine)
+        rec = advisor.update(state, now=0.0)
+        self.assertIn(PC_ID, [c.source_id for c in advisor.candidates()])
+        for _ in range(7):
+            if advisor.active_id != PC_ID:
+                advisor.choose(PC_ID)
+                rec = advisor.update(state, now=0.0)
+            _follow(state, rec)
+            if state.last_clear and "パーフェクトクリア" in state.last_clear:
+                break
+            rec = advisor.update(state, now=0.0)
+        self.assertIn("パーフェクトクリア", state.last_clear or "")
+
+
+class TestDpcAndTetrisPerfectClear(unittest.TestCase):
+    def test_labels_distinguish_search_pc_and_show_dpc_loop(self) -> None:
+        board = [[None] * COLS for _ in range(ROWS)]
+        for r, c in _pc_opener_board():
+            board[r][c] = GARBAGE
+        state = GameState.new(1, ("IJLOSTZ", "IOTSZJL", "IJLOSTZ"), board, ("I", None, 8))
+        advisor = Advisor(engine_factory=FakeEngine)
+        rec = advisor.update(state, now=0.0)
+        self.assertIn("(探索)", rec.label)
+        self.assertIn(rec.after_pc, ("開幕", "DPC", "袋ずれ"))
+        label = next(c.label for c in advisor.candidates() if c.source_id == PC_ID)
+        self.assertRegex(label, r"→(開幕へ|DPCへ|袋ずれ\(ループ崩れ\))$")
+
+    def test_after_pc_counts_placed_pieces(self) -> None:
+        from src.education.advisor import _after_pc, bag_status
+
+        # 置いた数で判断する(HOLDは一度使うと空に戻らないので、HOLDの有無では判断しない)
+        self.assertEqual(bag_status(0, None), "開幕")
+        self.assertEqual(bag_status(35, "O"), "開幕", "DPC後(5巡)にHOLDがあっても開幕テンプレを組める")
+        self.assertEqual(bag_status(20, "Z"), "DPC", "8ラインパフェ後はDPC")
+        self.assertEqual(bag_status(20, None), "袋ずれ")
+        self.assertEqual(bag_status(17, "Z"), "袋ずれ")
+        # 置いた数13(操作ミノI・HOLD空・次は14番)から1個置くと14個 → 開幕
+        state = GameState.new(1, None, None, ("I", None, 14))
+        self.assertEqual(_after_pc(state, [False]), "開幕")
+        # HOLDに繰り越しがあり置いた数が12(次は14番)から1個置くと13個 → DPC
+        held = GameState.new(1, None, None, ("I", "Z", 14))
+        self.assertEqual(_after_pc(held, [False]), "DPC")
+
+    def test_openers_come_back_after_dpc(self) -> None:
+        # 【2026-09-24】DPCを終えると5巡(35個)で、HOLDには6巡目のミノが残る。以前は「HOLDが空」を
+        # 開幕テンプレの条件にしていたため、DPCの後に開幕テンプレが出なかった
+        state = GameState.new(1, None, None, ("I", "O", 37))
+        state.sequence._prefix = tuple("IJLOSTZ" * 5) + tuple("OILSTZJ")
+        advisor = Advisor(engine_factory=FakeEngine)
+        advisor.update(state, now=0.0)
+        ids = [c.source_id for c in advisor.candidates()]
+        self.assertIn("迷走砲", ids)
+        self.assertNotIn("DPC", ids)
+
+    def test_tetris_pc_is_preferred_over_a_template(self) -> None:
+        advisor = Advisor(engine_factory=FakeEngine)
+        template = Recommendation("I", False, (), "", (), soft_sections=0)
+        advisor._template_recs = {candidate_templates()[0].name_ja: template}
+        advisor._pc_rec = Recommendation("I", False, (), "", (), soft_sections=3, tetris=True)
+        advisor._select()
+        self.assertEqual(advisor.active_id, PC_ID, "テトリスパフェよりテンプレを優先した")
+        advisor._pc_rec = Recommendation("I", False, (), "", (), soft_sections=0, tetris=False)
+        advisor._select()
+        self.assertNotEqual(advisor.active_id, PC_ID, "テトリスでないパフェはテンプレを優先")
+
+    def test_search_prefers_a_pc_with_a_tetris(self) -> None:
+        from src.education.pc_search import has_tetris
+
+        # 右端の縦1列だけ空いた4段: Iを縦に入れるテトリスで消せる。
+        board = frozenset((r, c) for r in range(ROWS - 4, ROWS) for c in range(COLS - 1))
+        steps = find_perfect_clear(board, list("I"), None)
+        self.assertIsInstance(steps, list)
+        self.assertTrue(has_tetris(board, steps))
+
+    def test_pc_plan_is_kept_while_followed(self) -> None:
+        # 【2026-09-24】2段パフェの途中で見えるミノが増え、7手のテトリスパフェへ切り替わった
+        state = GameState.new(1, None, None, ("O", "I", 15))
+        state.sequence._prefix = tuple("IJLOSTZIJLOSTZ") + tuple("OJLOJSZ")
+        advisor = Advisor(engine_factory=FakeEngine)
+        rec = advisor.update(state, now=0.0)
+        counts = []
+        for _ in range(6):
+            counts.append(rec.source)
+            _follow(state, rec)
+            if state.last_clear and "パーフェクトクリア" in state.last_clear:
+                break
+            rec = advisor.update(state, now=0.0)
+        self.assertIn("パーフェクトクリア", state.last_clear or "")
+        self.assertEqual(len(counts), 5, f"途中で別のパフェに切り替わった: {counts}")
+
+
+class TestFastReachability(unittest.TestCase):
+    def test_same_result_as_path_search(self) -> None:
+        from src.education.rules import piece_cells
+        from src.engine.srs_reach import find_path, lock_positions
+
+        state = GameState.new(1)
+        b = ROWS - 1
+        for c in list(range(0, 4)) + list(range(5, 10)):
+            state.board[b][c] = "X"
+        for c in list(range(0, 3)) + list(range(6, 10)):
+            state.board[b - 1][c] = "X"
+        for c in list(range(0, 3)) + list(range(5, 10)):
+            state.board[b - 2][c] = "X"
+        state.board[b - 4][1] = "X"
+        board = frozenset((r, c) for r in range(ROWS) for c in range(COLS) if state.board[r][c])
+        for piece in "TSZ":
+            plain, spin = lock_positions(board, piece)
+            for orient in range(4):
+                for row in range(ROWS - 6, ROWS):
+                    for col in range(-2, COLS):
+                        cells = piece_cells(piece, orient, row, col)
+                        if any(not (0 <= r < ROWS and 0 <= c < COLS) or (r, c) in board for r, c in cells):
+                            continue
+                        if not any(r + 1 >= ROWS or (r + 1, c) in board for r, c in cells):
+                            continue
+                        target = tuple(sorted(cells))
+                        self.assertEqual(find_path(state, piece, target) is not None, target in plain, target)
+                        if piece == "T":
+                            self.assertEqual(
+                                find_path(state, piece, target, spin_entry=True) is not None, target in spin, target
+                            )
+
+
+class TestToggleSwitches(unittest.TestCase):
+    def test_switches_show_their_state(self) -> None:
+        from src.education.window import ToggleSwitch
+
+        window = PracticeWindow(seed=0, advisor=Advisor(engine_factory=FakeEngine))
+        self.addCleanup(window.close)
+        for switch in (window.hints_btn, window.priority_btn, window.show_rec_check, window.show_steps_check):
+            self.assertIsInstance(switch, ToggleSwitch)
+            self.assertEqual(switch.focusPolicy(), QtCore.Qt.FocusPolicy.NoFocus, "盤面のキー操作を奪う")
+            switch.grab()  # 描画で例外が出ない
+        window.show_steps_check.click()
+        self.assertFalse(window.show_steps_check.isChecked())
+        self.assertNotIn("操作手順", window.rec_label.text())
+
+
+class TestDpcCarriedPiece(unittest.TestCase):
+    """【実画面 practice_20260924_210537〜210624】HOLD=Z(Z繰り越し)なのにO繰り越し用のO-05aを選び、
+    TSDの後に続くパフェの図が合わず途中で切れた。DPCの組み方は繰り越しミノが一致する図だけ使う。"""
+
+    def test_setup_matches_the_carried_piece(self) -> None:
+        from src.education.advisor import carried_pieces
+
+        state = GameState.new(1, ("JILOTSZ", "ILOTSZJ", "IJLOSTZ"), None, ("I", "Z", 8))
+        advisor = Advisor(engine_factory=FakeEngine)
+        rec = advisor.update(state, now=0.0)
+        self.assertEqual(advisor.active_id, "DPC")
+        self.assertNotIn("O-05a", rec.source)
+        self.assertTrue(rec.source.split("/ ")[-1].startswith("S-"), rec.source)
+        track = advisor._tracks["DPC"][0]
+        self.assertIn("Z", carried_pieces(track.form))
+
+    def test_carried_pieces_of_forms(self) -> None:
+        from src.education.advisor import carried_pieces
+
+        dpc = EDUCATION_TEMPLATES[1]
+        setups = [f for f in dpc.forms if not f.existing]
+        self.assertTrue(all(carried_pieces(f) for f in setups), "繰り越しミノが分からない組み方の図がある")
+        o02 = next(f for f in setups if f.section.startswith("O-02"))
+        self.assertEqual(carried_pieces(o02), frozenset("O"), "大文字の無い図はパターン名で判断する")
+
+
+class TestBagStatusByPieceIndex(unittest.TestCase):
+    """【実画面 practice_20260925_222055】DPCの途中から「テトリスパフェ →開幕へ」に従ったら、パフェ後に
+    開幕テンプレが出なかった。前の袋のSをHOLDしたまま新しい袋のミノを先に置いていた(置いた数は35で
+    7の倍数)。置いた数ではなく、まだ置いていないミノ(操作ミノ・HOLD)の番号で判断する。"""
+
+    def test_status_uses_unplaced_piece_indices(self) -> None:
+        from src.education.advisor import bag_status
+
+        self.assertEqual(bag_status(35, "S", 36, 34), "袋ずれ", "前の袋のミノをHOLDしている")
+        self.assertEqual(bag_status(35, "S", 36, 35), "開幕", "HOLDも新しい袋のミノ")
+        self.assertEqual(bag_status(35, None, 35, None), "開幕")
+        self.assertEqual(bag_status(20, "Z", 21, 20), "DPC", "3巡目のミノを繰り越し、操作ミノは4巡目の先頭")
+        self.assertEqual(bag_status(20, "Z", 22, 20), "袋ずれ")
+        self.assertEqual(bag_status(35, "S"), "開幕", "番号が分からないときは置いた数で判断")
+
+    def test_rules_track_piece_indices(self) -> None:
+        state = GameState.new(1)
+        self.assertEqual((state.current_index, state.hold_index), (0, None))
+        state.use_hold()  # 空のHOLDへ: 0番をHOLDし、1番が操作ミノ
+        self.assertEqual((state.current_index, state.hold_index), (1, 0))
+        state.hard_drop()
+        self.assertEqual((state.current_index, state.hold_index), (2, 0))
+        state.use_hold()  # 入れ替え: 0番が操作ミノ、2番をHOLD
+        self.assertEqual((state.current_index, state.hold_index), (0, 2))
+        state.undo()  # 直前に固定した手番(1手目)の開始時点(HOLD前)に戻る
+        self.assertEqual((state.current_index, state.hold_index), (0, None))
+
+    def test_tetris_pc_that_breaks_the_loop_is_labelled(self) -> None:
+        from src.engine.srs_reach import find_path  # noqa: F401  (画像の局面の再現)
+
+        cells = [(19, c) for c in range(1, 10)] + [(18, c) for c in (4, 5, 7, 8, 9)] + [(17, 5), (17, 7)]
+        board = [[None] * COLS for _ in range(ROWS)]
+        for r, c in cells:
+            board[r + HIDDEN_ROWS][c] = GARBAGE
+        state = GameState.new(1202165697, None, board, ("I", "L", 31))
+        advisor = Advisor(engine_factory=FakeEngine)
+        advisor.update(state, now=0.0)
+        labels = {c.source_id: c.label for c in advisor.candidates()}
+        self.assertIn("袋ずれ", labels[PC_ID], "ループが崩れるテトリスパフェを「開幕へ」と表示した")
+        self.assertIn("開幕へ", labels["DPC"])
+        self.assertEqual(advisor.active_id, PC_ID, "テトリスパフェの優先はそのまま(利用者の指示)")

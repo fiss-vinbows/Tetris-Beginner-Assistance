@@ -5,23 +5,25 @@
 
 - 使うのは操作ミノ・HOLD・NEXT5(と袋の位置から確定する7個目)だけ。
 - 置き方は通常SRSで出現位置から実際に届く位置だけ(左右移動・回転・1マスずつの落下)。
-- パフェの高さ(何段で消し切るか)を決め、その高さより上にはみ出す置き方や、
-  4の倍数でない空き領域ができる置き方は打ち切る。
+- パフェの高さ(何段で消し切るか)を決め、その高さより上にはみ出す置き方は打ち切る。
+  【2026-09-24・実画面 practice_20260924_201639〜201701】以前は「4の倍数でない空きマスの
+  塊ができる置き方」も打ち切っていたが、途中で行が消えると上下の塊がつながるため誤りで、
+  取れるパフェ(TST後にL→HOLDしてI→O→J→Z→T)を見逃していた。今はこの打ち切りを速く探す
+  1回目だけに使い(見つかった手順は正しい)、見つからなければ打ち切りなしで探し直す。
 - 時間の上限を超えたら「見つからなかった」ではなく「未判定」(TIMEOUT)を返す。
 """
 
 from __future__ import annotations
 
 import time
-from collections import deque
 from dataclasses import dataclass
 
-from functools import lru_cache
-
-from src.education.rules import _KICKS_I, _KICKS_JLSTZ, _SHAPES, COLS, HIDDEN_ROWS, ROWS, SPAWN_COL, SPAWN_ROW
+from src.education.rules import COLS, HIDDEN_ROWS, ROWS
+from src.engine.srs_reach import lock_positions
 
 TIME_LIMIT_SEC = 0.8  # 同期で探すとき(テスト等)の上限。画面では別スレッドで長めに探す
 TIMEOUT = "timeout"
+UNKNOWN = "?"  # 見えている範囲の次に来るミノ(種類は分からない)
 
 Board = frozenset  # 22行座標の占有マス
 
@@ -37,48 +39,9 @@ class _Timeout(Exception):
     pass
 
 
-@lru_cache(maxsize=200_000)
 def placements(board: Board, piece: str) -> tuple[tuple[tuple[int, int], ...], ...]:
-    """出現位置からSRSで届く、固定できる位置(4マス)の一覧。
-
-    【2026-09-24・利用者の指摘】ホールドを切り替えたときに動作が重かった。以前は
-    rules.GameStateの移動・回転を1手ずつ呼んで調べていたため遅かった(空の盤面で
-    パフェを探すと時間の上限0.8秒まで画面が止まった)。同じ通常SRS(rules の形と
-    補正表)を、占有マスの集合で直接調べる。結果は盤面とミノごとに覚えて使い回す。
-    """
-    shapes = _SHAPES[piece]
-    kicks = _KICKS_I if piece == "I" else _KICKS_JLSTZ
-
-    def fits(orient: int, row: int, col: int) -> bool:
-        for dr, dc in shapes[orient]:
-            r, c = row + dr, col + dc
-            if not (0 <= r < ROWS and 0 <= c < COLS) or (r, c) in board:
-                return False
-        return True
-
-    if not fits(0, SPAWN_ROW, SPAWN_COL):
-        return ()
-    start = (0, SPAWN_ROW, SPAWN_COL)
-    seen = {start}
-    queue = deque([start])
-    result: set[tuple[tuple[int, int], ...]] = set()
-    while queue:
-        orient, row, col = queue.popleft()
-        nexts = [(orient, row, col - 1), (orient, row, col + 1), (orient, row + 1, col)]
-        if not fits(orient, row + 1, col):
-            result.add(tuple(sorted((row + dr, col + dc) for dr, dc in shapes[orient])))
-        if piece != "O":
-            for direction in (-1, 1):
-                new = (orient + direction) % 4
-                for dx, dy in kicks[(orient, new)]:
-                    if fits(new, row - dy, col + dx):
-                        nexts.append((new, row - dy, col + dx))
-                        break
-        for node in nexts:
-            if node not in seen and fits(*node):
-                seen.add(node)
-                queue.append(node)
-    return tuple(sorted(result))
+    """出現位置からSRSで届く、固定できる位置(4マス)の一覧(srs_reach.lock_positionsを共用)。"""
+    return tuple(sorted(lock_positions(board, piece)[0]))
 
 
 def _lock(board: Board, cells) -> tuple[Board, int]:
@@ -96,7 +59,10 @@ def _lock(board: Board, cells) -> tuple[Board, int]:
 
 
 def _regions_ok(board: Board, height: int) -> bool:
-    """パフェの高さ以下の空きマスが、どれも4の倍数の大きさの塊になっているか。"""
+    """パフェの高さ以下の空きマスが、どれも4の倍数の大きさの塊か(1回目の探索の打ち切り用)。
+
+    途中で行が消えると塊がつながるので、これを満たさなくてもパフェになる場合がある。
+    """
     top = ROWS - height
     empty = {(r, c) for r in range(top, ROWS) for c in range(COLS) if (r, c) not in board}
     while empty:
@@ -136,6 +102,11 @@ def find_perfect_clear(
     盤面が空でも探す(パフェ直後の2段パフェ等)。
     【2026-09-24・実画面 practice_20260924_193201】以前は空の盤面を「パフェ済み」として
     探さず、O・HOLD I・NEXT J L O J S で取れる2段パフェが1手置くまで出なかった。
+
+    【2026-09-24・利用者の指示】テトリス(4列消し)を含むパフェが取れるなら、ソフトドロップが
+    要ってもそちらを優先する。探す順: テトリスあり(打ち切りあり)→テトリスなし(打ち切りあり)
+    →テトリスあり(打ち切りなし)→テトリスなし(打ち切りなし)。時間切れになったら、それまでに
+    見つかったパフェを返す。
     """
     board = frozenset(board)
     if any(r < HIDDEN_ROWS for r, _c in board):
@@ -148,15 +119,19 @@ def find_perfect_clear(
     deadline = time.monotonic() + time_limit
     failed: set[tuple] = set()
     moves = placements
+    pruned = True  # 空きマスの塊で打ち切って速く探す(見つかった手順は正しい)
+    need_tetris = True  # テトリス(4列消し)を含むパフェだけを探す
 
-    def dfs(b: Board, index: int, held: str | None, height: int, left: int):
+    def dfs(b: Board, index: int, held: str | None, height: int, left: int, tetris: bool = False):
         # 高さ以下の空きマスは常に4×残り手数(はみ出しを禁じているため)、
         # 置き終えて盤面が空になったときだけ成功
         if left == 0:
-            return [] if not b else None
+            return [] if not b and (tetris or not need_tetris) else None
         if time.monotonic() > deadline or (cancel is not None and cancel.is_set()):
             raise _Timeout
-        key = (b, index, held, height, left)
+        if need_tetris and not tetris and (height < 4 or ("I" not in sequence[index:] and held != "I")):
+            return None  # もうテトリス(4列消し)はできない: 高さが4段未満か、Iが残っていない
+        key = (pruned, need_tetris, b, index, held, height, left, tetris)
         if key in failed:
             return None
         options = []
@@ -164,28 +139,30 @@ def find_perfect_clear(
             options.append((sequence[index], False, index + 1, held))
         if index == 0 and not can_hold:
             pass
-        elif held is not None and index < len(sequence):
-            options.append((held, True, index + 1, sequence[index]))
+        elif held is not None and held != UNKNOWN and index <= len(sequence):
+            # 見えている範囲の最後でも、次のミノ(種類は見えないが必ず来る)と入れ替えてHOLDの
+            # ミノを置ける。入れ替えでHOLDに入った見えないミノは置けない(UNKNOWN)。
+            options.append((held, True, index + 1, sequence[index] if index < len(sequence) else UNKNOWN))
         elif held is None and index + 1 < len(sequence):
             options.append((sequence[index + 1], True, index + 2, sequence[index]))
         top = ROWS - height
         for piece, use_hold, next_index, next_held in options:
-            if use_hold and held is not None and piece == sequence[index]:
+            if use_hold and held is not None and index < len(sequence) and piece == sequence[index]:
                 continue  # 同じ種類のミノを入れ替えても結果は同じ
             for cells in moves(b, piece):
                 if any(r < top for r, _c in cells):
                     continue  # パフェの高さより上にはみ出す
                 nb, cleared = _lock(b, cells)
                 nh = height - cleared
-                if nb and not _regions_ok(nb, nh):
+                if pruned and nb and not _regions_ok(nb, nh):
                     continue
-                rest = dfs(nb, next_index, next_held, nh, left - 1)
+                rest = dfs(nb, next_index, next_held, nh, left - 1, tetris or cleared == 4)
                 if rest is not None:
                     return [PCStep(piece, cells, use_hold), *rest]
         failed.add(key)
         return None
 
-    try:
+    def run():
         for height in range(max(stack_height, 1), ROWS - HIDDEN_ROWS + 1):
             empty = height * COLS - filled
             if empty <= 0 or empty % 4:
@@ -196,6 +173,33 @@ def find_perfect_clear(
             found = dfs(board, 0, hold, height, pieces)
             if found is not None:
                 return found
+        return None
+
+    # テトリスにはIが要る
+    tetris_possible = "I" in sequence or hold == "I"
+    passes = [(True, True), (True, False), (False, True), (False, False)]
+    fallback = None  # 見つかったテトリスなしのパフェ(テトリスありを探し切る前に時間切れなら使う)
+    try:
+        for pruned, need_tetris in passes:
+            if need_tetris and not tetris_possible:
+                continue
+            if not need_tetris and fallback is not None:
+                continue
+            found = run()
+            if found is not None:
+                if need_tetris:
+                    return found
+                fallback = found
     except _Timeout:
-        return TIMEOUT
-    return None
+        return fallback if fallback is not None else TIMEOUT
+    return fallback
+
+
+def has_tetris(board: Board, steps: list[PCStep]) -> bool:
+    """パフェの手順にテトリス(4列消し)が含まれるか。"""
+    board = frozenset(board)
+    for step in steps:
+        board, cleared = _lock(board, step.cells)
+        if cleared == 4:
+            return True
+    return False

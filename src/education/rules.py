@@ -176,6 +176,9 @@ class Snapshot:
     back_to_back: int
     combo: int
     last_clear: str | None
+    # 操作ミノ・HOLDのミノが配列の何番目か(途中局面から始めた練習ではNone=不明)
+    current_index: int | None = None
+    hold_index: int | None = None
 
 
 @dataclass
@@ -215,6 +218,11 @@ class GameState:
     # 練習ごとの通し番号。同じシードでも盤面・ツモ順を変えたら別の練習として扱う
     # (推奨手の追跡状態を引き継がないため)。
     practice_id: int = 0
+    # 【2026-09-25・実画面 practice_20260925_222055】袋の区切りを正しく判断するため、操作ミノと
+    # HOLDのミノが配列の何番目かを覚える(置いた数だけでは、前の袋のミノをHOLDしたまま新しい袋の
+    # ミノを先に置いた状態を区別できない)。途中局面から始めた練習ではNone(不明)。
+    current_index: int | None = None
+    hold_index: int | None = None
 
     @classmethod
     def new(cls, seed: int, bags=None, board=None, position=None) -> "GameState":
@@ -368,7 +376,12 @@ class GameState:
         if self.game_over or self.hold_used:
             return False
         held, self.hold = self.hold, self.current
-        self._spawn(held if held is not None else self._take_next())
+        held_index, self.hold_index = self.hold_index, self.current_index
+        if held is None:
+            self._spawn(self._take_next())  # 番号は_take_nextが記録する
+        else:
+            self.current_index = held_index
+            self._spawn(held)
         self.hold_used = True
         return True
 
@@ -390,6 +403,8 @@ class GameState:
         self.back_to_back = snap.back_to_back
         self.combo = snap.combo
         self.last_clear = snap.last_clear
+        self.current_index = snap.current_index
+        self.hold_index = snap.hold_index
         self.game_over = False
         self._spawn(snap.current)
         self.turn_start = snap
@@ -420,10 +435,14 @@ class GameState:
             back_to_back=self.back_to_back,
             combo=self.combo,
             last_clear=self.last_clear,
+            current_index=self.current_index,
+            hold_index=self.hold_index,
         )
 
     def _take_next(self) -> str:
+        """次のミノを配る。配ったミノはすぐ操作ミノになるので、その番号を記録する。"""
         piece = self.sequence.peek(self.sequence_index)
+        self.current_index = self.sequence_index
         self.sequence_index += 1
         return piece
 

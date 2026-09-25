@@ -38,7 +38,8 @@ from src.engine.openers import (
     shift_cells_for_clears,
     tuck_count,
 )
-from src.education.pc_search import TIMEOUT, find_perfect_clear
+from src.education.pc_search import TIMEOUT, find_perfect_clear, has_tetris
+from src.education.six_three import WELL_COL, best_move
 from src.engine.srs_reach import difficulty_mark, find_path, find_path_min_soft
 
 # CC2の結果を採用するまでの最短の思考時間(秒)。これより前に届いた浅い結果では
@@ -48,12 +49,15 @@ MIN_THINK_SEC = 0.4
 AI_ID = "cc2"
 AI_LABEL = "ColdClear2"
 PC_ID = "pc"
+# 【2026-09-24・利用者の要望】6-3積み(左から7列目を井戸にしてテトリスで消す)。候補欄の1つ
+SIX_THREE_ID = "6-3"
+SIX_THREE_LABEL = "6-3積み"
 # 【2026-09-24・利用者の指示】候補の切替対象に含めないテンプレ
 EXCLUDED_TEMPLATES = frozenset({"オリーブ積み"})
 # パフェ後にHOLDへ繰り越したミノを使って組むテンプレ(1巡目の図はHOLDがあるときだけ使う)
 CARRY_TEMPLATES = frozenset({"DPC"})
 
-__all__ = ["AI_ID", "PC_ID", "Advisor", "Candidate", "Recommendation", "find_path", "rejoin_form"]
+__all__ = ["AI_ID", "PC_ID", "SIX_THREE_ID", "Advisor", "Candidate", "Recommendation", "find_path", "rejoin_form"]
 
 
 @dataclass(frozen=True)
@@ -65,6 +69,11 @@ class Recommendation:
     steps: tuple[str, ...] | None  # 操作手順。出現位置から到達できなければNone
     soft_sections: int | None = None  # 難度の評価範囲で必要なソフトドロップの区間数
     scope: str = ""  # 難度の評価範囲(「この図の完成まで」「この1手」)
+    # 【2026-09-24・利用者の指示】DPCによるパフェと探索したパフェを区別し、パフェの後に
+    # 何へつながるか(開幕へ/DPCへ/袋ずれ。bag_status参照)を示す
+    label: str = ""  # 候補欄の名前(空ならテンプレ名)
+    after_pc: str | None = None  # パフェ後の袋の状態(パフェ以外はNone)
+    tetris: bool = False  # テトリス(4列消し)を含むパフェ
 
 
 @dataclass(frozen=True)
@@ -116,26 +125,84 @@ def candidate_templates() -> tuple[OpenerTemplate, ...]:
     )
 
 
+def placed_count(sequence_index: int, hold: str | None) -> int:
+    """これまでに置いたミノの数(配られた数 - 操作ミノ - HOLDのミノ)。おじゃま・一手戻すの影響を受けない。"""
+    return sequence_index - 1 - (1 if hold is not None else 0)
+
+
+def bag_status(placed: int, hold: str | None, current_index: int | None = None, hold_index: int | None = None) -> str:
+    """袋の区切りから、次に組めるテンプレの種類。
+
+    【2026-09-24・利用者と確認】ゲームではHOLDは一度使うと空に戻らないので、HOLDの有無ではなく
+    置いた数で判断する。文献(DPCのページ)どおり、DPCを終えるとちょうどミノが5巡し、再び開幕
+    テンプレを組める。8ラインパフェ(20個)の後は、3巡目の1個をHOLDに繰り越してDPCを組む。
+    - "開幕": 置いた数が7の倍数(HOLDのミノも今の袋のもの)
+    - "DPC": 置いた数が7の倍数-1で、HOLDに前の袋のミノを繰り越している
+    - "袋ずれ": それ以外
+
+    【2026-09-25・実画面 practice_20260925_222055】置いた数だけでは、前の袋のミノをHOLDしたまま
+    新しい袋のミノを先に置いた状態(置いた数は7の倍数でも袋はずれている)を「開幕」と誤判定し、
+    パフェ後に開幕テンプレが出なかった。操作ミノ・HOLDのミノの配列上の番号が分かるときは、
+    まだ置いていないミノの番号で判断する:
+    - "開幕": まだ置いていない一番古いミノが袋の先頭(前の袋は置き終え、HOLDも新しい袋のミノ)
+    - "DPC": 操作ミノが袋の先頭で、HOLDのミノが1つ前の袋のもの(繰り越し)
+    番号が分からない(途中局面から始めた練習)ときは置いた数で判断する。
+    """
+    if current_index is not None and (hold is None or hold_index is not None):
+        oldest = current_index if hold is None else min(current_index, hold_index)
+        if oldest % 7 == 0:
+            return "開幕"
+        if hold is not None and current_index % 7 == 0 and hold_index // 7 == current_index // 7 - 1:
+            return "DPC"
+        return "袋ずれ"
+    if placed % 7 == 0:
+        return "開幕"
+    if placed % 7 == 6 and hold is not None:
+        return "DPC"
+    return "袋ずれ"
+
+
+def carried_pieces(form: OpenerForm) -> frozenset[str]:
+    """DPCの図で繰り越したミノの候補(図の大文字。Tスピンの'U'と既存ブロックの'C'は除く)。
+
+    大文字が2種類ある図(S-13bのT・S等)は、どちらかを繰り越していれば使える扱いにする。
+    大文字の無い図(文献で繰り越しのOを小文字で描いたO-02等)は、パターン名の先頭(O-02のO)
+    で判断する。J・Sの系統は左右反転の図も同じ名前なのでJ/L・S/Zのどちらでもよい。
+    """
+    letters = frozenset(ch for ch in form.text if ch.isupper() and ch not in "UC")
+    if letters:
+        return letters
+    group = form.section[:1]
+    return frozenset({"J": "JL", "S": "SZ"}.get(group, group))
+
+
 def startable_template(
-    template: OpenerTemplate, hold: str | None, bag_head: bool, continuing: bool = False
+    template: OpenerTemplate, hold: str | None, status: str, continuing: bool = False
 ) -> OpenerTemplate:
     """今の手番から使える図だけのテンプレ。
 
     【2026-09-24・実画面 practice_20260924_190040】パフェ後(操作ミノは袋の先頭、HOLD=Z)
     に、山岳積み2号の1巡目の図をHOLDのZ(前の袋のミノ)を使って組む手順を推奨した。
     7種1巡からずれた組み方なので、空の盤面から組む1巡目の図(既存ブロックの無い図)は、
-    通常のテンプレではHOLDが空で操作ミノが袋の先頭のときだけ使う。DPCは逆に、
-    パフェ後にHOLDへ繰り越したミノがあり、操作ミノが袋の先頭のときだけ使う。
+    袋の区切りがそろっているとき(bag_status=="開幕")だけ使う。DPCの組み方の図は、
+    前の袋のミノをHOLDに繰り越しているとき(bag_status=="DPC")だけ使う。
+    (当初は「HOLDが空」を条件にしていたが、HOLDは一度使うと空に戻らないため、DPCを
+    終えた後に開幕テンプレが出なくなっていた。)
 
     【2026-09-24・実画面 practice_20260924_195905】Tスピンだけの図(はちみつ砲のTST等)は
     一致判定がゆるく、同じTSTの形を持つ迷走砲の盤面にも一致して「はちみつ砲」と表示した。
     Tスピンだけの図は、そのテンプレを続けてきた場合(continuing)だけ使う。
     """
     carry = template.name_ja in CARRY_TEMPLATES
-    allow_empty = bag_head and ((hold is not None) if carry else (hold is None))
+    allow_empty = status == ("DPC" if carry else "開幕")
     forms = template.forms
     if not allow_empty:
         forms = tuple(f for f in forms if f.existing)
+    elif carry:
+        # 【2026-09-24・実画面 practice_20260924_210537〜210624】HOLD=Z(Z繰り越し)なのに
+        # O繰り越し用のO-05aを選び、TSDの後に続くパフェの図が合わず途中で切れた。
+        # DPCの組み方の図は、図の大文字(繰り越したミノ)がHOLDのミノと一致するものだけ使う。
+        forms = tuple(f for f in forms if f.existing or hold in carried_pieces(f))
     if not continuing:
         forms = tuple(f for f in forms if not f.is_spin_only())
     return template if forms == template.forms else replace(template, forms=forms)
@@ -213,6 +280,13 @@ class Advisor:
     _pc_future: object = None
     _pc_cancel: object = None
     _executor: object = None
+    # 手番(固定した数) → 進めているパフェの残り手順。手順どおりに置いている間は探し直さない
+    # (【2026-09-24】2段パフェの途中で見えるミノが増え、7手のテトリスパフェへ切り替わった)
+    _pc_plans: dict = field(default_factory=dict)
+    # 6-3積みの推奨手(選んでいるときだけ計算する。画面では別スレッド)
+    _s63_rec: Recommendation | None = None
+    _s63_future: object = None
+    s63_pending: bool = False
 
     def close(self) -> None:
         self._cancel_pc()
@@ -234,6 +308,7 @@ class Advisor:
         if state.practice_id != self._practice_id:  # リセット・盤面編集(別の練習)
             self._practice_id = state.practice_id
             self._tracks = {}
+            self._pc_plans = {}
             self._auto_id = None
         key = (len(state.history), state.hold_used, state.current, state.sequence_index, id(state.turn_start))
         if key != self._turn_key:
@@ -242,6 +317,9 @@ class Advisor:
             self._requested_at = None
             self._template_recs = self._compute_template_recs(state) if self.opener_enabled else {}
             self._pc_rec = None
+            self._s63_rec = None
+            self._s63_future = None
+            self.s63_pending = False
             if self.opener_enabled:
                 self._start_pc(state)
             self._select()
@@ -249,6 +327,8 @@ class Advisor:
             self._finish_pc(state)
         if self.active_id == PC_ID:
             return self._pc_rec
+        if self.active_id == SIX_THREE_ID:
+            return self._six_three(state)
         if self.active_id == AI_ID:
             if self._requested_at is None:
                 self._start_engine(state, now)
@@ -263,10 +343,10 @@ class Advisor:
         for template in candidate_templates():
             rec = self._template_recs.get(template.name_ja)
             if rec is not None:
-                result.append(Candidate(template.name_ja, template.name_ja, difficulty_mark(rec.soft_sections), rec.scope))
+                result.append(Candidate(template.name_ja, _candidate_label(rec, template.name_ja), difficulty_mark(rec.soft_sections), rec.scope))
         if self._pc_rec is not None:
             # 【2026-09-24・利用者の指示】パフェは候補欄に分岐として出す
-            result.append(Candidate(PC_ID, self._pc_rec.source, difficulty_mark(self._pc_rec.soft_sections), self._pc_rec.scope))
+            result.append(Candidate(PC_ID, _candidate_label(self._pc_rec, "パフェ"), difficulty_mark(self._pc_rec.soft_sections), self._pc_rec.scope))
         if self._engine_failed:
             mark, scope = "使用不可", ""
         elif self._ai_rec is not None:
@@ -275,6 +355,10 @@ class Advisor:
             mark, scope = "探索中", ""
         else:
             mark, scope = "", ""
+        s63 = self._s63_rec
+        s63_mark = "探索中" if self.s63_pending else (difficulty_mark(s63.soft_sections) if s63 else "")
+        if self.opener_enabled:
+            result.append(Candidate(SIX_THREE_ID, SIX_THREE_LABEL, s63_mark, "この1手" if s63 else ""))
         result.append(Candidate(AI_ID, AI_LABEL, mark, scope))
         return tuple(result)
 
@@ -304,13 +388,18 @@ class Advisor:
     def _select(self) -> None:
         """希望(preferred_id)を保ったまま、今の局面で実際に提示する候補を決める。"""
         available = [t.name_ja for t in candidate_templates() if t.name_ja in self._template_recs]
+        if self.preferred_id is None and self._pc_rec is not None and self._pc_rec.tetris:
+            # 【2026-09-24・利用者の指示】テトリスを含むパフェが取れるなら、ソフトドロップが
+            # 要ってもテンプレより優先する(利用者が候補を選んでいる間は選択を尊重する)
+            self.active_id = PC_ID
+            return
         # 【2026-09-24・利用者の指示】テンプレを続けている間はテンプレを優先し、
         # それ以外(AIで提示する局面)で5手以内のパフェが見えればパフェを提示する。
         fallback = PC_ID if self._pc_rec is not None else AI_ID
         if self.preferred_id is not None:
             # 希望のテンプレが一時的に組めない間はパフェかAIで提示し、組めるようになったら戻る。
             # 明示的にAIを選んだ場合は、テンプレが組めても勝手に切り替えない。
-            if self.preferred_id == AI_ID or self.preferred_id in available:
+            if self.preferred_id in (AI_ID, SIX_THREE_ID) or self.preferred_id in available:
                 self.active_id = self.preferred_id
             else:
                 self.active_id = fallback
@@ -337,6 +426,51 @@ class Advisor:
                 recs[template.name_ja] = rec
         return recs
 
+    def _six_three(self, state: GameState) -> Recommendation | None:
+        """6-3積みの推奨手。画面(pc_async)では別スレッドで計算し、終わるまではNone。"""
+        if self._s63_rec is not None:
+            return self._s63_rec
+        if self._s63_future is None:
+            args = (
+                frozenset((r, c) for r in range(ROWS) for c in range(COLS) if state.board[r][c] is not None),
+                state.current,
+                state.hold,
+                list(state.visible_next()),  # NEXT5まで
+                not state.hold_used,
+            )
+            if not self.pc_async:
+                self._s63_rec = self._s63_recommendation(state, best_move(*args))
+                return self._s63_rec
+            if self._executor is None:
+                self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="education_search")
+            self._s63_future = self._executor.submit(best_move, *args)
+            self.s63_pending = True
+            return None
+        if self._s63_future.done():
+            future, self._s63_future = self._s63_future, None
+            self.s63_pending = False
+            try:
+                self._s63_rec = self._s63_recommendation(state, future.result())
+            except Exception:  # noqa: BLE001 - 計算の失敗で画面を止めない
+                self._s63_rec = None
+        return self._s63_rec
+
+    @staticmethod
+    def _s63_recommendation(state: GameState, move) -> Recommendation | None:
+        if move is None:
+            return None
+        use_hold = move.use_hold and not state.hold_used
+        path = find_path_min_soft(state, move.piece, move.cells)
+        return Recommendation(
+            piece=move.piece,
+            use_hold=use_hold,
+            cells=move.cells,
+            source=f"6-3積み(井戸: 左から{WELL_COL + 1}列目)",
+            steps=None if path is None else (("ホールド",) if use_hold else ()) + path[0],
+            soft_sections=None if path is None else path[1],
+            scope="この1手",
+        )
+
     def _pc_inputs(self, state: GameState):
         """パフェ探索に渡す(盤面, ミノ順, HOLD, HOLDできるか)。見えている範囲だけ。"""
         sequence, _hold, _board = self._turn_sequence(state)
@@ -350,20 +484,45 @@ class Advisor:
         board = frozenset((r, c) for r in range(ROWS) for c in range(COLS) if state.board[r][c] is not None)
         return board, sequence, state.hold, not state.hold_used
 
+    def _continuing_pc(self, state: GameState):
+        """進めているパフェの残り手順(手順どおりに置いていれば)。この手番の最初の手から。"""
+        turn = len(state.history)
+        for stale in [t for t in self._pc_plans if t > turn]:
+            del self._pc_plans[stale]
+        prev = self._pc_plans.get(turn - 1)
+        if turn not in self._pc_plans and prev and len(prev) > 1 and state.last_lock is not None:
+            if set(state.last_lock[1]) == set(prev[0].cells):
+                self._pc_plans[turn] = prev[1:]
+        plan = self._pc_plans.get(turn)
+        if not plan:
+            return None
+        first = plan[0]
+        if state.hold_used:
+            if not first.use_hold and first.piece != state.current:
+                return None  # 手順と違うHOLDをした
+            plan = [replace(first, use_hold=False), *plan[1:]]  # HOLDは済んでいる
+        elif first.piece != (state.hold if first.use_hold else state.current):
+            return None
+        return plan
+
     def _start_pc(self, state: GameState) -> None:
         self._cancel_pc()
         self.pc_timed_out = False
+        plan = self._continuing_pc(state)
+        if plan is not None:
+            self._pc_rec = self._pc_recommendation(state, plan)
+            return
         inputs = self._pc_inputs(state)
         if inputs is None:
             return
         board, sequence, hold, can_hold = inputs
         if not self.pc_async:
-            self._pc_rec = self._pc_recommendation(
-                state, find_perfect_clear(board, sequence, hold, can_hold=can_hold)
-            )
+            found = find_perfect_clear(board, sequence, hold, can_hold=can_hold)
+            self._remember_pc(state, found)
+            self._pc_rec = self._pc_recommendation(state, found)
             return
         if self._executor is None:
-            self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pc_search")
+            self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="education_search")
         self._pc_cancel = threading.Event()
         self._pc_future = self._executor.submit(
             find_perfect_clear, board, sequence, hold, can_hold=can_hold, time_limit=3.0, cancel=self._pc_cancel
@@ -387,9 +546,14 @@ class Advisor:
             found = future.result()
         except Exception:  # noqa: BLE001 - 探索の失敗で画面を止めない
             return
+        self._remember_pc(state, found)
         self._pc_rec = self._pc_recommendation(state, found)
         if self._pc_rec is not None:
             self._select()
+
+    def _remember_pc(self, state: GameState, found) -> None:
+        if isinstance(found, list) and found:
+            self._pc_plans[len(state.history)] = found
 
     def _pc_recommendation(self, state: GameState, found) -> Recommendation | None:
         """パフェ探索の結果から1手目の推奨を作る(ソフトドロップの多さは問わない)。"""
@@ -402,14 +566,20 @@ class Advisor:
         path = find_path_min_soft(state, first.piece, first.cells)
         if path is None:
             return None
+        board = frozenset((r, c) for r in range(ROWS) for c in range(COLS) if state.board[r][c] is not None)
+        tetris = has_tetris(board, found)
+        label = "テトリスパフェ(探索)" if tetris else "パフェ(探索)"
         return Recommendation(
             piece=first.piece,
             use_hold=first.use_hold,
             cells=first.cells,
-            source=f"パフェ(あと{len(found)}手)",
+            source=f"{label} あと{len(found)}手",
             steps=(("ホールド",) if first.use_hold else ()) + path[0],
             soft_sections=_pc_soft_sections(state, found),
             scope="パフェまで",
+            label=label,
+            after_pc=_after_pc(state, [s.use_hold for s in found]),
+            tetris=tetris,
         )
 
     def _sync_track(self, state: GameState, template: OpenerTemplate) -> _OpenerTrack | None:
@@ -452,8 +622,9 @@ class Advisor:
         sequence, hold, board = self._turn_sequence(state)
         if sequence is None:
             return None
-        bag_head = (state.turn_start.sequence_index - 1) % 7 == 0
-        got = choose_form(startable_template(template, hold, bag_head, continuing), board, sequence, hold)
+        snap = state.turn_start
+        status = bag_status(placed_count(snap.sequence_index, hold), hold, snap.current_index, snap.hold_index)
+        got = choose_form(startable_template(template, hold, status, continuing), board, sequence, hold)
         if got is None:
             # 盤面エディタで図の途中形を作って始めた場合も、ここで合流する
             got = rejoin_form(template, board, sequence, hold)
@@ -506,6 +677,7 @@ class Advisor:
             steps=None if path is None else (("ホールド",) if use_hold else ()) + path[0],
             soft_sections=_form_soft_sections(state, track),
             scope="この図の完成まで",
+            **_dpc_pc_info(state, track),
         )
 
     # ---- CC2 ----
@@ -612,3 +784,39 @@ def _pc_soft_sections(state: GameState, steps) -> int | None:
             del sim.board[r]
             sim.board.insert(0, [None] * COLS)
     return total
+
+
+def _after_pc(state: GameState, hold_flags: list[bool]) -> str:
+    """手順(各手でHOLDするか)を置き終えた後の袋の状態("開幕"/"DPC"/"袋ずれ")。
+
+    置いた数は手順の手数だけ増える。HOLDは一度使うと空に戻らない。
+    操作ミノ・HOLDの番号も手順どおりに追いかける(次に配られるのはstate.sequence_index番)。
+    """
+    held = state.hold
+    current_index, hold_index, deal = state.current_index, state.hold_index, state.sequence_index
+    for i, use_hold in enumerate(hold_flags):
+        if use_hold and (i == 0 and state.hold_used):
+            use_hold = False  # この手番のHOLDは済んでいる
+        if not use_hold:
+            current_index, deal = deal, deal + 1  # 操作ミノを置き、次が配られる
+        elif held is None:
+            held = "?"  # 操作ミノをHOLDし、次のミノを置き、さらに次が配られる
+            hold_index, current_index, deal = current_index, deal + 1, deal + 2
+        else:
+            hold_index, current_index, deal = current_index, deal, deal + 1  # HOLDと入れ替えて置く
+    return bag_status(placed_count(state.sequence_index, state.hold) + len(hold_flags), held, current_index, hold_index)
+
+
+def _dpc_pc_info(state: GameState, track: _OpenerTrack) -> dict:
+    """DPCのパフェの図なら、候補欄の名前とパフェ後の袋の状態。"""
+    if track.template.name_ja not in CARRY_TEMPLATES or "パフェ" not in track.form.section.split(" > ")[-1]:
+        return {}
+    return {"label": "DPCパフェ", "after_pc": _after_pc(state, [s.use_hold for s in track.steps[track.index :]])}
+
+
+def _candidate_label(rec: Recommendation, default: str) -> str:
+    label = rec.label or default
+    if rec.after_pc is not None:
+        # 【2026-09-25・利用者の指示】袋ずれはループが崩れることを示す(優先の順位は変えない)
+        label += {"開幕": " →開幕へ", "DPC": " →DPCへ"}.get(rec.after_pc, " →袋ずれ(ループ崩れ)")
+    return label

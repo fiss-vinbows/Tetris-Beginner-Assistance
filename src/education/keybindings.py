@@ -133,7 +133,7 @@ def save_repeat(settings: dict[str, int], path: Path = REPEAT_PATH) -> None:
 # ---- 表示の設定(提示の表示/非表示、テンプレ優先/AI優先) ----
 # 【2026-09-24・利用者の要望】トグルで切り替え、次回も同じ状態で開く
 VIEW_PATH = app_root() / "config" / "education_view.json"
-DEFAULT_VIEW = {"show_hints": True, "prefer_ai": False}
+DEFAULT_VIEW = {"show_hints": True, "prefer_ai": False, "ren_analysis": True}  # ren_analysis: 無限中あけRENのAI解析
 
 
 def load_view(path: Path = VIEW_PATH) -> dict[str, bool]:

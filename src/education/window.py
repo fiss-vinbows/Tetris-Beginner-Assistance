@@ -22,7 +22,8 @@ from pathlib import Path
 from PyQt6 import QtCore, QtGui, QtWidgets
 
 from src.education import gamepad, keybindings
-from src.education.advisor import Advisor, Recommendation
+from src.education.advisor import SIX_THREE_ID, Advisor, Recommendation
+from src.education.six_three import WELL_COL
 from src.education.rules import (
     COLS,
     GARBAGE,
@@ -97,6 +98,7 @@ class BoardView(QtWidgets.QWidget):
         super().__init__(parent)
         self.state = state
         self.recommendation: Recommendation | None = None
+        self.well_col: int | None = None  # 6-3積みの井戸の列(選んでいる間だけ薄く示す)
         self.setFixedSize(COLS * CELL + 2, ROWS * CELL + 2)
         self.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
 
@@ -116,6 +118,12 @@ class BoardView(QtWidgets.QWidget):
                     painter.fillRect(cell_rect(r, c), _color(piece))
                 else:
                     painter.fillRect(cell_rect(r, c), QtGui.QColor(34, 34, 40) if r >= HIDDEN_ROWS else QtGui.QColor(26, 26, 30))
+        # 6-3積みの井戸(空けておく列)を薄く示す
+        if self.well_col is not None:
+            painter.fillRect(
+                QtCore.QRect(1 + self.well_col * CELL, 1 + HIDDEN_ROWS * CELL, CELL - 1, (ROWS - HIDDEN_ROWS) * CELL - 1),
+                QtGui.QColor(90, 160, 255, 40),
+            )
         # 非表示行との境界線
         painter.setPen(QtGui.QPen(QtGui.QColor(200, 200, 200, 120), 1, QtCore.Qt.PenStyle.DashLine))
         y = 1 + HIDDEN_ROWS * CELL
@@ -181,6 +189,66 @@ class PieceView(QtWidgets.QWidget):
             painter.fillRect(rect, _color(self.piece))
 
 
+class ToggleSwitch(QtWidgets.QAbstractButton):
+    """左右にスライドするトグルスイッチ。1行目に項目名、2行目に「オフ側 [スイッチ] オン側」。
+
+    【2026-09-24・利用者の指示】ボタンではどちらに切り替わっているか分かりにくかった。
+    選ばれている側の文字を太字・明るい色にし、つまみをその側へ寄せる。
+    """
+
+    TRACK_W = 40
+    TRACK_H = 20
+
+    def __init__(self, title: str, off_text: str, on_text: str, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.title = title
+        self.off_text = off_text
+        self.on_text = on_text
+        self.setCheckable(True)
+        self.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)  # 盤面のキー操作を奪わない
+        self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.setFixedSize(4 * CELL + 40, 46)
+        self.toggled.connect(lambda _v: self.update())
+
+    def set_title(self, title: str) -> None:
+        if title != self.title:
+            self.title = title
+            self.update()
+
+    def paintEvent(self, _event: QtGui.QPaintEvent) -> None:
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        text_color = self.palette().color(QtGui.QPalette.ColorRole.WindowText)
+        dim = QtGui.QColor(text_color)
+        dim.setAlpha(110)
+        painter.setPen(text_color)
+        painter.drawText(QtCore.QRect(0, 0, self.width(), 20), QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter, self.title)
+        on = self.isChecked()
+        bold = QtGui.QFont(self.font())
+        bold.setBold(True)
+        normal = QtGui.QFont(self.font())
+        metrics = QtGui.QFontMetrics(bold)
+        off_w = metrics.horizontalAdvance(self.off_text)
+        y = 22
+        # オフ側の文字
+        painter.setFont(normal if on else bold)
+        painter.setPen(dim if on else text_color)
+        painter.drawText(QtCore.QRect(0, y, off_w, self.TRACK_H), QtCore.Qt.AlignmentFlag.AlignVCenter, self.off_text)
+        # スイッチ本体
+        track = QtCore.QRectF(off_w + 6, y, self.TRACK_W, self.TRACK_H)
+        painter.setPen(QtCore.Qt.PenStyle.NoPen)
+        painter.setBrush(QtGui.QColor(70, 170, 255) if on else QtGui.QColor(110, 110, 120))
+        painter.drawRoundedRect(track, self.TRACK_H / 2, self.TRACK_H / 2)
+        knob_x = track.right() - self.TRACK_H + 2 if on else track.left() + 2
+        painter.setBrush(QtGui.QColor(255, 255, 255))
+        painter.drawEllipse(QtCore.QRectF(knob_x, y + 2, self.TRACK_H - 4, self.TRACK_H - 4))
+        # オン側の文字
+        painter.setFont(bold if on else normal)
+        painter.setPen(text_color if on else dim)
+        left = int(track.right()) + 6
+        painter.drawText(QtCore.QRect(left, y, self.width() - left, self.TRACK_H), QtCore.Qt.AlignmentFlag.AlignVCenter, self.on_text)
+
+
 class PracticeWindow(QtWidgets.QWidget):
     """教育モードの練習画面。キー入力をrules.GameStateの操作へ変換する。"""
 
@@ -188,7 +256,7 @@ class PracticeWindow(QtWidgets.QWidget):
         self, seed: int | None = None, parent: QtWidgets.QWidget | None = None, advisor: Advisor | None = None
     ) -> None:
         super().__init__(parent, QtCore.Qt.WindowType.Window)
-        self.setWindowTitle("教育モード(練習)")
+        self.setWindowTitle("シミュレーター")  # 【2026-09-25・利用者の指示】旧名「教育モード(練習)」
         self.bindings = keybindings.load_bindings()
         self.state = GameState.new(seed) if seed is not None else GameState.new(0).reset_new_sequence()
 
@@ -234,12 +302,12 @@ class PracticeWindow(QtWidgets.QWidget):
         for view in self.next_views:
             next_box.addWidget(view)
         # 推奨手の説明(提案元・操作手順)
-        self.show_rec_check = QtWidgets.QCheckBox("推奨配置を表示")
+        # 【2026-09-24・利用者の指示】どちらに切り替わっているか分かるようトグルスイッチにする
+        self.show_rec_check = ToggleSwitch("推奨配置", "非表示", "表示")
         self.show_rec_check.setChecked(True)
-        self.show_steps_check = QtWidgets.QCheckBox("操作手順を表示")
+        self.show_steps_check = ToggleSwitch("操作手順", "非表示", "表示")
         self.show_steps_check.setChecked(True)
         for check in (self.show_rec_check, self.show_steps_check):
-            check.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
             check.toggled.connect(lambda _v: self.refresh())
         self.rec_label = QtWidgets.QLabel()
         self.rec_label.setWordWrap(True)
@@ -247,14 +315,10 @@ class PracticeWindow(QtWidgets.QWidget):
         self.rec_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop | QtCore.Qt.AlignmentFlag.AlignLeft)
         # 【2026-09-24・利用者の要望】トグル: 提示(推奨配置・手順・候補欄)の表示/非表示、
         # テンプレ優先/AI優先。ホットキー・コントローラーにも割り当てられる。
-        self.hints_btn = QtWidgets.QPushButton()
-        self.priority_btn = QtWidgets.QPushButton()
+        self.hints_btn = ToggleSwitch("提示", "非表示", "表示")
+        self.priority_btn = ToggleSwitch("優先", "テンプレ", "AI")
         self.hints_btn.clicked.connect(lambda _c=False: self.perform("toggle_hints"))
         self.priority_btn.clicked.connect(lambda _c=False: self.perform("toggle_priority"))
-        for btn in (self.hints_btn, self.priority_btn):
-            btn.setCheckable(True)
-            btn.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
-            btn.setFixedWidth(4 * CELL + 40)
         next_box.addSpacing(8)
         next_box.addWidget(self.hints_btn)
         next_box.addWidget(self.priority_btn)
@@ -376,7 +440,7 @@ class PracticeWindow(QtWidgets.QWidget):
         self.view = keybindings.load_view(self.view_path)
         self.advisor.prefer_ai = self.view["prefer_ai"]
         self._last_advisor_status = ""
-        self._last_pc_pending = False
+        self._last_pc_pending = (False, False)  # (パフェ探索中, 6-3積み計算中)
         self.pad_timer = QtCore.QTimer(self)
         self.pad_timer.timeout.connect(self._on_tick)
         self.pad_timer.start(PAD_POLL_MS)
@@ -431,10 +495,10 @@ class PracticeWindow(QtWidgets.QWidget):
     def _refresh_toggles(self, show: bool) -> None:
         keys = self.bindings
         self.hints_btn.setChecked(show)
-        self.hints_btn.setText(f"提示: {'表示' if show else '非表示'} ({keys.get('toggle_hints', '')})")
+        self.hints_btn.set_title(f"提示 ({keys.get('toggle_hints', '')})")
         prefer_ai = self.view["prefer_ai"]
         self.priority_btn.setChecked(prefer_ai)
-        self.priority_btn.setText(f"優先: {'AI' if prefer_ai else 'テンプレ'} ({keys.get('toggle_priority', '')})")
+        self.priority_btn.set_title(f"優先 ({keys.get('toggle_priority', '')})")
         # 非表示のときは推奨配置・操作手順・候補欄をまとめて隠す(自力で練習する用)
         widgets = [self.show_rec_check, self.show_steps_check, self.rec_label, self.candidate_title,
                    self.cycle_btn, self.candidate_scope, *self.candidate_buttons]
@@ -593,7 +657,7 @@ class PracticeWindow(QtWidgets.QWidget):
 
     def _update_recommendation(self) -> None:
         rec = self.advisor.update(self.state)
-        pending = self.advisor.pc_pending
+        pending = (self.advisor.pc_pending, self.advisor.s63_pending)
         if (
             rec != self.board_view.recommendation
             or self.advisor.status != self._last_advisor_status
@@ -667,6 +731,8 @@ class PracticeWindow(QtWidgets.QWidget):
         rec = self.advisor.update(state) if hasattr(self, "advisor") else None
         show = not hasattr(self, "view") or self.view["show_hints"]
         self.board_view.recommendation = rec if show and self.show_rec_check.isChecked() else None
+        six_three = show and hasattr(self, "advisor") and self.advisor.active_id == SIX_THREE_ID
+        self.board_view.well_col = WELL_COL if six_three else None
         if hasattr(self, "view"):
             self._refresh_toggles(show)
         lines = []

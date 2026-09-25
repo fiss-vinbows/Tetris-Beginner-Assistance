@@ -224,8 +224,10 @@ class TestCandidateSelection(unittest.TestCase):
         rec = advisor.update(state, now=0.0)
         self.assertEqual(rec.scope, "この図の完成まで")
         self.assertIsNotNone(rec.soft_sections)
-        for cand in advisor.candidates()[:-1]:
-            self.assertIn(cand.mark, ("◎", "○", "△"))
+        names = {t.name_ja for t in candidate_templates()}
+        for cand in advisor.candidates():
+            if cand.source_id in names:
+                self.assertIn(cand.mark, ("◎", "○", "△"))
 
     def test_preferred_template_comes_back_and_explicit_ai_is_kept(self) -> None:
         advisor = Advisor(engine_factory=FakeEngine)

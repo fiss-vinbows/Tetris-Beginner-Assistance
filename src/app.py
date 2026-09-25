@@ -4156,7 +4156,8 @@ class MainWindow(QtWidgets.QWidget):
 
         # 【教育モード(2026-09-22着手・第1段階)】画像認識を使わない一人用の練習画面。
         # 仕様は input/教育/教育モード仕様書_説明と参照資料.txt。実装は src/education/。
-        self.practice_btn = QtWidgets.QPushButton("教育モード(練習)を開く")
+        # 【2026-09-25・利用者の指示】表示名を「シミュレーター」に変更(内部の名前はそのまま)。
+        self.practice_btn = QtWidgets.QPushButton("シミュレーターを開く")
         self.practice_btn.setToolTip(
             "自前の盤面で積み方を練習します(画像認識・キャプチャ不要)。"
             "自動落下なし、ハードドロップでのみ固定。一手戻す・同一配列/別配列でリセットができます。"
@@ -4164,6 +4165,15 @@ class MainWindow(QtWidgets.QWidget):
         self.practice_btn.clicked.connect(self._open_practice_window)
         layout.addWidget(self.practice_btn)
         self.practice_window: QtWidgets.QWidget | None = None
+        # 【2026-09-25・利用者の要望】無限中あけREN(シミュレーターとは別のモード)
+        self.ren_btn = QtWidgets.QPushButton("無限中あけRENを開く")
+        self.ren_btn.setToolTip(
+            "左右6列が埋まった中央4列だけで4列RENを練習します。"
+            "消せない置き方をするとRENが途切れて終了です(無限モード/25RENまでのタイムアタック)。"
+        )
+        self.ren_btn.clicked.connect(self._open_ren_window)
+        layout.addWidget(self.ren_btn)
+        self.ren_window: QtWidgets.QWidget | None = None
 
         hint = QtWidgets.QLabel(
             "支援モード中は画面右上の「終了」ボタンで終了できます"
@@ -4192,6 +4202,16 @@ class MainWindow(QtWidgets.QWidget):
         self.practice_window.raise_()
         self.practice_window.activateWindow()
         self.practice_window.setFocus()
+
+    def _open_ren_window(self) -> None:
+        from src.education.ren import RenWindow
+
+        if self.ren_window is None or not self.ren_window.isVisible():
+            self.ren_window = RenWindow()
+        self.ren_window.show()
+        self.ren_window.raise_()
+        self.ren_window.activateWindow()
+        self.ren_window.setFocus()
 
     def _on_calibrate_clicked(self) -> None:
         run_calibration()
