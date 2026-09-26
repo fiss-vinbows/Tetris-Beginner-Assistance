@@ -489,9 +489,13 @@ def choose_form(
     # 回転入れ(ソフトドロップが要る置き方)の少ない図を選ぶ。以前は最初に組めた図を
     # 採用していたため、ハードドロップで置ける別の図があるのに回転入れの多い図を
     # 推奨していた。回転入れの数が同じなら従来どおり並び順が先の図。
-    best: tuple[int, int, OpenerForm, list[OpenerStep]] | None = None
-    for form in sorted(template.forms, key=lambda f: -len(f.items)):
-        if best is not None and len(form.items) < best[1]:
+    # 【2026-09-26・利用者の指示】優先度を下げた図(is_low_priority)は、他に組める図が無いときだけ使う。
+    def rank(f: OpenerForm) -> tuple[bool, int]:
+        return (is_low_priority(template.name_ja, f.section), -len(f.items))
+
+    best: tuple[int, tuple[bool, int], OpenerForm, list[OpenerStep]] | None = None
+    for form in sorted(template.forms, key=rank):
+        if best is not None and rank(form) > best[1]:
             break
         if form.is_spin_only():
             # Tスピンだけの図: 消える行の既存ブロックが揃い、スロットが空いて
@@ -507,10 +511,20 @@ def choose_form(
         if steps is not None:
             cost = tuck_count(form.existing, steps)
             if best is None or cost < best[0]:
-                best = (cost, len(form.items), form, steps)
+                best = (cost, rank(form), form, steps)
             if cost == 0:
                 break
     return None if best is None else (best[2], best[3])
+
+
+# 【2026-09-26・利用者の指示】優先度を下げる図(テンプレ名, セクション名)。他に組める図が無いときだけ使う。
+# 迷走砲の通常形(%S>%O)の2巡目は置くミノが多いため「置くミノの多い図を優先」で理想形より先に選ばれていた
+# (ブラウザー版の実画面: 理想形の2巡目も回転入れ無しで組める局面)。
+_LOW_PRIORITY_SECTIONS = frozenset({("迷走砲", "通常形 > %S>%Oの場合")})
+
+
+def is_low_priority(template_name: str, section: str) -> bool:
+    return (template_name, section) in _LOW_PRIORITY_SECTIONS
 
 
 def tuck_count(existing: frozenset[tuple[int, int]] | set[tuple[int, int]], steps: list[OpenerStep]) -> int:

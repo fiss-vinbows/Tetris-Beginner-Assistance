@@ -428,3 +428,19 @@ class TestDpcAfterHoldSwap(unittest.TestCase):
         self.assertIn("S", carried_pieces(form), "繰り越したSの組み方の図を使う")
         self.assertEqual(steps[0].piece, "S")
         self.assertFalse(steps[0].use_hold, "この手番はHOLD済み")
+
+
+class TestLowPrioritySection(unittest.TestCase):
+    """【2026-09-26・利用者の指示】迷走砲の通常形(%S>%O)の2巡目は、他に組める図が無いときだけ使う。"""
+
+    def test_ideal_second_bag_is_chosen_first(self) -> None:
+        # ブラウザー版の実画面(シード1533451893): 1巡目の後、操作S・HOLD L・NEXT O I J Z T。
+        # 理想形の2巡目も回転入れ無しで組めるのに、置くミノの多い通常形(%S>%O)が選ばれていた。
+        from src.engine.openers import OPENER_TEMPLATES, choose_form, is_low_priority
+
+        meiso = next(t for t in OPENER_TEMPLATES if t.name_ja == "迷走砲")
+        board = {(r, c) for r, c in [[16,0],[16,7],[16,8],[17,0],[17,1],[17,2],[17,4],[17,7],[17,8],[17,9],[18,0],[18,1],[18,2],[18,3],[18,4],[18,5],[18,7],[18,8],[18,9],[19,0],[19,1],[19,2],[19,3],[19,4],[19,6],[19,7],[19,8],[19,9]]}
+        form, _steps = choose_form(meiso, board, list("SOIJZT"), "L")
+        self.assertEqual(form.section, "理想形 > 2巡目")
+        self.assertTrue(is_low_priority("迷走砲", "通常形 > %S>%Oの場合"))
+        self.assertFalse(is_low_priority("迷走砲", "理想形 > 2巡目"))
