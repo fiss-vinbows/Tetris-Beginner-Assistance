@@ -130,3 +130,23 @@ class TestWorkerUsesPredictedBoard(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestImpossibleLineClearIsRejected(unittest.TestCase):
+    """【2026-09-26・静的分析の指摘】1個のミノでは成立しない消去を採用しないこと。"""
+
+    def test_two_separated_gaps_are_not_a_line_clear(self) -> None:
+        # 最下段の空きが2列目と9列目に離れている: 1個のミノで同時には埋まらない
+        before = _key(("#.######.#",))
+        self.assertIsNone(_predict_board_after_line_clear(before, _key(())))
+
+    def test_missing_rest_of_the_placed_piece_is_not_accepted(self) -> None:
+        # 空き1マスの1列消しでは置いたミノの3マスが残るはず。全面空の読み取りは消去では説明できない
+        before = _key(("#########.",))
+        self.assertIsNone(_predict_board_after_line_clear(before, _key(())))
+
+    def test_rest_of_the_piece_must_connect_to_the_gap(self) -> None:
+        # 残った3マスが空きの列から離れている: 1個のミノの形にならない
+        before = _key(("..........", "..........", "#########."))
+        after = _key(("##........", "#........."))
+        self.assertIsNone(_predict_board_after_line_clear(before, after))

@@ -28,6 +28,7 @@ import itertools
 import shutil
 import statistics
 import sys
+import threading
 import time
 from collections import Counter
 from dataclasses import dataclass, field
@@ -58,15 +59,21 @@ from src.capture.screen_capture import CaptureRegion, ScreenCapture
 from src.engine.board_state import BoardState
 from src.engine.cold_clear_client import ColdClearClient, ColdClearMove
 from src.engine.opener_recovery import RecoveryGate, RecoveryState, RecoveryStep, TurnState, find_recovery
+from src.education.pc_search import find_perfect_clear
+from src.education.rules import HIDDEN_ROWS as PC_HIDDEN_ROWS
 from src.engine.openers import (
+    FormItem,
     OpenerForm,
     OpenerStep,
     OpenerTemplate,
+    DPC_TEMPLATE_NAME,
     apply_step,
+    choose_dpc,
     choose_form,
     choose_opener,
     full_rows_after,
     known_sequence,
+    plan_form,
     shift_cells_for_clears,
 )
 from src.paths import APP_TITLE, app_root, is_frozen, resource_root
@@ -96,7 +103,9 @@ MAX_CONSECUTIVE_RECOGNITION_FAILURES = 5
 # AIの不調は認識・表示を巻き込んで止める理由にならないため、まとめて受け止める。
 COLD_CLEAR_ERRORS = (TimeoutError, OSError, ValueError, RuntimeError)
 
-# 何かトラブルで終了操作ができなくなった場合の保険。この時間が経つと自動的に通常モードへ戻る。
+# 何かトラブルで終了操作ができなくなった場合の保険。提示が届かないままこの時間が経つと
+# 自動的に通常モードへ戻る。【2026-09-26・利用者の指示】以前は開始から10分で必ず解除され、
+# 対局中でも支援モードが切れた。提示が届くたびに数え直し、操作が無いときだけ止める。
 SAFETY_TIMEOUT_MS = 10 * 60 * 1000  # 10分
 
 # 認識結果デバッグログ・画面録画をまとめるフォルダ。
@@ -816,7 +825,35 @@ def _predict_board_after_line_clear(
 
     no_clear_missing, no_clear_extra = score(list(previous_board_key))
     no_clear_mismatch = no_clear_missing + len(no_clear_extra)
+
+    def is_one_piece(cleared: tuple[int, ...], kept: list[tuple[int, int]]) -> bool:
+        """消えた行の空きと、消去後に残ったマスを消去前の座標に戻し、1個のミノの形か調べる。
+
+        【2026-09-26・静的分析の指摘】離れた2つの空きや、残るはずのマスが無い盤面でも
+        消去として採用していた。4マスが4近傍で連結していればテトリミノのいずれかの形になる。
+        """
+        kept_rows = [r for r in range(rows) if r not in cleared]
+        cells = {(r, c) for r in cleared for c in range(cols) if not prev_filled[r][c]}
+        for r, c in kept:
+            if r < len(cleared):
+                return False  # 消去後の最上部に残るマスは消去前の盤面外になる
+            cells.add((kept_rows[r - len(cleared)], c))
+        if len(cells) != _PIECE_CELL_COUNT:
+            return False
+        start = next(iter(cells))
+        seen = {start}
+        stack = [start]
+        while stack:
+            r, c = stack.pop()
+            # 消去前の座標で隣り合うかを見る(消えた行をまたいでも行番号は連続している)
+            for nb in ((r + 1, c), (r - 1, c), (r, c + 1), (r, c - 1)):
+                if nb in cells and nb not in seen:
+                    seen.add(nb)
+                    stack.append(nb)
+        return len(seen) == _PIECE_CELL_COUNT
+
     best: tuple[int, tuple[int, ...], list[tuple[str | None, ...]], list[tuple[int, int]]] | None = None
+    best_tied = False
     for size in range(1, 5):
         for cleared in itertools.combinations(near_full, size):
             gaps = sum(cols - sum(prev_filled[r]) for r in cleared)
@@ -827,19 +864,25 @@ def _predict_board_after_line_clear(
             leftover = _PIECE_CELL_COUNT - gaps  # 置いたミノのうち消えた行の外に残るマス
             mismatch = missing + max(0, len(extra) - leftover)
             if leftover == 0:
-                kept: list[tuple[int, int]] | None = []  # 余分なマスはすべて誤読(文字等)
-            elif len(extra) <= leftover:
+                kept: list[tuple[int, int]] = []  # 余分なマスはすべて誤読(文字等)
+            elif len(extra) == leftover:
                 kept = extra  # 置いたミノの残り
             else:
-                kept = None  # どれが置いたミノの残りか区別できない
+                # 多ければどれが置いたミノの残りか区別できず、少なければ残るはずのマスが無い
+                continue
             if missing > _MAX_HIDDEN_AFTER_CLEAR:
                 continue  # 予測と読み取りが離れすぎ: 消去ではなく誤読(ノイズ)の可能性が高い
+            if not is_one_piece(cleared, kept):
+                continue  # 1個のミノでは成立しない消去
             if best is None or mismatch < best[0]:
                 best = (mismatch, cleared, board, kept)
-    if best is None:
-        return None
+                best_tied = False
+            elif mismatch == best[0]:
+                best_tied = True
+    if best is None or best_tied:
+        return None  # 候補なし、または同程度に合う候補が複数あり消去後の盤面を決められない
     mismatch, _cleared, board, kept_extra = best
-    if mismatch >= no_clear_mismatch or mismatch > _PIECE_CELL_COUNT or kept_extra is None:
+    if mismatch >= no_clear_mismatch or mismatch > _PIECE_CELL_COUNT:
         return None
     grid = [list(row) for row in board]
     for r, c in kept_extra:
@@ -1716,6 +1759,33 @@ class _ColdClearContinuation:
     reserve: str
 
 
+# 3巡目の図が無いときに探したパフェ(図の代わりに探索した手順を提示する)
+_PC_TEMPLATE = OpenerTemplate("パフェ", "Perfect Clear", "", ())
+
+
+class _PerfectClearSearch:
+    """支援モードのパフェ探索を別スレッドで1回行う(src.education.pc_searchを共用)。"""
+
+    def __init__(self, key, board, sequence, hold, can_hold: bool, time_limit: float) -> None:
+        self.key = key
+        self.cancel = threading.Event()
+        self.done = threading.Event()
+        self.result = None
+        self.logged = False  # 結果を処理(ログ・採用)済みか
+        thread = threading.Thread(
+            target=self._run, args=(board, list(sequence), hold, can_hold, time_limit), daemon=True
+        )
+        thread.start()
+
+    def _run(self, board, sequence, hold, can_hold, time_limit) -> None:
+        try:
+            self.result = find_perfect_clear(
+                board, sequence, hold, can_hold=can_hold, time_limit=time_limit, cancel=self.cancel
+            )
+        finally:
+            self.done.set()
+
+
 @dataclass
 class _OpenerRun:
     """進行中の開幕テンプレの1つの図(src.engine.openers参照)。"""
@@ -1727,6 +1797,9 @@ class _OpenerRun:
     # apply_stepで更新し、ライン消去による詰めも反映する。
     board: set[tuple[int, int]]
     index: int = 0  # 次に置く手
+    # 手順の座標が「消去前の図の座標」(テンプレ)ならTrue。ライン消去のたびに残りを下へずらす。
+    # パフェ探索の手順は置く時点の実際の座標なのでFalse(ずらすと二重になる)。
+    shift_on_clear: bool = True
     # 固定を検知してから、盤面が手順どおりになったのをまだ確認できていない
     # 場合の検知時刻。Noneなら確認待ちではない。
     awaiting_since: float | None = None
@@ -1800,12 +1873,21 @@ def _non_garbage_cells(board: BoardState) -> set[tuple[int, int]]:
 
 
 def _garbage_row_count(board: BoardState) -> int:
-    """盤面の下から続くおじゃま行の数(穴を除きGARBAGEで埋まった行)。"""
+    """盤面の下から続くおじゃま行の数(穴を除きGARBAGEで埋まった行)。
+
+    【2026-09-26・実機ログ debug_log_20260926_173733】パフェの最後の2行消去の演出で、消える途中の
+    2行が灰色で全部埋まって読まれ、おじゃま2行とみなしてDPCの手順を2段上へずらした。全部埋まった
+    行はその場で消えるので、おじゃま行には必ず穴(空き)がある。
+    """
     count = 0
     for r in range(board.height - 1, -1, -1):
         row = board.grid[r]
         garbage = sum(1 for cell in row if cell == "GARBAGE")
-        if garbage >= board.width - 2 and all(cell in (None, "GARBAGE") for cell in row):
+        if (
+            garbage >= board.width - 2
+            and None in row
+            and all(cell in (None, "GARBAGE") for cell in row)
+        ):
             count += 1
         else:
             break
@@ -2207,6 +2289,10 @@ class AssistWorker(QtCore.QThread):
         self._opener_continue_since: float | None = None
         # 「該当なし」を同じミノ順で毎tick記録しないための控え。
         self._opener_declined_sequence: list[str] | None = None
+        # 直前に置き終えた図のセクション名(2巡目の後のパフェ探索の判定に使う)。
+        self._opener_finished_section: str | None = None
+        # 3巡目の図が無いときのパフェ探索(別スレッド)。_PerfectClearSearch参照。
+        self._pc_search: _PerfectClearSearch | None = None
         # キャプチャごとに増える通し番号。復元の確定に「別のキャプチャで同じ
         # 候補が一致した」ことを要求するための識別子(opener_recovery.RecoveryGate)。
         self._tick_serial = 0
@@ -2318,6 +2404,10 @@ class AssistWorker(QtCore.QThread):
                 self._last_stabilized_recognition = None
                 self._prev_hold_piece = "UNKNOWN"
                 self._disallow_hold_active = False
+                if self._opener is None and self._opener_locks is not None:
+                    # テンプレ外では手順から復元できない: 固定を取りこぼした可能性があるので袋の位置は不明
+                    self._opener_locks = None
+                    self._log_opener("認識欠落: 置いた数(袋の位置)を不明にする")
                 if self._opener is not None and not self._opener.recovery_pending:
                     # 【2026-09-13実機】演出で盤面が読めない間も手は進む。認識
                     # 状態をリセットしたので固定の検知は当てにできない。復帰後は
@@ -2832,7 +2922,11 @@ class AssistWorker(QtCore.QThread):
                     for c, cell in enumerate(row):
                         if cell is not None and cell[0] is None:
                             cleaned.grid[r][c] = None
-                recognition = dataclass_replace(recognition, board=cleaned)
+                # 盤面キーと基準値も清掃後にそろえる。清掃前のままだと次tickの消去予測・
+                # 妥当性判定が存在しないマスを基準にし、正しい盤面を弾いて提示が遅れる。
+                cleaned_key = tuple(tuple(row) for row in cleaned.grid)
+                recognition = dataclass_replace(recognition, board=cleaned, board_key=cleaned_key)
+                self._last_board_key = cleaned_key
         if board_data_trustworthy:
             self._last_board_trustworthy_time = now_board_trust
 
@@ -2938,6 +3032,29 @@ class AssistWorker(QtCore.QThread):
             just_held = forced_by_hold_swap or (
                 old_hold_piece != "UNKNOWN" and effective_hold_piece != old_hold_piece
             )
+            # 【2026-09-26・実機ログ debug_log_20260926_144933 はちみつ砲3巡目】Jを固定した直後に
+            # 出てきたLをすぐHOLDすると、NEXTが1つ進んだのと同じtickでHOLD欄もO→Lに変わって見え、
+            # 「空のHOLDへの格納」とみなして固定を検知しなかった(テンプレの手順がJで止まり、図どおりに
+            # 置いたOで中断)。HOLDが空でなければHOLD操作ではNEXTは進まないので、これは「固定+
+            # 次のミノとHOLDの交換」。固定として扱い、操作ミノを交換後のミノ(元のHOLD)に直す。
+            lock_with_swap = (
+                just_held
+                and not forced_by_hold_swap
+                and next_shift == 1
+                and recognition.hold_known
+                and old_hold_piece not in (None, "UNKNOWN")
+                and effective_hold_piece == self._last_current_piece
+            )
+            if lock_with_swap:
+                if self._debug_log_file is not None:
+                    self._debug_log_file.write(
+                        f"----- 固定と同時にHOLD交換: 操作ミノ {self._last_current_piece} -> {old_hold_piece} -----\n"
+                    )
+                    self._debug_log_file.flush()
+                self._last_current_piece = old_hold_piece
+                self._expected_current_piece = old_hold_piece
+            # このtickで前のミノが固定されたか(HOLD操作だけでNEXTが進んだ場合を除く)
+            locked_by_next = next_advanced and (not just_held or lock_with_swap)
             if recognition.hold_known:
                 self._prev_hold_piece = effective_hold_piece
             # このミノについて実際にdisallow_holdを適用したかどうかを覚えておく。
@@ -2950,7 +3067,7 @@ class AssistWorker(QtCore.QThread):
             # HOLDの状態が確定できていない間は、変化の有無が分からないので
             # 固定と断定しない(誤って提案を消さない方へ倒す)。
             if recognition.hold_known and _detect_lock(
-                next_advanced, just_held, previous_piece is not None
+                next_advanced, just_held and not lock_with_swap, previous_piece is not None
             ):
                 # 前のミノが実際に置かれた。その提案はもう役目を終えている
                 # ので消す(実際のemitは、このtickで新しい提案が得られな
@@ -2981,12 +3098,22 @@ class AssistWorker(QtCore.QThread):
             # 【探索木の引き継ぎ(play)の判断材料】このtickで固定があったか。
             # 要求を見送ったtickの固定は_cc_pending_lockで持ち越されている。
             # 提示済み配置(_committed_placement)は下で解除するので、その前に控える。
-            locked_now = (next_advanced and not just_held) or self._cc_pending_lock
+            locked_now = locked_by_next or self._cc_pending_lock
+            if locked_by_next and self._opener is None and self._opener_locks is not None:
+                # 【2026-09-26・実機ログ debug_log_20260926_145208】テンプレが「砲のみ」に縮小されて
+                # 終わり、パフェをAIの提示で組むとDPCへ移らなかった。テンプレ外の手も数え続ける
+                # (DPCの判定に使う)。NEXTがちょうど1つ進んだ固定だけを数え、2つ以上進んだ
+                # (固定を取りこぼした疑い)ときは袋の位置を不明にする。移動量が分からない初回の
+                # 観測は数えない(認識欠落からの復帰は、欠落の時点で不明にしている)。
+                if next_shift == 1:
+                    self._opener_locks += 1
+                elif next_shift is not None:
+                    self._opener_locks = None
             self._cc_pending_lock = False
             self._update_opener(recognition, locked_now=locked_now, garbage_rise=garbage_rise)
             committed_before_lock = self._committed_placement
             committed_tbp_before_lock = self._committed_placement_tbp
-            if next_advanced and not just_held:
+            if locked_by_next:
                 self._committed_placement = None
                 self._committed_placement_tbp = None
             # これからCold Clear 2へ質問する局面の識別情報を覚えておく。
@@ -3152,7 +3279,9 @@ class AssistWorker(QtCore.QThread):
                     self.cold_clear.start_thinking(
                         recognition.board,
                         self._last_current_piece,
-                        recognition.hold_piece,
+                        # 照合キーと同じ補完済みのHOLDを渡す(生の値だとHOLDが一瞬読めない
+                        # だけで「HOLD空」の局面を考えさせ、照合だけ通ってしまう)
+                        effective_hold_for_key,
                         list(recognition.next_queue),
                         disallow_hold=self._disallow_hold_active,
                     )
@@ -3721,7 +3850,9 @@ class AssistWorker(QtCore.QThread):
             # HOLDも空なら対局の最初の手番とみなし、袋の先頭から数え始める
             # (全消去後や途中起動でも盤面は空になりうるが、その区別は
             # 付けられないので、以前からの「空なら開幕」の前提を引き継ぐ)。
-            self._opener_locks = 0 if hold is None else None
+            # HOLDがあるとき(パフェ後)は、対局開始から数え続けた置いた数を残す(DPCの判定に使う)。
+            if hold is None:
+                self._opener_locks = 0
         if any(cell is not None and cell[0] is None for row in recognition.pending_grid for cell in row):
             return  # 盤面がまだ確定していない(消えた行が残っている等)
         bag_position = None if self._opener_locks is None else self._opener_locks + (1 if hold is not None else 0)
@@ -3735,7 +3866,12 @@ class AssistWorker(QtCore.QThread):
         matched_cells = {(r + garbage_rows, c) for r, c in board_cells}
         if self._opener_continuing is not None:
             chosen_form = choose_form(self._opener_continuing, matched_cells, sequence, hold)
+            pc_run = None
             if chosen_form is None:
+                pc_run = self._perfect_clear_run(recognition, board_cells, sequence, hold, garbage_rows)
+            if pc_run is not None:
+                template, form, steps = pc_run
+            elif chosen_form is None:
                 # 【2026-09-12実機】図を置き終えた直後のtickは、置いたばかりの
                 # ミノが光っていて盤面が図と厳密に一致しないことがあり、1回で
                 # 諦めると2巡目が始まらなかった(はちみつ砲)。しばらく探し続ける。
@@ -3747,20 +3883,40 @@ class AssistWorker(QtCore.QThread):
                     )
                     self._opener_continuing = None
                     self._opener_continue_since = None
-                    self._opener_locks = None
                 return
-            template = self._opener_continuing
-            form, steps = chosen_form
+            else:
+                template = self._opener_continuing
+                form, steps = chosen_form
         else:
-            if board_cells or hold is not None:
+            if board_cells:
                 return
-            chosen = choose_opener(sequence, hold, matched_cells)
-            if chosen is None:
-                if self._opener_declined_sequence != sequence:
-                    self._opener_declined_sequence = sequence
-                    self._log_opener(f"該当なし ミノ順={''.join(sequence)}")
-                return
-            template, form, steps = chosen
+            if hold is not None:
+                # 【2026-09-26・利用者の指示】DPCを組める条件のときに限りDPCを提示する:
+                # テンプレを手順どおりに進めてパフェを取った直後で、置いた数が7の倍数-1
+                # (HOLDに前の袋のミノを繰り越し、操作ミノが袋の先頭)。外れたらAI提示に戻る。
+                if self._opener_locks is None or self._opener_locks % 7 != 6:
+                    return
+                # 【2026-09-26・実機ログ debug_log_20260926_174815 1136行目】HOLDは前の袋からの繰り越しで、
+                # 袋の先頭は操作ミノと確定している。HOLDを除いて7個目を補う(known_sequenceはHOLDと
+                # 操作ミノのどちらが先頭か決められないと補わず、6個ではDPCの図が見つからなかった)。
+                dpc_sequence = known_sequence(
+                    self._last_current_piece, recognition.next_queue, None, self._opener_locks + 1
+                )
+                chosen = choose_dpc(dpc_sequence or sequence, hold)
+                if chosen is None:
+                    if self._opener_declined_sequence != sequence:
+                        self._opener_declined_sequence = sequence
+                        self._log_opener(f"DPC該当なし ミノ順={''.join(sequence)} hold={hold}")
+                    return
+                template, form, steps = chosen
+            else:
+                chosen = choose_opener(sequence, hold, matched_cells)
+                if chosen is None:
+                    if self._opener_declined_sequence != sequence:
+                        self._opener_declined_sequence = sequence
+                        self._log_opener(f"該当なし ミノ順={''.join(sequence)}")
+                    return
+                template, form, steps = chosen
         if garbage_rows:
             steps = [
                 OpenerStep(st.piece, tuple((r - garbage_rows, c) for r, c in st.cells), st.use_hold, st.spin)
@@ -3777,7 +3933,10 @@ class AssistWorker(QtCore.QThread):
         # 混入し、手順どおりに置いても「手順と異なる盤面」で中断した
         # (山岳積み2号の3巡目)。余分なマスは従来どおり期待外(4未満)として扱う。
         run_board = {(r - garbage_rows, c) for r, c in form.existing}
-        self._opener = _OpenerRun(template=template, form=form, steps=steps, board=run_board)
+        self._opener = _OpenerRun(
+            template=template, form=form, steps=steps, board=run_board, shift_on_clear=template is not _PC_TEMPLATE
+        )
+        self._pc_search = None
         turn = self._observed_turn(recognition)
         if turn is not None:
             self._opener.recovery_snapshot = self._snapshot_opener(self._opener, turn)
@@ -3792,6 +3951,66 @@ class AssistWorker(QtCore.QThread):
             f" ミノ順={''.join(sequence)} hold={hold} 手順="
             + " ".join(f"{s.piece}{'(H)' if s.use_hold else ''}{'(spin)' if s.spin else ''}" for s in steps)
         )
+
+    # 3巡目の図が無いときのパフェ探索の時間上限(秒)。シミュレーターの画面用と同じ。
+    PC_SEARCH_TIME_LIMIT_SEC = 3.0
+
+    def _perfect_clear_run(
+        self,
+        recognition: RecognitionResult,
+        board_cells: set[tuple[int, int]],
+        sequence: list[str],
+        hold: str | None,
+        garbage_rows: int,
+    ) -> tuple[OpenerTemplate, OpenerForm, list[OpenerStep]] | None:
+        """【2026-09-26・利用者の指示】2巡目(TST)を置き終えて3巡目の図が無いとき、パフェを探す。
+
+        実機ログ debug_log_20260926_150555: 3巡目の図はミノ順が合わないと組めず、AIの提示に戻って
+        パフェが出なかった(同じ局面でパフェ探索は約2秒でパフェを見つける)。探索は1〜2秒かかるので
+        別スレッドで行い、見つかるまではAIの提示を出す。局面(盤面・ミノ順・HOLD)が変わったら
+        その結果は捨てて探し直す。見つかればテンプレと同じ形で1手ずつ提示する。
+        """
+        continuing = self._opener_continuing
+        section = self._opener_finished_section or ""
+        if (
+            continuing is None
+            or continuing.name_ja == DPC_TEMPLATE_NAME
+            # 【2026-09-26・実機ログ debug_log_20260926_174815】2巡目の後だけに限ると、3巡目が砲のみ
+            # (TSDだけ)に縮小されて終わった後やTSTドネイトの後に探さなかった。1巡目の後以外で探す。
+            or not section
+            or "1巡目" in section.split(" > ")[-1]
+            or garbage_rows
+            or not board_cells
+        ):
+            return None
+        can_hold = not self._disallow_hold_active
+        key = (frozenset(board_cells), tuple(sequence), hold, can_hold)
+        search = self._pc_search
+        if search is None or search.key != key:
+            if search is not None:
+                search.cancel.set()
+            board = frozenset((r + PC_HIDDEN_ROWS, c) for r, c in board_cells)
+            self._pc_search = _PerfectClearSearch(key, board, sequence, hold, can_hold, self.PC_SEARCH_TIME_LIMIT_SEC)
+            self._log_opener(f"3巡目の図が無いためパフェを探す ミノ順={''.join(sequence)} hold={hold}")
+            return None
+        if not search.done.is_set() or search.logged:
+            return None
+        search.logged = True
+        result = search.result
+        if not isinstance(result, list):
+            self._log_opener(f"パフェ探索: {'時間切れ' if result is not None else 'パフェなし'}")
+            return None
+        steps = [
+            OpenerStep(st.piece, tuple((r - PC_HIDDEN_ROWS, c) for r, c in st.cells), st.use_hold, False)
+            for st in result
+        ]
+        form = OpenerForm(
+            _PC_TEMPLATE.name_ja,
+            frozenset(board_cells),
+            tuple(FormItem(st.piece, st.cells) for st in steps),
+            "",
+        )
+        return _PC_TEMPLATE, form, steps
 
     # 固定を検知してから、盤面が手順どおりになるのをこの秒数まで待つ。
     # 超えたら手順から外れたとみなしてテンプレをやめる。
@@ -3859,7 +4078,7 @@ class AssistWorker(QtCore.QThread):
             # ずらさないとパフェ狙いの図の次の手が宙に浮いた位置になり、物理的に
             # 成立しない提案として捨てられて何も表示されなかった。
             cleared = full_rows_after(opener.board, opener.steps[opener.index].cells)
-            if cleared:
+            if cleared and opener.shift_on_clear:
                 opener.steps = opener.steps[: opener.index + 1] + [
                     OpenerStep(st.piece, shift_cells_for_clears(st.cells, cleared), st.use_hold, st.spin)
                     for st in opener.steps[opener.index + 1 :]
@@ -3875,6 +4094,7 @@ class AssistWorker(QtCore.QThread):
                 opener.recovery_snapshot = self._snapshot_opener(opener, turn)
             if opener.current_step() is None:
                 self._log_opener(f"図を置き終えた [{opener.form.section}]")
+                self._opener_finished_section = opener.form.section
                 self._opener_continuing = opener.template
                 self._opener_continue_since = None
                 self._opener = None
@@ -3884,13 +4104,85 @@ class AssistWorker(QtCore.QThread):
         # ときだけ。おじゃまのせり上がりは確認後に手順の座標をずらす
         # (_update_opener)ので、せり上がりを初めて観測した未確認のtickで
         # 即中断すると、ずらす前に「手順と異なる盤面」になってしまった(迷走砲)。
+        if len(extra) >= 4 and board_confirmed and self._rejoin_opener_after_reorder(opener, actual, recognition):
+            return
         if (len(extra) >= 4 and board_confirmed) or elapsed >= self.OPENER_CONFIRM_TIMEOUT_SEC:
             self._log_opener(
                 f"中断(手順と異なる盤面 {elapsed:.1f}秒) 期待={sorted(expected)} 実際={sorted(actual)}"
             )
             self._opener = None
             self._opener_continuing = None
-            self._opener_locks = None
+            # 固定は起きている(awaiting_since)ので、置いた数には含める(以後はAI提示の手として数える)
+            if self._opener_locks is not None:
+                self._opener_locks += 1
+
+    def _rejoin_opener_after_reorder(
+        self, opener: _OpenerRun, actual: set[tuple[int, int]], recognition: RecognitionResult
+    ) -> bool:
+        """今の手ではなく、図の後の手を先に置いた(手順の前後)なら、残りを組み直して続ける。
+
+        【2026-09-26・利用者の指示/実機ログ debug_log_20260926_144540 117・1456行目】手順を
+        入れ替えても図は変わらないのに、提示の順番どおりでないと「手順と異なる盤面」で中断して
+        テンプレの提示をやめていた。置いたマスが残りのどれかの手と完全に一致し、ラインが消えない
+        ときだけ、その手を済みとして、残りの手を今のミノ順・HOLDで組み直す(plan_form)。
+        組めなければ従来どおり中断する。探索したパフェの手順(座標が消去後)は対象外。
+        """
+        if not opener.shift_on_clear:
+            return False
+        placed = actual - opener.board
+        done = next(
+            (
+                k
+                for k in range(opener.index + 1, len(opener.steps))
+                if set(opener.steps[k].cells) == placed and opener.board <= actual
+            ),
+            None,
+        )
+        if done is None or full_rows_after(opener.board, opener.steps[done].cells):
+            return False
+        hold = recognition.hold_piece if recognition.hold_known else None
+        if not recognition.hold_known or self._last_current_piece is None:
+            return False
+        rest = [st for i, st in enumerate(opener.steps[opener.index :], opener.index) if i != done]
+        # 残りの手に対応する図のミノ(Tスピンの'U'等の条件を保つ)。座標は今の手順の座標に合わせる。
+        items = []
+        unused = list(opener.form.items)
+        for st in rest:
+            item = next((it for it in unused if it.piece == st.piece and len(it.cells) == len(st.cells)), None)
+            if item is None:
+                return False
+            unused.remove(item)
+            items.append(dataclass_replace(item, cells=tuple(st.cells)))
+        locks = None if self._opener_locks is None else self._opener_locks + 1
+        bag_position = None if locks is None else locks + (1 if hold is not None else 0)
+        sequence = known_sequence(self._last_current_piece, recognition.next_queue, hold, bag_position)
+        if sequence is None:
+            return False
+        new_board = opener.board | set(opener.steps[done].cells)
+        rest_form = OpenerForm(opener.form.section, frozenset(new_board), tuple(items), opener.form.text, opener.form.tuck_pieces)
+        planned = plan_form(rest_form, sequence, hold, placed=set(new_board))
+        if planned is None:
+            return False
+        placed_step = opener.steps[done]
+        opener.steps = opener.steps[: opener.index] + [placed_step] + planned
+        opener.index += 1
+        opener.board = new_board
+        opener.awaiting_since = None
+        self._opener_locks = locks
+        turn = self._observed_turn(recognition)
+        if turn is not None:
+            opener.recovery_snapshot = self._snapshot_opener(opener, turn)
+        self._log_opener(
+            f"手順の前後を受け入れて続行: {placed_step.piece}を先に置いた 残り="
+            + " ".join(f"{s.piece}{'(H)' if s.use_hold else ''}{'(spin)' if s.spin else ''}" for s in planned)
+        )
+        if opener.current_step() is None:
+            self._log_opener(f"図を置き終えた [{opener.form.section}]")
+            self._opener_finished_section = opener.form.section
+            self._opener_continuing = opener.template
+            self._opener_continue_since = None
+            self._opener = None
+        return True
 
     def _observed_turn(self, recognition: RecognitionResult) -> TurnState | None:
         """復元の照合に使う、今の手番の観測。操作ミノかHOLDが未確定ならNone。"""
@@ -3974,6 +4266,7 @@ class AssistWorker(QtCore.QThread):
             )
             if opener.current_step() is None:
                 self._log_opener(f"図を置き終えた [{opener.form.section}]")
+                self._opener_finished_section = opener.form.section
                 self._opener_continuing = opener.template
                 self._opener_continue_since = None
                 self._opener = None
@@ -4266,7 +4559,7 @@ class MainWindow(QtWidgets.QWidget):
             )
             layout.addWidget(self.record_video_checkbox)
 
-        self.opener_checkbox = QtWidgets.QCheckBox("開幕テンプレを提示する(はちみつ砲・迷走砲・山岳積み2号・オリーブ積み)")
+        self.opener_checkbox = QtWidgets.QCheckBox("開幕テンプレを提示する(はちみつ砲・迷走砲・山岳積み2号・オリーブ積み・パフェ後のDPC)")
         self.opener_checkbox.setChecked(True)
 
         depth_row = QtWidgets.QHBoxLayout()
@@ -4284,7 +4577,8 @@ class MainWindow(QtWidgets.QWidget):
         self.opener_checkbox.setToolTip(
             "対局開始時(盤面とHOLDが空)のミノ順から組める開幕テンプレを選び、"
             "1巡目の手順をAIの提案の代わりに表示します。テンプレ名は"
-            "HOLD欄の下に表示します。提示と違う場所に置くと通常のAI提案に戻ります。"
+            "HOLD欄の下に表示します。テンプレでパフェを取った直後にDPCを組める"
+            "条件がそろえば、DPCも提示します。提示と違う場所に置くと通常のAI提案に戻ります。"
         )
         layout.addWidget(self.opener_checkbox)
 
@@ -4472,6 +4766,8 @@ class MainWindow(QtWidgets.QWidget):
 
     def _on_draw_data_ready(self, draw_data: OverlayDrawData | None) -> None:
         self.last_valid_draw_data = draw_data
+        if draw_data is not None and self.safety_timer.isActive():
+            self.safety_timer.start(SAFETY_TIMEOUT_MS)  # 提示が届いた: 自動解除までの時間を数え直す
         if self.overlay is not None:
             self.overlay.update_draw_data(draw_data)
 

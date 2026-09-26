@@ -19,7 +19,7 @@ Tスピンを打つ図などは、すべてこの「既存ブロックの一致�
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .opener_data import EDUCATION_SOURCE_FORMS, OPENER_SOURCE_FORMS
 
@@ -511,6 +511,65 @@ def tuck_count(existing: frozenset[tuple[int, int]] | set[tuple[int, int]], step
     return count
 
 
+# 【2026-09-26・利用者の指示】支援モード(実戦)では、迷走砲は1巡目のIを左に置く図だけを使う。
+# 左右反転(Iが右)の形はTの移動が要り、実戦ではあまり使われない。シミュレーターは対象外。
+_ASSIST_NO_MIRROR_TEMPLATES = frozenset({"迷走砲"})
+_MIRRORED_ONLY_TEXTS: dict[str, frozenset[str]] = {
+    name_ja: frozenset(mirror_form_text(text) for _s, text in forms) - {text for _s, text in forms}
+    for name_ja, _en, _url, forms in OPENER_SOURCE_FORMS
+    if name_ja in _ASSIST_NO_MIRROR_TEMPLATES
+}
+
+
+def _assist_template(template: OpenerTemplate) -> OpenerTemplate:
+    """支援モードで使わない図(左右反転の迷走砲)を除いたテンプレを返す。"""
+    mirrored = _MIRRORED_ONLY_TEXTS.get(template.name_ja)
+    if not mirrored:
+        return template
+    return replace(template, forms=tuple(f for f in template.forms if f.text not in mirrored))
+
+
+def carried_pieces(form: OpenerForm) -> frozenset[str]:
+    """DPCの図で繰り越したミノの候補(図の大文字。Tスピンの'U'と既存ブロックの'C'は除く)。
+
+    大文字が2種類ある図(S-13bのT・S等)は、どちらかを繰り越していれば使える扱いにする。
+    大文字の無い図(文献で繰り越しのOを小文字で描いたO-02等)は、パターン名の先頭(O-02のO)
+    で判断する。J・Sの系統は左右反転の図も同じ名前なのでJ/L・S/Zのどちらでもよい。
+    """
+    letters = frozenset(ch for ch in form.text if ch.isupper() and ch not in "UC")
+    if letters:
+        return letters
+    group = form.section[:1]
+    return frozenset({"J": "JL", "S": "SZ"}.get(group, group))
+
+
+# 【2026-09-26・利用者の指示】支援モードでも、DPCを組める条件のときに限りDPCを提示する。
+DPC_TEMPLATE_NAME = "DPC"
+
+
+def choose_dpc(sequence: list[str], hold: str | None) -> tuple[OpenerTemplate, OpenerForm, list[OpenerStep]] | None:
+    """パフェ直後(空の盤面・HOLDに前の袋のミノを繰り越し)から組めるDPCの組み方の図と手順。
+
+    袋の区切りがそろっているかは呼び出し側が確かめる。図は、繰り越したミノ(図の大文字)が
+    HOLDのミノと一致するものだけ使う(シミュレーターのstartable_templateと同じ条件)。
+    戻り値のテンプレは続きの図(既存ブロックのある図)も含むので、続きの探索にそのまま使える。
+    """
+    if hold is None:
+        return None
+    template = next((t for t in EDUCATION_TEMPLATES if t.name_ja == DPC_TEMPLATE_NAME), None)
+    if template is None:
+        return None
+    forms = tuple(
+        f for f in template.forms if f.existing or (hold in carried_pieces(f) and not f.is_spin_only())
+    )
+    template = replace(template, forms=forms)
+    chosen = choose_form(template, set(), sequence, hold)
+    if chosen is None:
+        return None
+    form, steps = chosen
+    return template, form, steps
+
+
 def choose_opener(
     sequence: list[str], hold: str | None = None, board_cells: set[tuple[int, int]] | None = None
 ) -> tuple[OpenerTemplate, OpenerForm, list[OpenerStep]] | None:
@@ -521,6 +580,7 @@ def choose_opener(
     # どれも回転入れが要る場合だけ、回転入れの最も少ないテンプレを選ぶ。
     best: tuple[int, OpenerTemplate, OpenerForm, list[OpenerStep]] | None = None
     for template in OPENER_TEMPLATES:
+        template = _assist_template(template)
         chosen = choose_form(template, cells, sequence, hold)
         if chosen is None:
             continue

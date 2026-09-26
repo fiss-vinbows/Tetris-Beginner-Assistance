@@ -861,6 +861,27 @@ class TestAssistWorkerTickOnce(unittest.TestCase):
         # 立て直しでは、既に提示済みの配置を消さない(消すと振動になる)。
         self.assertIsNotNone(self.worker._committed_placement)
 
+    def test_mismatch_rethink_uses_the_same_filled_in_hold_as_the_turn_key(self) -> None:
+        # 【2026-09-26・静的分析の指摘】手番不一致からの再計算だけが生のHOLDを渡しており、
+        # HOLDが一瞬読めないと「HOLD空」の局面で考えさせる一方、照合キーは補完済みのHOLDになる。
+        self.cold_clear.poll_suggestion.return_value = _move("T")
+        with patch("src.app.time.monotonic", return_value=999.0):
+            with patch("src.app.recognize", return_value=_recognition(current_piece="T", hold_piece="Z")):
+                self.worker._tick_once(capture=MagicMock())
+        # 別要因(要求時と異なるNEXT等)の手番不一致が続き、再計算の直前まで来た状態
+        self.worker._thinking_turn_key = ("T", "Z", ("I", "I", "I", "I", "I"))
+        self.worker._turn_key_mismatch_ticks = AssistWorker.TURN_KEY_MISMATCH_RETHINK_TICKS - 1
+        self.cold_clear.start_thinking.reset_mock()
+        # 再計算のtickでHOLDが読めない(確定済みのHOLDはZ)
+        unknown_hold = _recognition(current_piece="T", hold_piece=None, hold_known=False)
+        with patch("src.app.time.monotonic", return_value=1000.0):
+            with patch("src.app.recognize", return_value=unknown_hold):
+                self.worker._tick_once(capture=MagicMock())
+
+        self.cold_clear.start_thinking.assert_called_once()
+        self.assertEqual(self.cold_clear.start_thinking.call_args.args[2], "Z")
+        self.assertEqual(self.worker._thinking_turn_key[1], "Z")
+
     def test_stale_suggestion_is_cleared_once_its_landing_cells_are_filled(self) -> None:
         # 実機の動画で確認された不具合の回帰テスト: 新しいミノがスポーンして
         # から新しい提案が計算し終わるまでのわずかな間、既に実行済み(盤面に
@@ -1360,6 +1381,36 @@ class TestAssistWorkerTickOnce(unittest.TestCase):
 
         self.cold_clear.start_thinking.assert_called_once()
 
+    def test_forced_acceptance_aligns_board_key_with_the_cleaned_board(self) -> None:
+        # 【2026-09-26・静的分析の指摘】強制受理で確定待ちのマスを空にしたとき、盤面本体だけを
+        # 差し替え、比較用の基準値(_last_board_key)は清掃前のままだった。次tickの消去予測・
+        # 妥当性判定が存在しないマスを基準にしてしまう。
+        self.cold_clear.poll_suggestion.return_value = _move("A")
+        stable = _recognition(
+            current_piece="A",
+            filled_cells=tuple((19, c) for c in range(10)) + tuple((18, c) for c in range(5)),
+        )
+        with patch("src.app.time.monotonic", return_value=1000.0):
+            with patch("src.app.recognize", return_value=stable):
+                self.worker._tick_once(capture=MagicMock())
+        self.cold_clear.start_thinking.reset_mock()
+
+        noisy = _recognition(
+            current_piece="B",
+            filled_cells=((19, 0), (19, 1)),
+            pending_cells=((19, 1),),
+            next_queue=("L", "J", "S", "Z", "I"),
+        )
+        timeout = AssistWorker.BOARD_TRUST_TIMEOUT_SEC
+        with patch("src.app.time.monotonic", return_value=1000.0 + timeout + 0.1):
+            with patch("src.app.recognize", return_value=noisy):
+                self.worker._tick_once(capture=MagicMock())
+
+        self.cold_clear.start_thinking.assert_called_once()
+        board = self.cold_clear.start_thinking.call_args.args[0]
+        self.assertIsNone(board.grid[19][1])
+        self.assertEqual(self.worker._last_board_key, tuple(tuple(row) for row in board.grid))
+
     def test_request_skipped_for_untrustworthy_board_is_retried_next_tick(self) -> None:
         # 【残課題・2026-09-11実機ログ】next_advancedのtickで盤面が信用
         # できないと要求を見送るが、next_advancedはそのtickで消費済み
@@ -1693,6 +1744,245 @@ class TestAssistWorkerTickOnce(unittest.TestCase):
         self.addCleanup(patcher.stop)
         return worker, received
 
+    # 【2026-09-26・利用者の指示】DPCを組める条件のときに限りDPCを提示する
+    def _dpc_tick(self, worker, locks: int | None, filled_cells=()) -> None:
+        worker._opener_locks = locks
+        self.cold_clear.poll_suggestion.return_value = _move("I", landing_cells=[(19, 5), (19, 6), (19, 7), (19, 8)])
+        # パフェ直後: 盤面が空、HOLDに前の袋のT、操作ミノIが袋の先頭
+        recognition = _recognition(
+            current_piece="I", hold_piece="T", next_queue=("O", "T", "S", "Z", "J"), filled_cells=filled_cells
+        )
+        with patch("src.app.time.monotonic", return_value=1000.0):
+            with patch("src.app.recognize", return_value=recognition):
+                worker._tick_once(capture=MagicMock())
+
+    def test_dpc_starts_right_after_a_template_perfect_clear(self) -> None:
+        worker, _received = self._opener_worker()
+        self._dpc_tick(worker, locks=20)  # 8ラインパフェ(20個)の後
+        self.assertIsNotNone(worker._opener)
+        self.assertEqual(worker._opener.template.name_ja, "DPC")
+        from src.engine.openers import carried_pieces
+
+        self.assertIn("T", carried_pieces(worker._opener.form))  # 繰り越したTに合う図
+
+    def test_dpc_is_not_offered_when_the_bag_position_is_unknown_or_misaligned(self) -> None:
+        for locks in (None, 21, 19):
+            worker, _received = self._opener_worker()
+            self._dpc_tick(worker, locks=locks)
+            self.assertIsNone(worker._opener, f"置いた数={locks}")
+
+    def _ai_turns(self, worker, queues, locks: int) -> None:
+        """テンプレ外(AI提示)の手番を進める。最初の観測で基準を作ってから置いた数を与える。"""
+        self.cold_clear.poll_suggestion.return_value = _move("A")
+        for i, (current, queue) in enumerate(queues):
+            rec = _recognition(current_piece=current, next_queue=queue, filled_cells=((19, 0),))
+            with patch("src.app.time.monotonic", return_value=1000.0 + i):
+                with patch("src.app.recognize", return_value=rec):
+                    worker._tick_once(capture=MagicMock())
+            if i == 0:
+                worker._opener_locks = locks
+
+    def test_pieces_placed_by_the_ai_are_counted_for_the_dpc(self) -> None:
+        # 【2026-09-26・実機ログ debug_log_20260926_145208】テンプレが砲のみで終わり、パフェを
+        # AIの提示で組んだらDPCへ移らなかった。テンプレ外の固定も数え続けること。
+        worker, _received = self._opener_worker()
+        self._ai_turns(worker, [("A", ("L", "S", "T", "Z", "O")), ("L", ("S", "T", "Z", "O", "J"))], locks=18)
+        self.assertEqual(worker._opener_locks, 19)
+
+    def test_missed_lock_forgets_the_bag_position(self) -> None:
+        # NEXTが一度に2つ進んだ: 固定を取りこぼした疑いがあるので袋の位置は不明にする
+        worker, _received = self._opener_worker()
+        self._ai_turns(worker, [("A", ("L", "S", "T", "Z", "O")), ("S", ("T", "Z", "O", "J", "I"))], locks=18)
+        self.assertIsNone(worker._opener_locks)
+
+    def test_recognition_gap_outside_a_template_forgets_the_bag_position(self) -> None:
+        # テンプレ外では手順から復元できないので、認識が途切れたら袋の位置は不明にする
+        from src.app import MAX_CONSECUTIVE_RECOGNITION_FAILURES
+
+        worker, _received = self._opener_worker()
+        self._ai_turns(worker, [("A", ("L", "S", "T", "Z", "O"))], locks=18)
+        for _ in range(MAX_CONSECUTIVE_RECOGNITION_FAILURES):
+            with patch("src.app.recognize", return_value=None):
+                worker._tick_once(capture=MagicMock())
+        self.assertIsNone(worker._opener_locks)
+
+    def test_lock_and_hold_swap_seen_in_the_same_tick_is_a_lock(self) -> None:
+        # 【2026-09-26・実機ログ debug_log_20260926_144933 はちみつ砲3巡目】Jを固定した直後に
+        # 出てきたLをすぐHOLDし、NEXTの進行とHOLD欄の変化(O→L)が同じtickに見えた。
+        # 空のHOLDへの格納と誤認して固定を検知せず、テンプレの手順が止まって中断した。
+        worker, _received = self._opener_worker()
+        self.cold_clear.poll_suggestion.return_value = _move("A")
+        before = _recognition(current_piece="J", hold_piece="O", next_queue=("L", "S", "Z", "I", "T"))
+        after = _recognition(
+            current_piece=None, hold_piece="L", next_queue=("S", "Z", "I", "T", "J"), filled_cells=((19, 0),)
+        )
+        with patch("src.app.time.monotonic", return_value=1000.0):
+            with patch("src.app.recognize", return_value=before):
+                worker._tick_once(capture=MagicMock())
+                worker._tick_once(capture=MagicMock())
+        worker._opener_locks = 10
+        with patch("src.app.time.monotonic", return_value=1001.0):
+            with patch("src.app.recognize", return_value=after):
+                worker._tick_once(capture=MagicMock())
+        self.assertEqual(worker._opener_locks, 11, "固定として数えていない")
+        self.assertEqual(worker._last_current_piece, "O", "操作ミノが交換後のミノになっていない")
+        self.assertTrue(worker._disallow_hold_active, "この手番のHOLDは使用済み")
+
+    def test_storing_into_an_empty_hold_is_still_not_a_lock(self) -> None:
+        # 空のHOLDへの格納ではNEXTが進むが固定ではない(従来どおり)
+        worker, _received = self._opener_worker()
+        self.cold_clear.poll_suggestion.return_value = _move("A")
+        before = _recognition(current_piece="J", hold_piece=None, next_queue=("L", "S", "Z", "I", "T"), filled_cells=((19, 0),))
+        after = _recognition(current_piece="L", hold_piece="J", next_queue=("S", "Z", "I", "T", "O"), filled_cells=((19, 0),))
+        with patch("src.app.time.monotonic", return_value=1000.0):
+            with patch("src.app.recognize", return_value=before):
+                worker._tick_once(capture=MagicMock())
+                worker._tick_once(capture=MagicMock())
+        worker._opener_locks = 10
+        with patch("src.app.time.monotonic", return_value=1001.0):
+            with patch("src.app.recognize", return_value=after):
+                worker._tick_once(capture=MagicMock())
+        self.assertEqual(worker._opener_locks, 10)
+        self.assertEqual(worker._last_current_piece, "L")
+
+    def test_perfect_clear_is_searched_when_no_third_bag_form_fits(self) -> None:
+        # 【2026-09-26・実機ログ debug_log_20260926_150555 713行目】迷走砲2巡目(TST)の後、ミノ順
+        # L O J I T Z・HOLD S では3巡目の図が組めずAIの提示に戻り、パフェが出なかった。
+        # 同じ局面でパフェ探索はパフェを見つけるので、それをテンプレと同じ形で提示すること。
+        from src.engine import openers
+        from src.engine.board_state import BoardState
+        from src.engine.openers import apply_step
+
+        meiso = next(t for t in openers.OPENER_TEMPLATES if t.name_ja == "迷走砲")
+        worker, _received = self._opener_worker()
+        rows = ["......OOJI", "S..Z..OOJI", "SSZZ...JJI", "ILLST.JJOO"]
+        board = tuple((16 + i, c) for i, row in enumerate(rows) for c, ch in enumerate(row) if ch != ".")
+        rec = _recognition(current_piece="L", hold_piece="S", next_queue=("O", "J", "I", "T", "Z"), filled_cells=board)
+        self.cold_clear.poll_suggestion.return_value = _move("A")
+        clock = iter(1000.0 + 0.2 * i for i in range(10))
+        with patch("src.app.time.monotonic", side_effect=lambda: current_time[0]):
+            with patch("src.app.recognize", return_value=rec):
+                current_time = [next(clock)]
+                worker._tick_once(capture=MagicMock())
+                worker._opener_continuing = meiso
+                worker._opener_finished_section = "理想形 > 2巡目"
+                current_time[0] = next(clock)
+                worker._tick_once(capture=MagicMock())  # 探索開始(見つかるまではAI提示)
+                self.assertIsNone(worker._opener)
+                self.assertIsNotNone(worker._pc_search)
+                self.assertTrue(worker._pc_search.done.wait(10))
+                current_time[0] = next(clock)
+                worker._tick_once(capture=MagicMock())
+        run = worker._opener
+        self.assertIsNotNone(run, "パフェの手順を提示していない")
+        self.assertEqual(run.template.name_ja, "パフェ")
+        self.assertFalse(run.shift_on_clear, "探索の手順は実際の座標なので消去でずらさない")
+        # 手順は置く時点の盤面の座標: 順に置けて、最後に盤面が空になる
+        cells = set(board)
+        for step in run.steps:
+            grid = BoardState()
+            for r, c in cells:
+                grid.grid[r][c] = "X"
+            self.assertTrue(grid.is_placement_physically_valid(list(step.cells)), step)
+            cells = apply_step(cells, step.cells)
+        self.assertEqual(cells, set())
+
+    def test_perfect_clear_is_not_searched_after_the_first_bag(self) -> None:
+        # パフェ探索は2巡目(TST)を置き終えた後だけ。1巡目の後は従来どおり次の図を探す
+        from src.engine import openers
+
+        meiso = next(t for t in openers.OPENER_TEMPLATES if t.name_ja == "迷走砲")
+        worker, _received = self._opener_worker()
+        rec = _recognition(current_piece="L", hold_piece="S", next_queue=("O", "J", "I", "T", "Z"), filled_cells=((19, 0),))
+        self.cold_clear.poll_suggestion.return_value = _move("A")
+        with patch("src.app.recognize", return_value=rec):
+            with patch("src.app.time.monotonic", return_value=1000.0):
+                worker._tick_once(capture=MagicMock())
+            worker._opener_continuing = meiso
+            worker._opener_finished_section = "1巡目とミノ順"
+            with patch("src.app.time.monotonic", return_value=1000.2):
+                worker._tick_once(capture=MagicMock())
+        self.assertIsNone(worker._pc_search)
+
+    def _reorder_setup(self, placed_cells, current, hold, next_queue):
+        """迷走砲1巡目(I L S T Z O J)をI・Lまで置いた状態から、次の固定を確認させる。"""
+        from src.app import _OpenerRun
+        from src.engine.openers import apply_step, choose_opener
+
+        template, form, steps = choose_opener(list("ILSTZOJ"))
+        if isinstance(placed_cells, int):
+            placed_cells = steps[placed_cells].cells  # 図の手番号で指定
+        worker, _received = self._opener_worker()
+        board: set = set()
+        for st in steps[:2]:
+            board = apply_step(board, st.cells)
+        worker._opener = _OpenerRun(template=template, form=form, steps=list(steps), board=set(board), index=2)
+        worker._opener_locks = 2
+        rec = _recognition(
+            current_piece=current, hold_piece=hold, next_queue=next_queue, filled_cells=tuple(board | set(placed_cells))
+        )
+        self.cold_clear.poll_suggestion.return_value = _move("A")
+        for i in range(3):
+            with patch("src.app.time.monotonic", return_value=1000.0 + 0.2 * i):
+                with patch("src.app.recognize", return_value=rec):
+                    if worker._opener is not None and worker._opener.index == 2:
+                        worker._opener.awaiting_since = 1000.0
+                    worker._tick_once(capture=MagicMock())
+        return worker, steps
+
+    def test_placing_a_later_step_first_keeps_the_template(self) -> None:
+        # 【2026-09-26・利用者の指示/実機ログ debug_log_20260926_144540】手順を入れ替えても図は
+        # 変わらないのに、提示の順番どおりでないと中断していた。Sの代わりにSをHOLDして次の手の
+        # Tを図の位置に置いた場合も、残り(S Z O J)を組み直して続けること。
+        worker, steps = self._reorder_setup(3, "Z", "S", ("O", "J", "L", "T", "I"))
+        self.assertIsNotNone(worker._opener, "手順の前後で中断した")
+        self.assertEqual(worker._opener.index, 3)
+        self.assertEqual(worker._opener_locks, 3)
+        remaining = sorted(st.piece for st in worker._opener.steps[3:])
+        self.assertEqual(remaining, sorted("SOJZ"))
+
+    def test_placing_a_piece_off_the_form_still_abandons_the_template(self) -> None:
+        # 図に無い位置に置いたら従来どおり中断する
+        worker, _steps = self._reorder_setup(((16, 4), (17, 4), (17, 5), (18, 4)), "Z", "S", ("O", "J", "L", "T", "I"))
+        self.assertIsNone(worker._opener)
+
+    def test_dpc_fills_in_the_seventh_piece_from_the_bag_head(self) -> None:
+        # 【2026-09-26・実機ログ debug_log_20260926_174815 1136行目】操作ミノO・NEXT J L I T S・HOLD Z
+        # (前の袋の繰り越し)で、7個目(Z)を補えず「DPC該当なし」になった。袋の先頭は操作ミノ。
+        from src.engine.openers import choose_dpc
+
+        self.assertIsNone(choose_dpc(list("OJLITS"), "Z"), "前提: 6個ではDPCの図が見つからない")
+        worker, _received = self._opener_worker()
+        worker._opener_locks = 20
+        self.cold_clear.poll_suggestion.return_value = _move("A")
+        rec = _recognition(current_piece="O", hold_piece="Z", next_queue=("J", "L", "I", "T", "S"))
+        with patch("src.app.time.monotonic", return_value=1000.0):
+            with patch("src.app.recognize", return_value=rec):
+                worker._tick_once(capture=MagicMock())
+        self.assertIsNotNone(worker._opener, "DPCが始まっていない")
+        self.assertEqual(worker._opener.template.name_ja, "DPC")
+
+    def test_perfect_clear_is_searched_after_a_cannon_only_third_bag(self) -> None:
+        # 【2026-09-26・実機ログ debug_log_20260926_174815 612〜657行目】3巡目が砲のみ(TSDだけ)に
+        # 縮小されて終わった後も、続きの図が無ければパフェを探すこと
+        from src.engine import openers
+
+        meiso = next(t for t in openers.OPENER_TEMPLATES if t.name_ja == "迷走砲")
+        worker, _received = self._opener_worker()
+        rows = ["......OOJI", "S..Z..OOJI", "SSZZ...JJI", "ILLST.JJOO"]
+        board = tuple((16 + i, c) for i, row in enumerate(rows) for c, ch in enumerate(row) if ch != ".")
+        rec = _recognition(current_piece="L", hold_piece="S", next_queue=("O", "J", "I", "T", "Z"), filled_cells=board)
+        self.cold_clear.poll_suggestion.return_value = _move("A")
+        with patch("src.app.recognize", return_value=rec):
+            with patch("src.app.time.monotonic", return_value=1000.0):
+                worker._tick_once(capture=MagicMock())
+            worker._opener_continuing = meiso
+            worker._opener_finished_section = "理想形 > 3巡目 - パフェ狙い"
+            with patch("src.app.time.monotonic", return_value=1000.2):
+                worker._tick_once(capture=MagicMock())
+        self.assertIsNotNone(worker._pc_search)
+        worker._pc_search.cancel.set()
+
     def test_opener_overrides_the_ai_suggestion_at_game_start(self) -> None:
         # 盤面・HOLDが空で1巡目のミノ順が分かる手番では、組めるテンプレの
         # 手をAIの提案の代わりに出し、テンプレ名をラベルに載せること。
@@ -1818,7 +2108,8 @@ class TestAssistWorkerTickOnce(unittest.TestCase):
                 worker._tick_once(capture=MagicMock())  # 盤面を確定
         self.assertEqual(worker._opener.index, 1)
         self.assertEqual(worker._opener_locks, 1, "固定を確認するたびに数える")
-        # 手順と異なる場所に1ミノ置いた → 中断 → 袋の位置は不明に戻る
+        # 手順と異なる場所に1ミノ置いた → 中断。【2026-09-26】以後もAI提示の手として
+        # 数え続ける(DPCの判定に使う)ので、中断の固定も含めて2個
         wrong = first_cells + ((17, 6), (17, 7), (16, 6), (16, 7))
         with patch("src.app.time.monotonic", return_value=1001.0):
             with patch(
@@ -1829,7 +2120,7 @@ class TestAssistWorkerTickOnce(unittest.TestCase):
                 with patch("src.app.time.monotonic", return_value=1001.2):
                     worker._tick_once(capture=MagicMock())  # 盤面を確認
         self.assertIsNone(worker._opener, "手順と異なる盤面で中断していない")
-        self.assertIsNone(worker._opener_locks, "中断後も袋の位置を覚えている")
+        self.assertEqual(worker._opener_locks, 2, "中断した固定も数える")
 
     def test_reduced_opener_form_is_labeled_as_cannon_only(self) -> None:
         # 【2026-09-14実機】「パフェ狙い」の図なのにパフェにならない手が出た。
@@ -2954,3 +3245,25 @@ class TestAssistWorkerTickOnce(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestGarbageRowCount(unittest.TestCase):
+    """【2026-09-26・実機ログ debug_log_20260926_173733】消去演出で灰色に読まれた全埋まり行はおじゃまではない。"""
+
+    def test_fully_filled_gray_rows_are_not_garbage(self) -> None:
+        from src.app import _garbage_row_count
+
+        board = BoardState()
+        for r in (18, 19):
+            for c in range(10):
+                board.grid[r][c] = "GARBAGE"
+        self.assertEqual(_garbage_row_count(board), 0)
+
+    def test_garbage_rows_with_a_hole_are_counted(self) -> None:
+        from src.app import _garbage_row_count
+
+        board = BoardState()
+        for r in (18, 19):
+            for c in range(10):
+                board.grid[r][c] = None if c == 3 else "GARBAGE"
+        self.assertEqual(_garbage_row_count(board), 2)

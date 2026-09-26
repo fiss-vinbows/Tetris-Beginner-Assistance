@@ -370,3 +370,23 @@ class TestFirstBagAvoidsSoftDrop(unittest.TestCase):
                 continue
             _tpl, form, steps = chosen
             self.assertEqual(tuck_count(form.existing, steps), 0, f"{''.join(perm)}: 1巡目に回転入れがある")
+
+
+class TestAssistMeisoLeftOnly(unittest.TestCase):
+    """【2026-09-26・利用者の指示】支援モードの迷走砲は1巡目のIを左に置く図だけ。シミュレーターは従来どおり。"""
+
+    def test_assist_never_chooses_meiso_with_i_on_the_right(self) -> None:
+        chosen_meiso = 0
+        for perm in itertools.permutations("IOTSZJL"):
+            chosen = choose_opener(list(perm))
+            if chosen is None or chosen[0].name_ja != "迷走砲":
+                continue
+            chosen_meiso += 1
+            i_cols = {c for step in chosen[2] if step.piece == "I" for _r, c in step.cells}
+            self.assertEqual(i_cols, {0}, f"{''.join(perm)}: Iが左端以外 {i_cols}")
+        self.assertGreater(chosen_meiso, 0)
+
+    def test_simulator_templates_keep_the_mirrored_meiso(self) -> None:
+        meiso = _template("迷走砲")
+        first = [f for f in meiso.forms if f.section.startswith("1巡目")]
+        self.assertTrue(any("i" in line[-1] for f in first for line in f.text.splitlines()))

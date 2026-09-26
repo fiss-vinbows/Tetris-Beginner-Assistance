@@ -31,6 +31,7 @@ from src.engine.openers import (
     OpenerForm,
     OpenerStep,
     OpenerTemplate,
+    carried_pieces,
     choose_form,
     full_rows_after,
     known_sequence,
@@ -160,20 +161,6 @@ def bag_status(placed: int, hold: str | None, current_index: int | None = None, 
     if placed % 7 == 6 and hold is not None:
         return "DPC"
     return "袋ずれ"
-
-
-def carried_pieces(form: OpenerForm) -> frozenset[str]:
-    """DPCの図で繰り越したミノの候補(図の大文字。Tスピンの'U'と既存ブロックの'C'は除く)。
-
-    大文字が2種類ある図(S-13bのT・S等)は、どちらかを繰り越していれば使える扱いにする。
-    大文字の無い図(文献で繰り越しのOを小文字で描いたO-02等)は、パターン名の先頭(O-02のO)
-    で判断する。J・Sの系統は左右反転の図も同じ名前なのでJ/L・S/Zのどちらでもよい。
-    """
-    letters = frozenset(ch for ch in form.text if ch.isupper() and ch not in "UC")
-    if letters:
-        return letters
-    group = form.section[:1]
-    return frozenset({"J": "JL", "S": "SZ"}.get(group, group))
 
 
 def startable_template(
