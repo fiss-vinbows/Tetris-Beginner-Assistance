@@ -390,3 +390,25 @@ class TestAssistMeisoLeftOnly(unittest.TestCase):
         meiso = _template("迷走砲")
         first = [f for f in meiso.forms if f.section.startswith("1巡目")]
         self.assertTrue(any("i" in line[-1] for f in first for line in f.text.splitlines()))
+
+
+class TestPlanPrefersTetris(unittest.TestCase):
+    """【2026-09-26・利用者の指摘】回転入れの数が同じなら、テトリスを含む順番を優先する。"""
+
+    def test_i_is_saved_for_the_tetris(self) -> None:
+        # DPC I-05 くるまDPC > パフェ(右端にIの井戸)で、残りが O・J・I、操作ミノ I・HOLD J。
+        # 以前は I → O → J(H) と先にIを差し込み2行だけ消していた。J(H) → O → I(H) ならテトリス。
+        from src.engine.openers import EDUCATION_TEMPLATES, FormItem, OpenerForm, plan_form
+
+        dpc = next(t for t in EDUCATION_TEMPLATES if t.name_ja == "DPC")
+        form = next(
+            f for f in dpc.forms
+            if f.section == "I-05 くるまDPC > パフェ" and f.text.splitlines()[1] == "oollzzjjji"
+        )
+        rest = [it for it in form.items if it.piece in "OJI"]
+        board = set(form.existing) | {c for it in form.items if it.piece not in "OJI" for c in it.cells}
+        steps = plan_form(OpenerForm(form.section, frozenset(), tuple(rest), form.text), list("IOLTZS"), "J", placed=board)
+        self.assertIsNotNone(steps)
+        self.assertEqual([s.piece for s in steps], ["J", "O", "I"])
+        self.assertEqual(steps[-1].cells, next(it for it in rest if it.piece == "I").cells)
+        self.assertIsInstance(rest[0], FormItem)

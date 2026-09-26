@@ -363,21 +363,33 @@ def plan_form(
     # で置ける位置があるのに回転入れの位置を推奨することがあった。Tスピンの手は
     # 避けられないので数えない。同じ回数なら従来どおり操作中のミノを先に試す順。
     # 状態(何番目のミノか・HOLD・置いた図のミノ)ごとに結果を覚えて探索を抑える。
-    memo: dict[tuple, tuple[int, list[OpenerStep]] | None] = {}
+    # 【2026-09-26・利用者の指摘(ブラウザー版 DPC I-05 パフェ)】回転入れの数が同じなら、テトリス
+    # (4行同時消去)を含む順番を優先する。以前は操作中のミノを先に置く順を選んだため、Iを最後に
+    # 回せばテトリスでパフェになる図でも、先にIを差し込んで2行だけ消す手順を案内していた。
+    # 評価は (回転入れの数, -テトリスの数) の小さい方。パフェ探索のテトリス優先と同じ考え方。
+    memo: dict[tuple, tuple[tuple[int, int], list[OpenerStep]] | None] = {}
 
     def tuck_cost(item: FormItem, current_placed: set[tuple[int, int]]) -> int:
         return 0 if item.spin or _can_hard_drop(current_placed, item.cells) else 1
 
+    def is_tetris(item: FormItem, current_placed: set[tuple[int, int]]) -> bool:
+        """このミノで4行が同時に揃う(図の座標のまま。揃った行は置いた後も残っている扱い)。"""
+        after = current_placed | set(item.cells)
+        rows = {r for r, _c in item.cells}
+        return sum(1 for r in rows if all((r, c) in after for c in range(BOARD_COLS))) == 4
+
     def search(index: int, hold_piece: str | None, current_placed: set[tuple[int, int]], done: frozenset[int]):
         if len(done) == len(items):
-            return 0, []
+            return (0, 0), []
         if index >= len(sequence):
             return None
         key = (index, hold_piece, done)
         if key in memo:
             return memo[key]
         current = sequence[index]
-        best: tuple[int, list[OpenerStep]] | None = None
+        best: tuple[tuple[int, int], list[OpenerStep]] | None = None
+        # これ以上良くならない評価(回転入れ0、残りのIがすべてテトリス)。見つかったら探索を打ち切る。
+        ideal = (0, -sum(1 for i, it in enumerate(items) if i not in done and it.piece == "I"))
 
         def consider(i: int, piece: str, use_hold: bool, next_index: int, next_hold: str | None) -> None:
             nonlocal best
@@ -385,28 +397,28 @@ def plan_form(
             rest = search(next_index, next_hold, current_placed | set(item.cells), done | {i})
             if rest is None:
                 return
-            cost = rest[0] + tuck_cost(item, current_placed)
+            cost = (rest[0][0] + tuck_cost(item, current_placed), rest[0][1] - is_tetris(item, current_placed))
             if best is None or cost < best[0]:
                 best = (cost, [OpenerStep(piece, item.cells, use_hold, item.spin)] + rest[1])
 
         # 1) 操作中のミノをそのまま置く
         for i in candidates(current, current_placed, done):
             consider(i, current, False, index + 1, hold_piece)
-            if best is not None and best[0] == 0:
+            if best is not None and best[0] == ideal:
                 break
         # 2) ホールドして、出てきたミノを置く
-        if best is None or best[0] > 0:
+        if best is None or best[0] != ideal:
             if hold_piece is None:
                 if index + 1 < len(sequence):
                     nxt = sequence[index + 1]
                     for i in candidates(nxt, current_placed, done):
                         consider(i, nxt, True, index + 2, current)
-                        if best is not None and best[0] == 0:
+                        if best is not None and best[0] == ideal:
                             break
             else:
                 for i in candidates(hold_piece, current_placed, done):
                     consider(i, hold_piece, True, index + 1, current)
-                    if best is not None and best[0] == 0:
+                    if best is not None and best[0] == ideal:
                         break
         memo[key] = best
         return best
