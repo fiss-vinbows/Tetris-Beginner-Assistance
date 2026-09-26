@@ -100,10 +100,10 @@ class TestFirstBagFormsNeedAlignedBag(unittest.TestCase):
 
 class TestEducationOnlyTemplates(unittest.TestCase):
     def test_vision_templates_are_unchanged(self) -> None:
-        self.assertEqual([t.name_ja for t in OPENER_TEMPLATES], ["迷走砲", "はちみつ砲", "山岳積み2号", "オリーブ積み"])
+        self.assertEqual([t.name_ja for t in OPENER_TEMPLATES], ["迷走砲", "はちみつ砲", "山岳積み2号", "オリーブ積み", "ガムシロ積み"])
         self.assertEqual([t.name_ja for t in EDUCATION_TEMPLATES], ["開幕パフェ積み", "DPC"])
         self.assertEqual(
-            [t.name_ja for t in candidate_templates()], ["迷走砲", "はちみつ砲", "山岳積み2号", "開幕パフェ積み", "DPC"]
+            [t.name_ja for t in candidate_templates()], ["迷走砲", "はちみつ砲", "山岳積み2号", "ガムシロ積み", "開幕パフェ積み", "DPC"]
         )
         dpc = EDUCATION_TEMPLATES[1]
         self.assertTrue(any("組み方" in f.section for f in dpc.forms))

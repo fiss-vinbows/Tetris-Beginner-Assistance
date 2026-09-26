@@ -228,6 +228,37 @@ OPENER_SOURCE_FORMS: tuple[tuple[str, str, str, tuple[tuple[str, str], ...]], ..
             ("組み方とミノ順 > 1パターン確定 > 3巡目", "\n".join(('----------', 'oostttzjjj', 'oosslzzccj', 'cccclzcccc', 'cccsllcccc', 'cccctccccc'))),
         ),
     ),
+    (
+        # 【2026-09-26・利用者の指示】TD系のうち、ガムシロ積みを追加(tools/import_opener_page.py で抜き出し)。
+        # ページに見出しの無い3巡目の図・インペリアルクロスの図には、内容に合わせたセクション名を付けた。
+        # 既存ブロックだけの図(TST後の地形)は収録しない。
+        "ガムシロ積み",
+        "Gamushiro Stacking",
+        "https://shiwehi.com/tetris/template/gamushiro.php",
+        (
+            ("1巡目とミノ順", "\n".join(('----------', '----------', 's------i--', 'ss----ti--', 'js-zzttioo', 'jjj-zztioo'))),
+            ("1巡目とミノ順", "\n".join(('----------', '----------', '--i------z', '--it----zz', 'ooittss-zl', 'ooitss-lll'))),
+            ("2巡目パフェルート", "\n".join(('----------', 'cLLjjsscoo', 'ccLjssccoo', 'ccLccccccc', 'cccjcccccc'))),
+            ("2巡目パフェルート", "\n".join(('----------', 'cLLiiiicoo', 'ccLlllccoo', 'ccLccccccc', 'ccclcccccc'))),
+            ("2巡目パフェルート", "\n".join(('----------', 'cjjjtttcoo', 'ccLLLtccoo', 'ccLccccccc', 'cccjcccccc'))),
+            ("通常ルート(2巡目→3巡目) > %L>%Oの場合 > 2巡目", "\n".join(('i-------oo', 'i-------oo', 'ijj-----ll', 'ij----ssLl', 'cj-zzsscLl', 'cc--zzccLL', 'cc-ccccccc', 'ccc-cccccc'))),
+            ("通常ルート(2巡目→3巡目) > %L>%Oの場合 > 2巡目", "\n".join(('c-------cc', 'c-------cc', 'ccc-----cc', 'cc----cccc', 'CCUCCCCCCC', 'CCUUCCCCCC', 'CCUCCCCCCC', 'ccc-cccccc'))),
+            ("通常ルート(2巡目→3巡目) > %O>%T%Lの場合 > 2巡目", "\n".join(('i-------ll', 'i-------Ll', 'ijj-----Ll', 'ij----ssLL', 'cj-zzsscoo', 'cc--zzccoo', 'cc-ccccccc', 'ccc-cccccc'))),
+            ("通常ルート(2巡目→3巡目) > %O>%T%Lの場合 > 2巡目", "\n".join(('c-------cc', 'c-------cc', 'ccc-----cc', 'cc----cccc', 'CCUCCCCCCC', 'CCUUCCCCCC', 'CCUCCCCCCC', 'ccc-cccccc'))),
+            ("通常ルート(2巡目→3巡目) > 3巡目 - パフェ狙い", "\n".join(('cjiiiillcc', 'cjjjsszlcc', 'cccsszzlcc', 'cctttzcccc', 'ccctcccccc'))),
+            ("通常ルート(2巡目→3巡目) > 3巡目 - パフェ狙い", "\n".join(('cjiiiioocc', 'cjjjssoocc', 'cccsslllcc', 'cctttlcccc', 'ccctcccccc'))),
+            ("通常ルート(2巡目→3巡目) > 3巡目 - パフェ狙い", "\n".join(('ciiiilllcc', 'cjjjsloocc', 'cccjssoocc', 'cctttscccc', 'ccctcccccc'))),
+            ("通常ルート(2巡目→3巡目) > 3巡目 - パフェ狙い", "\n".join(('coojjtttcc', 'coojsstlcc', 'cccsslllcc', 'cciiiicccc', 'cccjcccccc'))),
+            ("通常ルート(2巡目→3巡目) > 3巡目 - パフェ狙い", "\n".join(('ciiiizoocc', 'cjjjzzoocc', 'cccjzlllcc', 'cctttlcccc', 'ccctcccccc'))),
+            ("通常ルート(2巡目→3巡目) > 3巡目 - パフェ狙い", "\n".join(('cjzziiiicc', 'cjjjlloocc', 'ccczzloocc', 'cctttlcccc', 'ccctcccccc'))),
+            ("通常ルート(2巡目→3巡目) > 3巡目 - パフェ狙い", "\n".join(('coojssllcc', 'coojjjzlcc', 'cccsszzlcc', 'cctttzcccc', 'ccctcccccc'))),
+            ("通常ルート(2巡目→3巡目) > 3巡目 - パフェ狙い", "\n".join(('coozzsllcc', 'coojjsslcc', 'cccjzzslcc', 'cciiiicccc', 'cccjcccccc'))),
+            ("通常ルート(2巡目→3巡目) > インペリアルクロス", "\n".join(('i---------', 'i---------', 'i---------', 'i---ss----', 'c--sszoocc', 'c---zzoocc', 'ccc-zlllcc', 'cc---lcccc', 'ccc-cccccc'))),
+            ("通常ルート(2巡目→3巡目) > インペリアルクロス", "\n".join(('----------', '------i---', '------i-oo', '----ssijoo', 'c--sszijcc', 'c---zzjjcc', 'ccc-zlllcc', 'cc---lcccc', 'ccc-cccccc'))),
+            ("妥協ルート(2巡目) > %L>%Oの場合 > 2巡目", "\n".join(('-------l--', '-------l--', '-------ll-', '-------ooi', '-jj----ooi', '-j----ssLi', 'cj-zzsscLi', 'cc--zzccLL', 'cc-ccccccc', 'ccc-cccccc'))),
+            ("妥協ルート(2巡目) > %L>%Oの場合 > 2巡目", "\n".join(('-------c--', '-------c--', '-------cc-', '-------ccc', '-cc----ccc', '-c----cccc', 'CCUCCCCCCC', 'CCUUCCCCCC', 'CCUCCCCCCC', 'ccc-cccccc'))),
+        ),
+    ),
 )
 
 

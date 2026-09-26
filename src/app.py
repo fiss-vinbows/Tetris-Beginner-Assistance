@@ -4565,7 +4565,7 @@ class MainWindow(QtWidgets.QWidget):
             )
             layout.addWidget(self.record_video_checkbox)
 
-        self.opener_checkbox = QtWidgets.QCheckBox("開幕テンプレを提示する(はちみつ砲・迷走砲・山岳積み2号・オリーブ積み・パフェ後のDPC)")
+        self.opener_checkbox = QtWidgets.QCheckBox("開幕テンプレを提示する(はちみつ砲・迷走砲・山岳積み2号・オリーブ積み・ガムシロ積み・パフェ後のDPC)")
         self.opener_checkbox.setChecked(True)
 
         depth_row = QtWidgets.QHBoxLayout()
