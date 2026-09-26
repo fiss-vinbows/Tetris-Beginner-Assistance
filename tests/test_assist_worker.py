@@ -1962,6 +1962,24 @@ class TestAssistWorkerTickOnce(unittest.TestCase):
         self.assertIsNotNone(worker._opener, "DPCが始まっていない")
         self.assertEqual(worker._opener.template.name_ja, "DPC")
 
+    def test_dpc_starts_after_holding_right_after_the_perfect_clear(self) -> None:
+        # 【2026-09-26・利用者の指摘】パフェ直後にHOLDして、操作ミノS(繰り越し)・HOLD T(袋の先頭)に
+        # 入れ替わった手番でも、組めるDPCを案内すること(この手番はHOLD済みなのでHOLDしない手順)
+        worker, _received = self._opener_worker()
+        self.cold_clear.poll_suggestion.return_value = _move("A")
+        rec = _recognition(current_piece="S", hold_piece="T", next_queue=("I", "L", "O", "Z", "S"))
+        with patch("src.app.recognize", return_value=rec):
+            with patch("src.app.time.monotonic", return_value=1000.0):
+                worker._tick_once(capture=MagicMock())
+            worker._opener_locks = 20
+            worker._disallow_hold_active = True
+            with patch("src.app.time.monotonic", return_value=1000.2):
+                worker._tick_once(capture=MagicMock())
+        self.assertIsNotNone(worker._opener, "DPCが始まっていない")
+        self.assertEqual(worker._opener.template.name_ja, "DPC")
+        self.assertEqual(worker._opener.steps[0].piece, "S")
+        self.assertFalse(worker._opener.steps[0].use_hold)
+
     def test_perfect_clear_is_searched_after_a_cannon_only_third_bag(self) -> None:
         # 【2026-09-26・実機ログ debug_log_20260926_174815 612〜657行目】3巡目が砲のみ(TSDだけ)に
         # 縮小されて終わった後も、続きの図が無ければパフェを探すこと

@@ -412,3 +412,19 @@ class TestPlanPrefersTetris(unittest.TestCase):
         self.assertEqual([s.piece for s in steps], ["J", "O", "I"])
         self.assertEqual(steps[-1].cells, next(it for it in rest if it.piece == "I").cells)
         self.assertIsInstance(rest[0], FormItem)
+
+
+class TestDpcAfterHoldSwap(unittest.TestCase):
+    """【2026-09-26・利用者の指摘】パフェ直後にHOLDして操作ミノとHOLDが入れ替わってもDPCを組む。"""
+
+    def test_carried_piece_on_the_current_side(self) -> None:
+        from src.engine.openers import carried_pieces, choose_dpc
+
+        # HOLD後: 操作ミノS(前の袋の繰り越し)、HOLD T(袋の先頭・使用済み)、NEXT I L O Z S、7個目J
+        sequence = list("SILOZSJ")
+        chosen = choose_dpc(sequence, "T", carried="S", can_hold=False)
+        self.assertIsNotNone(chosen)
+        _template, form, steps = chosen
+        self.assertIn("S", carried_pieces(form), "繰り越したSの組み方の図を使う")
+        self.assertEqual(steps[0].piece, "S")
+        self.assertFalse(steps[0].use_hold, "この手番はHOLD済み")

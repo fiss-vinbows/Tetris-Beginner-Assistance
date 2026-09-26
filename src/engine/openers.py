@@ -273,6 +273,7 @@ def plan_form(
     hold: str | None,
     placed: set[tuple[int, int]] | None = None,
     allow_tuck: bool | None = None,
+    can_hold: bool = True,
 ) -> list[OpenerStep] | None:
     """実際のミノ順(先頭が操作中のミノ)とホールドに対して、図を組む手順を返す。
 
@@ -286,6 +287,8 @@ def plan_form(
     ハードドロップでは入らない置き方を前提にした形があるため(迷走砲の
     2巡目)。ページに明記のないミノは、入れ方が実際にあるか分からない
     (張り出しの下へ横から入れられるとは限らない)ので許さない。
+
+    can_hold: この手番でまだHOLDできるか(HOLD済みなら最初の手はHOLDしない)。
     """
     if allow_tuck is None:
         # まずハードドロップだけで組める順番を探し、無ければSRSで実際に入れられる
@@ -295,9 +298,9 @@ def plan_form(
         # そのため「Jの下へSを回転入れ」前提でしか組めないミノ順(はちみつ砲の
         # 2巡目 J L T I S Z O・HOLD=L)で図が見つからずAIに切り替わっていた。
         # 入れられない位置(2026-09-12の不具合)はSRSの到達判定で防ぐ。
-        strict = plan_form(form, sequence, hold, placed, allow_tuck=False)
+        strict = plan_form(form, sequence, hold, placed, allow_tuck=False, can_hold=can_hold)
         if strict is None:
-            strict = plan_form(form, sequence, hold, placed, allow_tuck=True)
+            strict = plan_form(form, sequence, hold, placed, allow_tuck=True, can_hold=can_hold)
         if strict is not None or form.required is None:
             return strict
         # 図どおりに全部は置けない。Tスピンに必要なミノだけの図で探し直す
@@ -309,7 +312,7 @@ def plan_form(
             form.text,
             form.tuck_pieces,
         )
-        return plan_form(reduced, sequence, hold, placed)
+        return plan_form(reduced, sequence, hold, placed, can_hold=can_hold)
 
     placed_cells = set(placed) if placed is not None else set(form.existing)
     items = form.items
@@ -407,7 +410,7 @@ def plan_form(
             if best is not None and best[0] == ideal:
                 break
         # 2) ホールドして、出てきたミノを置く
-        if best is None or best[0] != ideal:
+        if (best is None or best[0] != ideal) and (can_hold or index > 0):
             if hold_piece is None:
                 if index + 1 < len(sequence):
                     nxt = sequence[index + 1]
@@ -469,6 +472,7 @@ def choose_form(
     board_cells: set[tuple[int, int]],
     sequence: list[str],
     hold: str | None,
+    can_hold: bool = True,
 ) -> tuple[OpenerForm, list[OpenerStep]] | None:
     """今の盤面(おじゃまを除く占有)に既存ブロックが一致し、ミノ順で組める図を返す。
 
@@ -499,7 +503,7 @@ def choose_form(
                 continue
         elif not form.existing <= target or len(target - form.existing) >= 4:
             continue
-        steps = plan_form(form, sequence, hold)
+        steps = plan_form(form, sequence, hold, can_hold=can_hold)
         if steps is not None:
             cost = tuck_count(form.existing, steps)
             if best is None or cost < best[0]:
@@ -559,23 +563,31 @@ def carried_pieces(form: OpenerForm) -> frozenset[str]:
 DPC_TEMPLATE_NAME = "DPC"
 
 
-def choose_dpc(sequence: list[str], hold: str | None) -> tuple[OpenerTemplate, OpenerForm, list[OpenerStep]] | None:
+def choose_dpc(
+    sequence: list[str], hold: str | None, carried: str | None = None, can_hold: bool = True
+) -> tuple[OpenerTemplate, OpenerForm, list[OpenerStep]] | None:
     """パフェ直後(空の盤面・HOLDに前の袋のミノを繰り越し)から組めるDPCの組み方の図と手順。
 
     袋の区切りがそろっているかは呼び出し側が確かめる。図は、繰り越したミノ(図の大文字)が
     HOLDのミノと一致するものだけ使う(シミュレーターのstartable_templateと同じ条件)。
     戻り値のテンプレは続きの図(既存ブロックのある図)も含むので、続きの探索にそのまま使える。
+
+    carried: 繰り越したミノ(前の袋のミノ)。省略時はHOLDのミノ。【2026-09-26・利用者の指摘】パフェ直後に
+    HOLDして操作ミノ(袋の先頭)とHOLDを入れ替えると、繰り越したミノは操作ミノ側に来る。以前はHOLDのミノ
+    だけで図を選んだため、組めるDPCを案内しなかった。can_hold: この手番でまだHOLDできるか。
     """
     if hold is None:
         return None
+    if carried is None:
+        carried = hold
     template = next((t for t in EDUCATION_TEMPLATES if t.name_ja == DPC_TEMPLATE_NAME), None)
     if template is None:
         return None
     forms = tuple(
-        f for f in template.forms if f.existing or (hold in carried_pieces(f) and not f.is_spin_only())
+        f for f in template.forms if f.existing or (carried in carried_pieces(f) and not f.is_spin_only())
     )
     template = replace(template, forms=forms)
-    chosen = choose_form(template, set(), sequence, hold)
+    chosen = choose_form(template, set(), sequence, hold, can_hold=can_hold)
     if chosen is None:
         return None
     form, steps = chosen

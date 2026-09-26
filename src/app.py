@@ -3899,10 +3899,16 @@ class AssistWorker(QtCore.QThread):
                 # 【2026-09-26・実機ログ debug_log_20260926_174815 1136行目】HOLDは前の袋からの繰り越しで、
                 # 袋の先頭は操作ミノと確定している。HOLDを除いて7個目を補う(known_sequenceはHOLDと
                 # 操作ミノのどちらが先頭か決められないと補わず、6個ではDPCの図が見つからなかった)。
-                dpc_sequence = known_sequence(
-                    self._last_current_piece, recognition.next_queue, None, self._opener_locks + 1
-                )
-                chosen = choose_dpc(dpc_sequence or sequence, hold)
+                # 【2026-09-26・利用者の指摘】パフェ直後に(図が選ばれる前に)HOLDすると、操作ミノ(繰り越し)と
+                # HOLD(袋の先頭)が入れ替わる。以前はHOLDのミノを繰り越しとみなしてDPCを組めないと判定した。
+                # この手番でHOLD済みなら入れ替わった形として、袋の先頭で7個目を補い、HOLDしない手順で組む。
+                swapped = self._disallow_hold_active
+                head = hold if swapped else self._last_current_piece
+                carried = self._last_current_piece if swapped else hold
+                dpc_sequence = known_sequence(head, recognition.next_queue, None, self._opener_locks + 1)
+                if swapped and dpc_sequence is not None:
+                    dpc_sequence = [self._last_current_piece, *dpc_sequence[1:]]
+                chosen = choose_dpc(dpc_sequence or sequence, hold, carried=carried, can_hold=not swapped)
                 if chosen is None:
                     if self._opener_declined_sequence != sequence:
                         self._opener_declined_sequence = sequence
