@@ -69,14 +69,36 @@ class TestGamepadInputs(unittest.TestCase):
 
 class TestPracticeWindow(unittest.TestCase):
     def setUp(self) -> None:
+        self.window = self._make_window()
+
+    @staticmethod
+    def _make_window() -> PracticeWindow:
         from src.education.advisor import Advisor
 
         # 推奨手のAI(CC2)は起動せず、何も返さない偽物を使う
         fake = type("E", (), {"start_thinking": lambda *a, **k: None, "poll_suggestion": lambda *a: None, "close": lambda s: None})
-        self.window = PracticeWindow(seed=5, advisor=Advisor(engine_factory=fake, opener_enabled=False))
-        self.window.isActiveWindow = lambda: True  # offscreenでは常に非アクティブになるため
-        self.window.bindings = dict(keybindings.DEFAULT_BINDINGS)
-        self.window.repeat = dict(keybindings.DEFAULT_REPEAT)  # 利用者の保存済み設定に左右されないように
+        window = PracticeWindow(seed=5, advisor=Advisor(engine_factory=fake, opener_enabled=False))
+        window.isActiveWindow = lambda: True  # offscreenでは常に非アクティブになるため
+        window.bindings = dict(keybindings.DEFAULT_BINDINGS)
+        window.repeat = dict(keybindings.DEFAULT_REPEAT)  # 利用者の保存済み設定に左右されないように
+        # 【2026-09-27】_on_tickが実機のコントローラーを読むと、テスト中に触った入力で盤面が動いて落ちていた。
+        # つながっていない偽物に差し替える(コントローラーの動作は_handle_pad_actionsを直接呼んで確かめる)
+        window.pad = type("P", (), {"find": lambda s: False, "connected": lambda s: False, "poll": lambda s: set()})()
+        return window
+
+    def test_controller_held_on_the_real_device_does_not_affect_tests(self) -> None:
+        # 実機のコントローラーでハードドロップが押されたままでも、テスト用の窓は_on_tickで動かない
+        from unittest import mock
+
+        from src.education import gamepad
+
+        with mock.patch.multiple(
+            gamepad.Gamepad, find=lambda s: True, connected=lambda s: True, poll=lambda s: {"Button1"}
+        ), mock.patch.object(gamepad, "load_pad_bindings", lambda *a, **k: {"hard_drop": ["Button1"]}):
+            window = self._make_window()
+            for _ in range(3):
+                window._on_tick()
+        self.assertEqual(window.state.history, [], "実機のコントローラーの入力がテストに混ざっている")
 
     def test_keys_drive_the_game_state(self) -> None:
         state = self.window.state
