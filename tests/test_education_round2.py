@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from dataclasses import replace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -639,3 +640,28 @@ class TestBagStatusByPieceIndex(unittest.TestCase):
         self.assertIn("袋ずれ", labels[PC_ID], "ループが崩れるテトリスパフェを「開幕へ」と表示した")
         self.assertIn("開幕へ", labels["DPC"])
         self.assertEqual(advisor.active_id, PC_ID, "テトリスパフェの優先はそのまま(利用者の指示)")
+
+
+class TestPreferOlderSamePiece(unittest.TestCase):
+    """【2026-09-27】操作ミノとHOLDが同じ種類でHOLDが古い袋のミノなら、HOLDして古いほうを置く(パフェ後の袋ずれ防止)。"""
+
+    def _state(self, hold_index: int, current_index: int, hold_used: bool = False) -> GameState:
+        state = GameState.new(1)
+        state.current, state.hold = "J", "J"
+        state.hold_index, state.current_index, state.hold_used = hold_index, current_index, hold_used
+        return state
+
+    def test_older_piece_in_hold_is_placed_first(self) -> None:
+        from src.education.advisor import _prefer_older_same_piece
+
+        rec = Recommendation(piece="J", use_hold=False, cells=((21, 0),), source="テンプレ DPC / 組み方", steps=("←", "ハードドロップ"))
+        got = _prefer_older_same_piece(self._state(6, 7), rec)
+        self.assertTrue(got.use_hold, "前の袋のJをHOLDに残したまま新しい袋のJを置かせている")
+        self.assertEqual(got.steps, ("ホールド", "←", "ハードドロップ"))
+        self.assertEqual(got.cells, rec.cells, "置く位置は変えない")
+        # HOLDのほうが新しい・HOLD済み・種類が違う場合はそのまま
+        self.assertIs(_prefer_older_same_piece(self._state(8, 7), rec), rec)
+        self.assertIs(_prefer_older_same_piece(self._state(6, 7, hold_used=True), rec), rec)
+        other = replace(rec, piece="L")
+        self.assertIs(_prefer_older_same_piece(self._state(6, 7), other), other)
+

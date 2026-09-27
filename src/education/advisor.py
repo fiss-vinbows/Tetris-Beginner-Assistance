@@ -131,6 +131,27 @@ def placed_count(sequence_index: int, hold: str | None) -> int:
     return sequence_index - 1 - (1 if hold is not None else 0)
 
 
+def _prefer_older_same_piece(state: GameState, rec: Recommendation | None) -> Recommendation | None:
+    """操作ミノとHOLDのミノが同じ種類で、HOLDのほうが古い袋のミノなら、HOLDして古いほうを置く案内にする。
+
+    【2026-09-27・利用者の指示(ブラウザー版で見つかった不具合の予防)】HOLDを使わない手を優先すると、
+    新しい袋のミノを置いて前の袋のミノをHOLDに残す。置く形は同じでも袋の区切りがずれ、それがパフェの
+    最後の1手だと、パフェ後に開幕テンプレを始められない(bag_status が「袋ずれ」になる)。
+    """
+    if (
+        rec is None
+        or rec.use_hold
+        or state.hold_used
+        or state.hold != rec.piece
+        or state.current != rec.piece
+        or state.hold_index is None
+        or state.current_index is None
+        or state.hold_index >= state.current_index
+    ):
+        return rec
+    return replace(rec, use_hold=True, steps=None if rec.steps is None else ("ホールド", *rec.steps))
+
+
 def bag_status(placed: int, hold: str | None, current_index: int | None = None, hold_index: int | None = None) -> str:
     """袋の区切りから、次に組めるテンプレの種類。
 
@@ -289,6 +310,9 @@ class Advisor:
 
     # ---- 公開 ----
     def update(self, state: GameState, now: float | None = None) -> Recommendation | None:
+        return _prefer_older_same_piece(state, self._update(state, now))
+
+    def _update(self, state: GameState, now: float | None = None) -> Recommendation | None:
         now = time.monotonic() if now is None else now
         if state.game_over:
             return None
