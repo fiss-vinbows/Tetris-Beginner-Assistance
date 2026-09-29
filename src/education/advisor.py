@@ -19,13 +19,14 @@
 
 from __future__ import annotations
 
+import copy
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 
 import src.engine.openers as openers
-from src.education.rules import COLS, HIDDEN_ROWS, NEXT_VISIBLE, ROWS, Cell, GameState
+from src.education.rules import COLS, HIDDEN_ROWS, NEXT_VISIBLE, PIECES, ROWS, Cell, GameState
 from src.engine.board_state import BoardState
 from src.engine.openers import (
     OpenerForm,
@@ -39,7 +40,8 @@ from src.engine.openers import (
     shift_cells_for_clears,
     tuck_count,
 )
-from src.education.pc_search import TIMEOUT, find_perfect_clear, has_tetris
+from src.education.pc_odds import best_odds_move
+from src.education.pc_search import TIMEOUT, PCStep, find_perfect_clear, has_tetris
 from src.education.six_three import WELL_COL, best_move
 from src.engine.srs_reach import difficulty_mark, find_path, find_path_min_soft
 
@@ -50,6 +52,13 @@ MIN_THINK_SEC = 0.4
 AI_ID = "cc2"
 AI_LABEL = "ColdClear2"
 PC_ID = "pc"
+# 【2026-09-28・利用者の要望】継続パフェ(パフェの後に続けて取るパフェ)。見えないミノも含めて
+# 成功率が一番高い置き方を案内する(pc_odds.py)。5連続までを視野に、パフェ直後と、その案内に
+# 従っている間(と候補欄で選んでいる間)だけ計算する(1回に数秒かかるため)
+PC_ODDS_ID = "pc-odds"
+PC_ODDS_LABEL = "継続パフェ"
+ODDS_TIME_LIMIT = 1.0  # 計算の上限(秒)。【2026-09-29・利用者の指摘(少し遅い)】2秒から縮めた
+ODDS_AUTO_MIN = 0.5  # 自動で選ぶのは成功率がこれ以上のとき(低いときは候補欄に出すだけ)
 # 【2026-09-24・利用者の要望】6-3積み(左から7列目を井戸にしてテトリスで消す)。候補欄の1つ
 SIX_THREE_ID = "6-3"
 SIX_THREE_LABEL = "6-3積み"
@@ -58,7 +67,7 @@ EXCLUDED_TEMPLATES = frozenset({"オリーブ積み"})
 # パフェ後にHOLDへ繰り越したミノを使って組むテンプレ(1巡目の図はHOLDがあるときだけ使う)
 CARRY_TEMPLATES = frozenset({"DPC"})
 
-__all__ = ["AI_ID", "PC_ID", "SIX_THREE_ID", "Advisor", "Candidate", "Recommendation", "find_path", "rejoin_form"]
+__all__ = ["AI_ID", "PC_ID", "PC_ODDS_ID", "SIX_THREE_ID", "Advisor", "Candidate", "Recommendation", "find_path", "rejoin_form"]
 
 
 @dataclass(frozen=True)
@@ -75,6 +84,40 @@ class Recommendation:
     label: str = ""  # 候補欄の名前(空ならテンプレ名)
     after_pc: str | None = None  # パフェ後の袋の状態(パフェ以外はNone)
     tetris: bool = False  # テトリス(4列消し)を含むパフェ
+    # 【2026-09-29・利用者の指示】ブラウザー版のように、テンプレの図・パフェの手順で置く予定の
+    # ミノ(次の1手を含む)を盤面に薄く示す。(ミノ, 22行座標)を今の盤面の座標で並べる
+    guide: tuple[tuple[str, tuple[Cell, ...]], ...] = ()
+
+
+class _HypoSequence:
+    """先読み用のミノ列: 見えている範囲(known_until番まで)は元の列、その次に配られるミノは仮の種類。
+
+    未表示の配列を覗かないよう、見えている範囲より先を読もうとしたら LookupError にする。
+    """
+
+    def __init__(self, base, known_until: int, hypo: dict[int, str]) -> None:
+        self.base = base
+        self.known_until = known_until
+        self.hypo = hypo
+
+    def peek(self, index: int) -> str:
+        if index in self.hypo:
+            return self.hypo[index]
+        if index > self.known_until:
+            raise LookupError("先読みで未表示のミノを読もうとした")
+        return self.base.peek(index)
+
+    def __getattr__(self, name):
+        if name == "base":
+            raise AttributeError(name)  # 複製の途中(baseがまだ無い)で無限に呼び合わない
+        return getattr(self.base, name)
+
+
+@dataclass(frozen=True)
+class _OddsRecommendation(Recommendation):
+    """継続パフェの推奨手(成功率を持つ)。"""
+
+    odds_rate: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -295,9 +338,31 @@ class Advisor:
     _s63_rec: Recommendation | None = None
     _s63_future: object = None
     s63_pending: bool = False
+    # 継続パフェ(成功率つき)。odds_searchは計算の関数(テストでは差し替える)
+    odds_search: object = best_odds_move
+    _odds_rec: Recommendation | None = None
+    _odds_future: object = None
+    _odds_cancel: object = None
+    odds_pending: bool = False
+    # 手番(固定した数) → 継続パフェの残り手順(見えているミノで決まる分)。従っている間は計算し直さない
+    _odds_plans: dict = field(default_factory=dict)
+    _odds_meta: object = None  # 手順を計算したときの成功率など(OddsMove)
+    # 【2026-09-29・利用者の指示】先読み計算: 次の手番で計算が要るとき(パフェ・継続パフェの手順の最後の
+    # 1手)、案内どおりに置いた後の局面を、次にNEXTへ出うるミノ(袋の残りの種類)ごとに裏で計算しておく
+    prefetch_enabled: bool | None = None  # Noneなら画面(pc_async)のときだけ
+    _odds_cache: dict = field(default_factory=dict)  # 計算の入力 → 結果(OddsMove)
+    _prefetch: dict = field(default_factory=dict)  # 計算の入力 → (future, 打ち切りの合図)
+    _prefetch_executor: object = None
+    _prefetch_turn: object = None  # 先読みを始めた手番(同じ手番で二重に始めない)
+    _odds_key: object = None  # 計算中・表示中の継続パフェの入力
 
     def close(self) -> None:
         self._cancel_pc()
+        self._cancel_odds()
+        self._cancel_prefetch()
+        if self._prefetch_executor is not None:
+            self._prefetch_executor.shutdown(wait=False)
+            self._prefetch_executor = None
         if self._executor is not None:
             self._executor.shutdown(wait=False)
             self._executor = None
@@ -320,6 +385,10 @@ class Advisor:
             self._practice_id = state.practice_id
             self._tracks = {}
             self._pc_plans = {}
+            self._odds_plans = {}
+            self._odds_meta = None
+            self._odds_cache = {}
+            self._cancel_prefetch()
             self._auto_id = None
         key = (len(state.history), state.hold_used, state.current, state.sequence_index, id(state.turn_start))
         if key != self._turn_key:
@@ -331,13 +400,21 @@ class Advisor:
             self._s63_rec = None
             self._s63_future = None
             self.s63_pending = False
+            self._odds_rec = None
             if self.opener_enabled:
                 self._start_pc(state)
+                self._start_odds(state)
             self._select()
         if self._pc_future is not None and self._pc_future.done():
             self._finish_pc(state)
+        if self._odds_future is not None and self._odds_future.done():
+            self._finish_odds(state)
+        self._collect_prefetch()
+        self._maybe_prefetch(state)
         if self.active_id == PC_ID:
             return self._pc_rec
+        if self.active_id == PC_ODDS_ID:
+            return self._odds_rec
         if self.active_id == SIX_THREE_ID:
             return self._six_three(state)
         if self.active_id == AI_ID:
@@ -358,6 +435,10 @@ class Advisor:
         if self._pc_rec is not None:
             # 【2026-09-24・利用者の指示】パフェは候補欄に分岐として出す
             result.append(Candidate(PC_ID, _candidate_label(self._pc_rec, "パフェ"), difficulty_mark(self._pc_rec.soft_sections), self._pc_rec.scope))
+        if self._odds_rec is not None:
+            result.append(Candidate(PC_ODDS_ID, self._odds_rec.label, difficulty_mark(self._odds_rec.soft_sections), self._odds_rec.scope))
+        elif self.odds_pending:
+            result.append(Candidate(PC_ODDS_ID, PC_ODDS_LABEL, "探索中", ""))
         if self._engine_failed:
             mark, scope = "使用不可", ""
         elif self._ai_rec is not None:
@@ -406,12 +487,20 @@ class Advisor:
             return
         # 【2026-09-24・利用者の指示】テンプレを続けている間はテンプレを優先し、
         # それ以外(AIで提示する局面)で5手以内のパフェが見えればパフェを提示する。
-        fallback = PC_ID if self._pc_rec is not None else AI_ID
+        # 見えているミノで取れるパフェが無ければ、成功率の高い継続パフェ(パフェ直後とその続き)
+        if self._pc_rec is not None:
+            fallback = PC_ID
+        elif self._odds_rec is not None and self._odds_rate >= ODDS_AUTO_MIN:
+            fallback = PC_ODDS_ID
+        else:
+            fallback = AI_ID
         if self.preferred_id is not None:
             # 希望のテンプレが一時的に組めない間はパフェかAIで提示し、組めるようになったら戻る。
             # 明示的にAIを選んだ場合は、テンプレが組めても勝手に切り替えない。
             if self.preferred_id in (AI_ID, SIX_THREE_ID) or self.preferred_id in available:
                 self.active_id = self.preferred_id
+            elif self.preferred_id == PC_ODDS_ID and (self._odds_rec is not None or self.odds_pending):
+                self.active_id = PC_ODDS_ID
             else:
                 self.active_id = fallback
             return
@@ -495,16 +584,20 @@ class Advisor:
         board = frozenset((r, c) for r in range(ROWS) for c in range(COLS) if state.board[r][c] is not None)
         return board, sequence, state.hold, not state.hold_used
 
-    def _continuing_pc(self, state: GameState):
-        """進めているパフェの残り手順(手順どおりに置いていれば)。この手番の最初の手から。"""
+    def _continuing_pc(self, state: GameState, plans: dict | None = None):
+        """進めているパフェの残り手順(手順どおりに置いていれば)。この手番の最初の手から。
+
+        plans: 手番 → 手順。省略時は見えているミノで探したパフェ(継続パフェの手順にも使う)。
+        """
+        plans = self._pc_plans if plans is None else plans
         turn = len(state.history)
-        for stale in [t for t in self._pc_plans if t > turn]:
-            del self._pc_plans[stale]
-        prev = self._pc_plans.get(turn - 1)
-        if turn not in self._pc_plans and prev and len(prev) > 1 and state.last_lock is not None:
+        for stale in [t for t in plans if t > turn]:
+            del plans[stale]
+        prev = plans.get(turn - 1)
+        if turn not in plans and prev and len(prev) > 1 and state.last_lock is not None:
             if set(state.last_lock[1]) == set(prev[0].cells):
-                self._pc_plans[turn] = prev[1:]
-        plan = self._pc_plans.get(turn)
+                plans[turn] = prev[1:]
+        plan = plans.get(turn)
         if not plan:
             return None
         first = plan[0]
@@ -591,6 +684,222 @@ class Advisor:
             label=label,
             after_pc=_after_pc(state, [s.use_hold for s in found]),
             tetris=tetris,
+            guide=_pc_guide(board, found),
+        )
+
+    # ---- 継続パフェ(成功率つき) ----
+    @property
+    def _odds_rate(self) -> float:
+        return getattr(self._odds_rec, "odds_rate", 0.0) or 0.0
+
+    def _wants_odds(self, state: GameState, board) -> bool:
+        """継続パフェの成功率を計算する局面か(1回に数秒かかるので限る)。"""
+        if board and min(r for r, _c in board) < ROWS - 6:
+            return False  # 6段より高い盤面はパフェを狙わない
+        if self.preferred_id == PC_ODDS_ID:
+            return True  # 候補欄で選んでいる
+        turn = len(state.history)
+        if not board:
+            # パフェの直後(練習開始の空の盤面=HOLDも空は、開幕テンプレに任せる)
+            return turn > 0 or state.hold is not None
+        prev = self._odds_plans.get(turn - 1)
+        return bool(prev) and state.last_lock is not None and set(state.last_lock[1]) == set(prev[0].cells)
+
+    def _odds_inputs(self, state: GameState):
+        """成功率の計算に渡す(盤面, ミノ順, HOLD, 袋の残り, HOLDできるか)。見えている範囲だけ。"""
+        inputs = self._pc_inputs(state)
+        if inputs is None:
+            return None
+        board, sequence, hold, can_hold = inputs
+        turn_sequence, _hold, _board = self._turn_sequence(state)
+        snap = state.turn_start
+        # 見えている最後のミノの通し番号。袋の区切りは配った数から分かる(未表示の配列は見ない)
+        last = snap.sequence_index - 1 + len(turn_sequence) - 1
+        if (last + 1) % 7 == 0:
+            pool = frozenset()  # 袋の最後まで見えている(7個目を補ったときも。補ったミノの番号は読まない)
+        else:
+            start = last // 7 * 7
+            pool = frozenset(PIECES) - {state.sequence.peek(i) for i in range(start, last + 1)}
+        return board, sequence, hold, pool, can_hold
+
+    def _start_odds(self, state: GameState) -> None:
+        self._cancel_odds()
+        board = frozenset((r, c) for r in range(ROWS) for c in range(COLS) if state.board[r][c] is not None)
+        # 【2026-09-29・利用者の指摘(待ち時間)】案内した手順どおりに置いている間は計算し直さない
+        plan = self._continuing_pc(state, self._odds_plans)
+        if plan is not None and self._odds_meta is not None:
+            self._odds_rec = self._odds_recommendation(state, self._odds_meta, plan)
+            return
+        if not self._wants_odds(state, board):
+            return
+        inputs = self._odds_inputs(state)
+        if inputs is None:
+            return
+        board, sequence, hold, pool, can_hold = inputs
+        key = _odds_key(inputs)
+        self._odds_key = key
+        self._collect_prefetch()
+        if key in self._odds_cache:
+            # 先読みで計算済み: 待たずに示す
+            self._cancel_prefetch()
+            self._odds_rec = self._odds_recommendation(state, self._odds_cache[key])
+            return
+        running = self._prefetch.pop(key, None)
+        self._cancel_prefetch()  # 実際に来なかったミノの先読みは捨てる
+        if running is not None:
+            # 先読みが計算中: その結果を待つ(最初から計算し直さない)
+            self._odds_future, self._odds_cancel = running
+            self.odds_pending = True
+            return
+        if not self.pc_async:
+            move = self.odds_search(board, sequence, hold, pool, can_hold=can_hold, time_limit=ODDS_TIME_LIMIT)
+            self._odds_cache[key] = move
+            self._odds_rec = self._odds_recommendation(state, move)
+            return
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="education_search")
+        self._odds_cancel = threading.Event()
+        self._odds_future = self._executor.submit(
+            self.odds_search, board, sequence, hold, pool, can_hold=can_hold, time_limit=ODDS_TIME_LIMIT, cancel=self._odds_cancel
+        )
+        self.odds_pending = True
+
+    def _cancel_odds(self) -> None:
+        """局面が変わった: 古い計算を止め、結果を使わない。"""
+        if self._odds_cancel is not None:
+            self._odds_cancel.set()
+        self._odds_future = None
+        self._odds_cancel = None
+        self.odds_pending = False
+
+    def _finish_odds(self, state: GameState) -> None:
+        future, self._odds_future = self._odds_future, None
+        self._odds_cancel = None
+        self.odds_pending = False
+        try:
+            move = future.result()
+        except Exception:  # noqa: BLE001 - 計算の失敗で画面を止めない
+            return
+        if move is not None and self._odds_key is not None:
+            self._odds_cache[self._odds_key] = move
+        self._odds_rec = self._odds_recommendation(state, move)
+        self._select()
+
+    # ---- 先読み計算 ----
+    def _prefetch_inputs(self, state: GameState) -> list[tuple]:
+        """次の手番で継続パフェの計算が要るなら、案内どおりに置いた後の局面の計算の入力を、
+        次にNEXTへ出うるミノごとに返す。要らない・作れないときは空。"""
+        turn = len(state.history)
+        if self.active_id == PC_ID:
+            plan, rec = self._pc_plans.get(turn), self._pc_rec  # パフェの最後の1手 → 次はパフェ直後
+        elif self.active_id == PC_ODDS_ID:
+            plan, rec = self._odds_plans.get(turn), self._odds_rec  # 継続パフェの手順の最後の1手
+        else:
+            return []
+        if not plan or len(plan) != 1 or rec is None or rec.steps is None:
+            return []
+        if rec.use_hold and state.hold is None and not state.hold_used:
+            return []  # HOLDが空でHOLDすると2個配られる(先読みは1個まで)
+        last = state.sequence_index + NEXT_VISIBLE - 1  # 見えている最後のミノの番号
+        if (last + 1) % 7 == 0:
+            pool = frozenset(PIECES)
+        else:
+            pool = frozenset(PIECES) - {state.sequence.peek(i) for i in range(last // 7 * 7, last + 1)}
+        out = []
+        for piece in sorted(pool):
+            try:
+                sim = copy.deepcopy(state, {id(state.sequence): state.sequence})  # ミノ列は変えないので共有
+                sim.sequence = _HypoSequence(state.sequence, last, {last + 1: piece})
+                if not _play(sim, rec):
+                    return []
+                board = frozenset((r, c) for r in range(ROWS) for c in range(COLS) if sim.board[r][c] is not None)
+                if board and not self._wants_odds(sim, board):
+                    return []
+                inputs = self._odds_inputs(sim)
+            except LookupError:
+                return []
+            if inputs is not None:
+                out.append(inputs)
+        return out
+
+    def _maybe_prefetch(self, state: GameState) -> None:
+        enabled = self.pc_async if self.prefetch_enabled is None else self.prefetch_enabled
+        if not enabled or not self.opener_enabled or self._prefetch_turn == self._turn_key:
+            return
+        if self.active_id not in (PC_ID, PC_ODDS_ID):
+            return
+        rec = self._pc_rec if self.active_id == PC_ID else self._odds_rec
+        if rec is None:
+            return  # 推奨手がまだ(計算中)
+        self._prefetch_turn = self._turn_key
+        if self._prefetch_executor is None:
+            # 1つずつ順に(同時に走らせると、それぞれが全スレッドを取り合って遅くなる)
+            self._prefetch_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="education_prefetch")
+        for inputs in self._prefetch_inputs(state):
+            key = _odds_key(inputs)
+            if key in self._odds_cache or key in self._prefetch:
+                continue
+            board, sequence, hold, pool, can_hold = inputs
+            cancel = threading.Event()
+            future = self._prefetch_executor.submit(
+                self.odds_search, board, sequence, hold, pool, can_hold=can_hold, time_limit=ODDS_TIME_LIMIT, cancel=cancel
+            )
+            self._prefetch[key] = (future, cancel)
+
+    def _collect_prefetch(self) -> None:
+        """終わった先読みの結果を覚える。"""
+        for key, (future, _cancel) in list(self._prefetch.items()):
+            if future.done():
+                del self._prefetch[key]
+                try:
+                    move = future.result()
+                except Exception:  # noqa: BLE001 - 計算の失敗で画面を止めない
+                    continue
+                if move is not None:
+                    if len(self._odds_cache) > 200:
+                        self._odds_cache.clear()
+                    self._odds_cache[key] = move
+
+    def _cancel_prefetch(self) -> None:
+        for future, cancel in self._prefetch.values():
+            cancel.set()
+            future.cancel()
+        self._prefetch = {}
+
+    def _odds_recommendation(self, state: GameState, move, plan=None) -> Recommendation | None:
+        """継続パフェの推奨手。plan: 続けている手順の残り(省略時はmoveの手順を今から始める)。"""
+        if move is None or move.success == 0:
+            return None
+        turn = len(state.history)
+        if plan is None:
+            steps = list(move.plan) or [PCStep(move.piece, move.cells, move.use_hold)]
+            if state.hold_used:
+                steps[0] = replace(steps[0], use_hold=False)  # HOLDは済んでいる
+            self._odds_plans[turn] = steps
+            self._odds_meta = move
+            plan = steps
+        first = plan[0]
+        use_hold = first.use_hold and not state.hold_used
+        path = find_path_min_soft(state, first.piece, first.cells)
+        if path is None:
+            return None
+        board = frozenset((r, c) for r in range(ROWS) for c in range(COLS) if state.board[r][c] is not None)
+        percent = int(move.rate * 100)  # 切り捨て(100%は全部の並びで組めたときだけ)
+        placed = move.pieces - (len(move.plan or (None,)) - len(plan))  # パフェまでの残り手数
+        return _OddsRecommendation(
+            piece=first.piece,
+            use_hold=use_hold,
+            cells=first.cells,
+            source=(
+                f"継続パフェ 成功率{percent}%({move.success}/{move.total}通り)・{move.height}段パフェまであと{placed}手"
+                f"・ガイドは読めている{len(plan)}手"
+            ),
+            steps=(("ホールド",) if use_hold else ()) + path[0],
+            soft_sections=_pc_soft_sections(state, plan),
+            scope=f"ガイドの{len(plan)}手",
+            label=f"{PC_ODDS_LABEL} {percent}%",
+            odds_rate=move.rate,
+            guide=_pc_guide(board, plan),
         )
 
     def _sync_track(self, state: GameState, template: OpenerTemplate) -> _OpenerTrack | None:
@@ -688,6 +997,7 @@ class Advisor:
             steps=None if path is None else (("ホールド",) if use_hold else ()) + path[0],
             soft_sections=_form_soft_sections(state, track),
             scope="この図の完成まで",
+            guide=tuple((st.piece, _to22(st.cells)) for st in track.steps[track.index :]),
             **_dpc_pc_info(state, track),
         )
 
@@ -795,6 +1105,48 @@ def _pc_soft_sections(state: GameState, steps) -> int | None:
             del sim.board[r]
             sim.board.insert(0, [None] * COLS)
     return total
+
+
+def _odds_key(inputs) -> tuple:
+    board, sequence, hold, pool, can_hold = inputs
+    return (frozenset(board), tuple(sequence), hold, frozenset(pool), can_hold)
+
+
+_PLAY_OPS = {"←": "move_left", "→": "move_right", "左回転": "rotate_ccw", "右回転": "rotate_cw", "↓": "soft_drop"}
+
+
+def _play(state: GameState, rec: Recommendation) -> bool:
+    """推奨手の操作手順どおりに置く(先読み用)。置いた場所が推奨の位置になればTrue。"""
+    if rec.use_hold and not state.use_hold():
+        return False
+    for step in rec.steps or ():
+        if step in ("ホールド", "ハードドロップ"):
+            continue
+        name, _, times = step.partition("×")
+        for _ in range(int(times or 1)):
+            if not getattr(state, _PLAY_OPS[name])():
+                return False
+    state.hard_drop()
+    return state.last_lock is not None and set(state.last_lock[1]) == set(rec.cells)
+
+
+def _pc_guide(board, steps) -> tuple[tuple[str, tuple[Cell, ...]], ...]:
+    """パフェの手順(各手は前の手までの消去後の座標)を、今の盤面の座標に直して並べる。
+
+    途中で行が消えると、その後の手は下へずれた座標で表されるので、消えた行を挟んだ元の
+    行へ戻す(今の盤面の上に1枚の図として重ねて示すため)。
+    """
+    placed = set(board)
+    rows = list(range(ROWS))  # 消去後の行 → 今の盤面の行(Noneは今の盤面より上)
+    guide = []
+    for step in steps:
+        guide.append((step.piece, tuple(sorted((rows[r], c) for r, c in step.cells if rows[r] is not None))))
+        placed |= set(step.cells)
+        full = [r for r in range(ROWS) if all((r, c) in placed for c in range(COLS))]
+        if full:
+            rows = [None] * len(full) + [rows[r] for r in range(ROWS) if r not in full]
+            placed = {(r + sum(1 for f in full if f > r), c) for r, c in placed if r not in full}
+    return tuple(guide)
 
 
 def _after_pc(state: GameState, hold_flags: list[bool]) -> str:

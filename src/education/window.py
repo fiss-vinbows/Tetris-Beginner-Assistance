@@ -43,6 +43,7 @@ CANDIDATE_WIDTH = 170  # 候補欄の幅(テンプレ名と難度が1行に収�
 
 CELL = 28  # 1マスの描画サイズ(px)
 GHOST_ALPHA = 70
+GUIDE_ALPHA = 56  # テンプレの図・パフェの手順の薄い表示(ブラウザー版と同じ濃さ 0.22)
 # 押しっぱなしで連続入力する操作(方向キー・十字キー)。
 REPEATABLE_ACTIONS = frozenset({"move_left", "move_right", "soft_drop"})
 PAD_POLL_MS = 16  # コントローラーの読み取りと、押しっぱなしの連続入力の判定の間隔
@@ -124,6 +125,13 @@ class BoardView(QtWidgets.QWidget):
                 QtCore.QRect(1 + self.well_col * CELL, 1 + HIDDEN_ROWS * CELL, CELL - 1, (ROWS - HIDDEN_ROWS) * CELL - 1),
                 QtGui.QColor(90, 160, 255, 40),
             )
+        # テンプレの図・パフェの手順で置く予定のミノを薄く示す(空いているマスだけ。ブラウザー版と同じ)
+        rec = self.recommendation
+        if rec is not None and not state.game_over:
+            for piece, cells in getattr(rec, "guide", ()):  # 中あけRENの手(RenStep)はガイドを持たない
+                for r, c in cells:
+                    if 0 <= r < ROWS and state.board[r][c] is None:
+                        painter.fillRect(cell_rect(r, c), _color(piece, GUIDE_ALPHA))
         # 非表示行との境界線
         painter.setPen(QtGui.QPen(QtGui.QColor(200, 200, 200, 120), 1, QtCore.Qt.PenStyle.DashLine))
         y = 1 + HIDDEN_ROWS * CELL
@@ -440,7 +448,7 @@ class PracticeWindow(QtWidgets.QWidget):
         self.view = keybindings.load_view(self.view_path)
         self.advisor.prefer_ai = self.view["prefer_ai"]
         self._last_advisor_status = ""
-        self._last_pc_pending = (False, False)  # (パフェ探索中, 6-3積み計算中)
+        self._last_pc_pending = (False, False, False)  # (パフェ探索中, 6-3積み計算中, 継続パフェ計算中)
         self.pad_timer = QtCore.QTimer(self)
         self.pad_timer.timeout.connect(self._on_tick)
         self.pad_timer.start(PAD_POLL_MS)
@@ -513,7 +521,7 @@ class PracticeWindow(QtWidgets.QWidget):
     def _refresh_candidates(self) -> None:
         candidates = self.advisor.candidates()
         active = self.advisor.active_id
-        sig = tuple((c.source_id, c.mark) for c in candidates) + (active, self.advisor.pc_pending)
+        sig = tuple((c.source_id, c.mark) for c in candidates) + (active, self.advisor.pc_pending, self.advisor.odds_pending)
         if sig != self._candidate_sig:
             self._candidate_sig = sig
             for btn in self.candidate_buttons:
@@ -541,6 +549,8 @@ class PracticeWindow(QtWidgets.QWidget):
         lines.append("◎=ソフトドロップなし ○=1回 △=2回以上")
         if self.advisor.pc_pending:
             lines.append("パフェ探索中…")
+        if self.advisor.odds_pending:
+            lines.append("継続パフェの成功率を計算中…")
         if preferred is not None and preferred != active:
             lines.append(f"({preferred}が組めない間はAIで提示)")
         self.candidate_scope.setText("<br>".join(lines))
@@ -657,7 +667,7 @@ class PracticeWindow(QtWidgets.QWidget):
 
     def _update_recommendation(self) -> None:
         rec = self.advisor.update(self.state)
-        pending = (self.advisor.pc_pending, self.advisor.s63_pending)
+        pending = (self.advisor.pc_pending, self.advisor.s63_pending, self.advisor.odds_pending)
         if (
             rec != self.board_view.recommendation
             or self.advisor.status != self._last_advisor_status

@@ -51,6 +51,15 @@ cargo build --release
 
 `external/cold-clear-2/target/release/cold-clear-2.exe` が生成されていればOK。`src/engine/cold_clear_client.py`の`COLD_CLEAR_EXE`がこのパスを参照している。
 
+シミュレーターの「継続パフェ」(パフェの後に続けて取るパフェの成功率)は、このリポジトリに含まれるRust製の計算プログラムを使う:
+
+```bash
+cd native/pc-odds
+cargo build --release
+```
+
+`native/pc-odds/target/release/pc-odds.exe` が生成されていればOK(`src/education/pc_odds.py`の`PC_ODDS_EXE`)。未ビルドなら継続パフェの候補が出ないだけで、ほかの機能は動く。
+
 ### 3. キャリブレーション
 
 `start.bat`を実行し、「キャリブレーションを実行」から盤面・ホールド・ネクスト欄の位置を指定する（同じウィンドウ配置・解像度である限り再利用できる）。
