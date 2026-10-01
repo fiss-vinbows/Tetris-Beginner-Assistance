@@ -39,6 +39,8 @@ from src.engine.openers import (
     plan_form,
     shift_cells_for_clears,
     tuck_count,
+    TD_TEMPLATE_NAMES,
+    TDTD_DISCARDS,
 )
 from src.education.pc_odds import best_odds_move
 from src.education.pc_search import TIMEOUT, PCStep, find_perfect_clear, has_tetris
@@ -139,6 +141,7 @@ class _OpenerTrack:
     steps: list[OpenerStep]
     index: int = 0
     rejoined: bool = False  # 手順を外れた後、盤面が合流して復帰した
+    tdtd: bool = False  # TDTD(袋がずれたままTD系テンプレを組み直している)
 
     def current(self) -> OpenerStep | None:
         return self.steps[self.index] if self.index < len(self.steps) else None
@@ -163,10 +166,12 @@ def board_state_for_engine(state: GameState) -> BoardState:
 
 
 def candidate_templates() -> tuple[OpenerTemplate, ...]:
-    """候補に並べるテンプレ(並び順が候補欄の順)。開幕パフェ積み・DPCは教育モード専用。"""
-    return tuple(t for t in openers.OPENER_TEMPLATES if t.name_ja not in EXCLUDED_TEMPLATES) + tuple(
-        openers.EDUCATION_TEMPLATES
-    )
+    """候補に並べるテンプレ(並び順が候補欄の順)。開幕パフェ積み・DPCは教育モード専用。
+
+    【2026-09-30・利用者の要望】TDTD向けに集めたTD系テンプレも並べる。オリーブ積み(EXCLUDED_TEMPLATES)は
+    通常は出さず、TDTD(袋がずれたまま組み直す)として始めたときだけ使う(_sync_track)。
+    """
+    return tuple(openers.OPENER_TEMPLATES) + tuple(openers.TD_EXTRA_TEMPLATES) + tuple(openers.EDUCATION_TEMPLATES)
 
 
 def placed_count(sequence_index: int, hold: str | None) -> int:
@@ -245,7 +250,10 @@ def startable_template(
     Tスピンだけの図は、そのテンプレを続けてきた場合(continuing)だけ使う。
     """
     carry = template.name_ja in CARRY_TEMPLATES
-    allow_empty = status == ("DPC" if carry else "開幕")
+    # 【2026-09-30・利用者の要望】TDTD: DPCを組める状態(前の袋のミノを繰り越し)でも、TD系テンプレは
+    # 袋がずれたまま1巡目の図から組み直せる(候補として並べ、自動選択はDPCを優先する)
+    tdtd = template.name_ja in TD_TEMPLATE_NAMES and status == "DPC"
+    allow_empty = status == ("DPC" if carry else "開幕") or tdtd
     forms = template.forms
     if not allow_empty:
         forms = tuple(f for f in forms if f.existing)
@@ -510,8 +518,10 @@ class Advisor:
         if self._auto_id not in available and available:
             # 【2026-09-23・利用者の指示】ソフトドロップの少ないテンプレを選ぶ(同じなら並び順)
             def cost(name: str) -> tuple:
-                sections = self._template_recs[name].soft_sections
-                return (sections is None, sections or 0, available.index(name))
+                rec = self._template_recs[name]
+                sections = rec.soft_sections
+                # 【2026-09-30・利用者の指示】パフェ後はDPCをTDTDより優先する
+                return ("TDTD" in rec.label, sections is None, sections or 0, available.index(name))
 
             self._auto_id = min(available, key=cost)
         self.active_id = self._auto_id if self._auto_id in available else fallback
@@ -919,6 +929,8 @@ class Advisor:
             # 【2026-09-24】以前は一度外れると(前の手番がNone)探し直さず、盤面が
             # 合流しても定跡へ戻れなかった。
             track = self._start_track(state, template, rejoin=turn > 0)
+        if template.name_ja in EXCLUDED_TEMPLATES and (track is None or not track.tdtd):
+            track = None  # オリーブ積みはTDTDのときだけ
         tracks[turn] = track
         return track
 
@@ -937,14 +949,16 @@ class Advisor:
         return sequence, snap.hold, _board20(snap.board)
 
     def _start_track(
-        self, state: GameState, template: OpenerTemplate, rejoin: bool = False, continuing: bool = False
+        self, state: GameState, template: OpenerTemplate, rejoin: bool = False, continuing: bool = False, tdtd: bool = False
     ) -> _OpenerTrack | None:
         sequence, hold, board = self._turn_sequence(state)
         if sequence is None:
             return None
         snap = state.turn_start
         status = bag_status(placed_count(snap.sequence_index, hold), hold, snap.current_index, snap.hold_index)
-        got = choose_form(startable_template(template, hold, status, continuing), board, sequence, hold)
+        # TDTDの2巡目以降は、余りのミノを図の外へ置く手を許す(【2026-10-01・利用者の指示】TSDまでは打ち切る)
+        discards = TDTD_DISCARDS if tdtd and continuing else 0
+        got = choose_form(startable_template(template, hold, status, continuing), board, sequence, hold, discards=discards)
         if got is None:
             # 盤面エディタで図の途中形を作って始めた場合も、ここで合流する
             got = rejoin_form(template, board, sequence, hold)
@@ -953,7 +967,9 @@ class Advisor:
         if got is None:
             return None
         form, steps = got
-        return _OpenerTrack(template, form, list(steps), rejoined=rejoin)
+        # 袋がずれた状態(繰り越しあり)から1巡目の図を始めたらTDTD。続きの図(2巡目以降)も引き継ぐ
+        tdtd = tdtd or (template.name_ja in TD_TEMPLATE_NAMES and not form.existing and status == "DPC")
+        return _OpenerTrack(template, form, list(steps), rejoined=rejoin, tdtd=tdtd)
 
     def _advance_track(self, state: GameState, prev: _OpenerTrack) -> _OpenerTrack | None:
         step = prev.current()
@@ -964,10 +980,10 @@ class Advisor:
         before = _board20(state.history[-1].board)
         cleared = full_rows_after(before, step.cells)
         rest = [replace(st, cells=shift_cells_for_clears(st.cells, cleared)) if cleared else st for st in prev.steps[prev.index + 1 :]]
-        track = _OpenerTrack(prev.template, prev.form, prev.steps[: prev.index + 1] + rest, prev.index + 1, prev.rejoined)
+        track = _OpenerTrack(prev.template, prev.form, prev.steps[: prev.index + 1] + rest, prev.index + 1, prev.rejoined, prev.tdtd)
         if track.current() is None:
             # 図を置き終えた: 同じテンプレの続きの図(2巡目以降)を探す
-            return self._start_track(state, prev.template, continuing=True)
+            return self._start_track(state, prev.template, continuing=True, tdtd=prev.tdtd)
         return track
 
     def _from_track(self, state: GameState, track: _OpenerTrack | None) -> Recommendation | None:
@@ -993,12 +1009,13 @@ class Advisor:
             piece=step.piece,
             use_hold=use_hold,
             cells=cells,
-            source=f"{kind} {track.template.name_ja} / {section}" + (" (定跡に復帰)" if track.rejoined else ""),
+            source=f"{kind} {track.template.name_ja}{'(TDTD: 袋がずれたまま)' if track.tdtd else ''} / {section}"
+            + (" (定跡に復帰)" if track.rejoined else ""),
             steps=None if path is None else (("ホールド",) if use_hold else ()) + path[0],
             soft_sections=_form_soft_sections(state, track),
             scope="この図の完成まで",
             guide=tuple((st.piece, _to22(st.cells)) for st in track.steps[track.index :]),
-            **_dpc_pc_info(state, track),
+            **({"label": f"{track.template.name_ja}(TDTD)"} if track.tdtd else _dpc_pc_info(state, track)),
         )
 
     # ---- CC2 ----

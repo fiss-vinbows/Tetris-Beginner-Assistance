@@ -70,6 +70,8 @@ from src.engine.openers import (
     DPC_TEMPLATE_NAME,
     apply_step,
     choose_dpc,
+    choose_tdtd,
+    TDTD_DISCARDS,
     choose_form,
     choose_opener,
     full_rows_after,
@@ -2177,6 +2179,7 @@ class AssistWorker(QtCore.QThread):
         plan_depth: int = 3,
         pc_odds_enabled: bool = False,
         pc_odds_first: bool = False,
+        tdtd_mode: str = "off",
     ) -> None:
         super().__init__()
         self.calibration = calibration
@@ -2186,6 +2189,11 @@ class AssistWorker(QtCore.QThread):
         # 継続パフェを提示するか。pc_odds_first: パフェの後などテンプレ(DPC等)も組めるとき継続パフェを優先
         # (【2026-09-29・利用者の指示】選べるようにする。対局開始(盤面もHOLDも空)は常にテンプレ優先)
         self._pc_odds_enabled = pc_odds_enabled
+        # 【2026-09-30・利用者の要望】TDTD: パフェ後、袋がずれたままTD系テンプレを1巡目から組み直す。
+        # "off"=DPCのみ、"fallback"=DPCが組めないときTDTD、"first"=TDTDを優先(組めないときDPC)。
+        # DPCはパフェ後ほぼ必ず組めるため、"fallback"ではTDTDはほとんど出ない
+        self._tdtd_mode = tdtd_mode
+        self._opener_tdtd = False  # 進めているテンプレがTDTD(袋がずれたまま)で始めたものか
         self._pc_odds_first = pc_odds_first
         self._pc_odds_search_func = best_odds_move  # 計算の関数(テストでは差し替える)
         self._pc_odds_search: _PcOddsSearch | None = None
@@ -3920,6 +3928,7 @@ class AssistWorker(QtCore.QThread):
             return
         if not _non_garbage_cells(recognition.board):
             self._opener_continuing = None  # 盤面が空: 前のテンプレの続きは忘れる
+            self._opener_tdtd = False
             if recognition.hold_piece is None:
                 self._opener_locks = 0  # 対局の最初の手番とみなす(_maybe_start_templateと同じ)
         game_start = not _all_cells(recognition.board) and recognition.hold_piece is None
@@ -3962,7 +3971,9 @@ class AssistWorker(QtCore.QThread):
         garbage_rows = _garbage_row_count(recognition.board)
         matched_cells = {(r + garbage_rows, c) for r, c in board_cells}
         if self._opener_continuing is not None:
-            chosen_form = choose_form(self._opener_continuing, matched_cells, sequence, hold)
+            # TDTDの2巡目以降は、余りのミノを図の外へ置く手を許す(plan_formのdiscards)
+            discards = TDTD_DISCARDS if self._opener_tdtd else 0
+            chosen_form = choose_form(self._opener_continuing, matched_cells, sequence, hold, discards=discards)
             pc_run = None
             if chosen_form is None:
                 pc_run = self._perfect_clear_run(recognition, board_cells, sequence, hold, garbage_rows)
@@ -4005,11 +4016,20 @@ class AssistWorker(QtCore.QThread):
                 dpc_sequence = known_sequence(head, recognition.next_queue, None, self._opener_locks + 1)
                 if swapped and dpc_sequence is not None:
                     dpc_sequence = [self._last_current_piece, *dpc_sequence[1:]]
-                chosen = choose_dpc(dpc_sequence or sequence, hold, carried=carried, can_hold=not swapped)
+                chosen = None
+                if self._tdtd_mode == "first":
+                    chosen = choose_tdtd(dpc_sequence or sequence, hold, can_hold=not swapped)
+                if chosen is None:
+                    chosen = choose_dpc(dpc_sequence or sequence, hold, carried=carried, can_hold=not swapped)
+                if chosen is None and self._tdtd_mode == "fallback":
+                    chosen = choose_tdtd(dpc_sequence or sequence, hold, can_hold=not swapped)
+                if chosen is not None and chosen[0].name_ja != DPC_TEMPLATE_NAME:
+                    self._log_opener(f"TDTD(袋がずれたまま{chosen[0].name_ja}を組み直す)")
+                    self._opener_tdtd = True
                 if chosen is None:
                     if self._opener_declined_sequence != sequence:
                         self._opener_declined_sequence = sequence
-                        self._log_opener(f"DPC該当なし ミノ順={''.join(sequence)} hold={hold}")
+                        self._log_opener(f"DPC{'・TDTD' if self._tdtd_mode != 'off' else ''}該当なし ミノ順={''.join(sequence)} hold={hold}")
                     return
                 template, form, steps = chosen
             else:
@@ -4787,6 +4807,19 @@ class MainWindow(QtWidgets.QWidget):
         )
         layout.addWidget(self.opener_checkbox)
         layout.addWidget(self.pc_odds_checkbox)
+        tdtd_row = QtWidgets.QHBoxLayout()
+        tdtd_row.addWidget(QtWidgets.QLabel("パフェ後(繰り越しあり)のテンプレ:"))
+        self.tdtd_combo = QtWidgets.QComboBox()
+        self.tdtd_combo.addItems(["DPCのみ", "DPC優先(組めないときTDTD)", "TDTD優先(組めないときDPC)"])
+        self.tdtd_combo.setCurrentIndex(1)
+        self.tdtd_combo.setToolTip(
+            "TDTD: TD系テンプレ(迷走砲・はちみつ砲・山岳積み2号・ガムシロ積み)で8段パフェを取った後、HOLDに前の袋の"
+            "ミノが残って袋がずれたまま、TD系テンプレを1巡目から組み直します。\n"
+            "DPCはパフェ後ほぼ必ず組めるため、「DPC優先」ではTDTDはほとんど出ません。"
+        )
+        tdtd_row.addWidget(self.tdtd_combo)
+        tdtd_row.addStretch(1)
+        layout.addLayout(tdtd_row)
         layout.addLayout(pc_first_row)
 
         # 【教育モード(2026-09-22着手・第1段階)】画像認識を使わない一人用の練習画面。
@@ -4922,6 +4955,7 @@ class MainWindow(QtWidgets.QWidget):
             plan_depth=self.plan_depth_spin.value(),
             pc_odds_enabled=self.pc_odds_checkbox.isChecked(),
             pc_odds_first=self.pc_odds_priority_combo.currentIndex() == 1,
+            tdtd_mode=("off", "fallback", "first")[self.tdtd_combo.currentIndex()],
         )
         # 別スレッド(worker)からのシグナルなので、必ずメインスレッドの
         # イベントループ経由で_on_draw_data_readyが呼ばれるよう明示する

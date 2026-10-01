@@ -77,14 +77,18 @@ class TestSeventhPieceAtTurnStart(unittest.TestCase):
 
 
 class TestFirstBagFormsNeedAlignedBag(unittest.TestCase):
-    def test_no_first_bag_opener_after_pc_with_carried_piece(self) -> None:
-        # パフェ後: 操作ミノTは袋の先頭、HOLD=Z(前の袋のミノ)。山岳積みの1巡目をZ込みで組まない
+    def test_first_bag_opener_after_pc_with_carried_piece_is_only_tdtd(self) -> None:
+        # パフェ後: 操作ミノTは袋の先頭、HOLD=Z(前の袋のミノ)。自動ではDPCを案内する。
+        # 【2026-09-30・利用者の要望】TD系テンプレは袋がずれたまま1巡目から組み直せる(TDTD)ので、
+        # 候補に並べるときは「(TDTD)」と区別する。TD系でない開幕パフェ積みは組まない
         state = GameState.new(1, ("IJLOSTZ", "IJLOSTZ", "TSJLZOI"), None, ("T", "Z", 15))
         advisor = Advisor(engine_factory=FakeEngine)
         rec = advisor.update(state, now=0.0)
-        ids = [c.source_id for c in advisor.candidates()]
-        for name in ("山岳積み2号", "はちみつ砲", "迷走砲", "開幕パフェ積み"):
-            self.assertNotIn(name, ids)
+        candidates = {c.source_id: c.label for c in advisor.candidates()}
+        self.assertNotIn("開幕パフェ積み", candidates)
+        for name in ("山岳積み2号", "はちみつ砲", "迷走砲", "ガムシロ積み"):
+            if name in candidates:
+                self.assertEqual(candidates[name], f"{name}(TDTD)")
         self.assertEqual(advisor.active_id, "DPC")
         self.assertIn("DPC", rec.source)
 
@@ -93,7 +97,9 @@ class TestFirstBagFormsNeedAlignedBag(unittest.TestCase):
         dpc = next(t for t in EDUCATION_TEMPLATES if t.name_ja == "DPC")
         has_empty = lambda t: any(not f.existing for f in t.forms)  # noqa: E731
         self.assertTrue(has_empty(startable_template(mountain, None, "開幕")))
-        self.assertFalse(has_empty(startable_template(mountain, "Z", "DPC")), "前の袋のミノを繰り越して1巡目の図を使う")
+        self.assertTrue(has_empty(startable_template(mountain, "Z", "DPC")), "TDTD: 繰り越しがあっても1巡目の図を使える")
+        pc_opener = next(t for t in EDUCATION_TEMPLATES if t.name_ja == "開幕パフェ積み")
+        self.assertFalse(has_empty(startable_template(pc_opener, "Z", "DPC")), "TD系でないテンプレを繰り越し込みで組む")
         self.assertFalse(has_empty(startable_template(mountain, None, "袋ずれ")), "袋の途中から1巡目の図を使う")
         self.assertTrue(has_empty(startable_template(dpc, "S", "DPC")))
         self.assertFalse(has_empty(startable_template(dpc, None, "開幕")), "繰り越しミノが無いのにDPC")
@@ -104,7 +110,10 @@ class TestEducationOnlyTemplates(unittest.TestCase):
         self.assertEqual([t.name_ja for t in OPENER_TEMPLATES], ["迷走砲", "はちみつ砲", "山岳積み2号", "オリーブ積み", "ガムシロ積み"])
         self.assertEqual([t.name_ja for t in EDUCATION_TEMPLATES], ["開幕パフェ積み", "DPC"])
         self.assertEqual(
-            [t.name_ja for t in candidate_templates()], ["迷走砲", "はちみつ砲", "山岳積み2号", "ガムシロ積み", "開幕パフェ積み", "DPC"]
+            [t.name_ja for t in candidate_templates()],
+            ["迷走砲", "はちみつ砲", "山岳積み2号", "オリーブ積み", "ガムシロ積み"]
+            + ["ホットケーキ積み", "くろみつ砲", "PC-Spin", "皐月積み", "ベーカリーTD", "タンドリーチキン積み"]
+            + ["開幕パフェ積み", "DPC"],
         )
         dpc = EDUCATION_TEMPLATES[1]
         self.assertTrue(any("組み方" in f.section for f in dpc.forms))
