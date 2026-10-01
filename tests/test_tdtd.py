@@ -210,5 +210,56 @@ class TestDiscards(unittest.TestCase):
             return
         self.fail("図のミノを置かない列がある図が見つからない")
 
+class TestSplitPieces(unittest.TestCase):
+    """【2026-10-01・利用者の指示】行をまたいで描かれた図(消える前の座標で描かれたミノ)も読む。"""
+
+    # ホットケーキ積みの3巡目の図: Jで17行目が揃って消えた後に、TとZを置く
+    PANCAKE = "\n".join(["----------", "ooiiiizlll", "ootttzzlcc", "ccccjjcccc", "ccctjzcccc", "ccccjccccc"])
+
+    def test_split_piece_is_read_with_its_gap_row(self) -> None:
+        from src.engine.openers import parse_form
+
+        form = parse_form(self.PANCAKE)
+        self.assertIsNotNone(form)
+        by_piece = {it.piece: it for it in form.items}
+        self.assertEqual(by_piece["T"].cells, ((16, 2), (16, 3), (16, 4), (18, 3)))
+        self.assertEqual(by_piece["T"].gap_rows, frozenset({17}))
+        self.assertEqual(by_piece["Z"].gap_rows, frozenset({17}))
+        self.assertEqual(by_piece["J"].gap_rows, frozenset())
+
+    def test_gap_row_must_be_cleared_in_the_figure(self) -> None:
+        from src.engine.openers import parse_form
+
+        broken = self.PANCAKE.replace("ccccjjcccc", "ccc-jjcccc")  # 17行目が揃わない
+        self.assertIsNone(parse_form(broken))
+
+    def test_split_piece_is_placed_after_the_line_clears(self) -> None:
+        from src.engine.openers import full_rows_after, parse_form, plan_form, shift_cells_for_clears
+
+        form = parse_form(self.PANCAKE)
+        steps = plan_form(form, ["O", "I", "J", "T", "Z", "L"], None)
+        self.assertIsNotNone(steps)
+        order = [st.piece for st in steps]
+        self.assertLess(order.index("J"), order.index("T"), "間の行を消すJより先にTを置いた")
+        self.assertLess(order.index("J"), order.index("Z"))
+        # 実際に行を消しながら置くと、TとZは消えた後の座標でつながり、空いた位置に支えられて置ける
+        board = set(form.existing)
+        rest = [tuple(st.cells) for st in steps]
+        for k, cells in enumerate(rest):
+            self.assertFalse(set(cells) & board, steps[k].piece)
+            self.assertTrue(any(r + 1 >= 20 or (r + 1, c) in board for r, c in cells), f"{steps[k].piece}が宙に浮く")
+            cleared = full_rows_after(board, cells)
+            board |= set(cells)
+            if cleared:
+                board = {(r + sum(1 for g in cleared if g > r), c) for r, c in board if r not in cleared}
+                rest[k + 1 :] = [shift_cells_for_clears(c, cleared) for c in rest[k + 1 :]]
+
+    def test_most_figures_of_the_collected_templates_are_read(self) -> None:
+        from src.engine.opener_data_td import TD_EXTRA_SOURCE_FORMS
+
+        total = sum(len(forms) for _ja, _en, _url, forms in TD_EXTRA_SOURCE_FORMS)
+        self.assertGreaterEqual(total, 250, "行をまたいだ図が収録されていない")
+
+
 if __name__ == "__main__":
     unittest.main()

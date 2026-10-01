@@ -45,6 +45,10 @@ class FormItem:
     # 置いたときに自分の行がすべて揃って消える場合だけ置ける(別図から合流した
     # TSTのT。_mark_required_items参照)。
     must_clear: bool = False
+    # 【2026-10-01・利用者の指示】行をまたいで描かれたミノ: この行(図の座標)が揃って消えた後に置く。
+    # テトリス堂の図は消える前の座標で描かれているため、間の行が消えた後に置くミノは分かれて見える
+    # (例: TSDで1行消えた後に置く3巡目のミノ)。消えた後は残りの手と同じく下へずらすとつながる。
+    gap_rows: frozenset[int] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -130,9 +134,12 @@ def parse_form(text: str, section: str = "", tuck_pieces: frozenset[str] = froze
             piece, last = symbol.upper(), False
         else:
             return None
-        for group in _components(cells):
-            if len(group) != 4:
-                return None
+        groups = _components(cells)
+        whole = [g for g in groups if len(g) == 4]
+        split = _merge_split_groups([g for g in groups if len(g) != 4], piece)
+        if split is None:
+            return None
+        for group in whole:
             # 既存ブロックが同じ列の上にあるミノは、図の上ではハードドロップで
             # 入らない(TSDのT、回転入れのLなど)。
             group_set = set(group)
@@ -140,11 +147,70 @@ def parse_form(text: str, section: str = "", tuck_pieces: frozenset[str] = froze
                 (rr, c) in existing for r, c in group for rr in range(r) if (rr, c) not in group_set
             )
             items.append(FormItem(piece, group, spin=last or blocked, last=last))
+        for group, gaps in split:
+            # 間の行が消えた後の盤面で、上に既存ブロックがあるか(回転入れ・Tスピン)
+            shifted = _drop_rows(set(group), gaps)
+            above = _drop_rows({cell for cell in existing if cell[0] not in gaps}, gaps)
+            blocked = any((rr, c) in above for r, c in shifted for rr in range(r) if (rr, c) not in shifted)
+            items.append(FormItem(piece, group, spin=last or blocked, last=last, gap_rows=gaps))
     if not items:
         return None
+    # 行をまたぐミノの間の行は、図の完成形で揃って消える行でなければならない
+    final = set(existing) | {cell for item in items for cell in item.cells}
+    for item in items:
+        if any(not all((r, c) in final for c in range(BOARD_COLS)) for r in item.gap_rows):
+            return None
     return OpenerForm(
         section=section, existing=frozenset(existing), items=tuple(items), text=text, tuck_pieces=tuck_pieces
     )
+
+
+def _drop_rows(cells: set[tuple[int, int]], rows) -> set[tuple[int, int]]:
+    """行rowsが消えた後の座標(消えた行より上のマスは、その数だけ下へずれる)。rows上のマスは捨てる。"""
+    return {(r + sum(1 for g in rows if g > r), c) for r, c in cells if r not in rows}
+
+
+def _is_piece_shape(cells: set[tuple[int, int]], piece: str) -> bool:
+    """4マスが、そのミノのどれかの向きの形か。"""
+    from src.education.rules import _SHAPES  # 循環importを避ける
+
+    r0, c0 = min(r for r, _c in cells), min(c for _r, c in cells)
+    norm = {(r - r0, c - c0) for r, c in cells}
+    for shape in _SHAPES[piece]:
+        sr, sc = min(r for r, _c in shape), min(c for _r, c in shape)
+        if {(r - sr, c - sc) for r, c in shape} == norm:
+            return True
+    return False
+
+
+def _merge_split_groups(groups: list[Cells], piece: str) -> list[tuple[Cells, frozenset[int]]] | None:
+    """4マスにならない塊を組み合わせ、行をまたいで描かれたミノ(と間の行)にする。組めなければNone。
+
+    組み合わせた塊の、上下の間にある行(どの塊のマスも無い行)を取り除くと、そのミノの形につながるもの。
+    """
+    if not groups:
+        return []
+    first, rest = groups[0], groups[1:]
+    for size in range(1, len(rest) + 1):
+        for combo in _combinations(rest, size):
+            cells = set(first).union(*combo)
+            if len(cells) != 4:
+                continue
+            rows = {r for r, _c in cells}
+            gaps = frozenset(r for r in range(min(rows), max(rows)) if r not in rows)
+            if not gaps or not _is_piece_shape(_drop_rows(cells, gaps), piece):
+                continue
+            others = [g for g in rest if g not in combo]
+            merged = _merge_split_groups(others, piece)
+            if merged is not None:
+                return [(tuple(sorted(cells)), gaps), *merged]
+    return None
+
+
+def _combinations(items: list, size: int):
+    import itertools
+
+    return itertools.combinations(items, size)
 
 
 def mirror_form_text(text: str) -> str:
@@ -351,6 +417,17 @@ def plan_form(
     def placeable(item: FormItem, current_placed: set[tuple[int, int]], done: frozenset[int]) -> bool:
         if item.last and len(done) < len(items) - last_count:
             return False
+        if item.gap_rows:
+            # 行をまたいで描かれたミノ: 間の行がすべて揃って(消えて)から、消えた後の盤面で判定する
+            if not all((r, c) in current_placed for r in item.gap_rows for c in range(BOARD_COLS)):
+                return False
+            full = {r for r, _c in current_placed if all((r, c) in current_placed for c in range(BOARD_COLS))}
+            board, cells = _drop_rows(current_placed, full), tuple(sorted(_drop_rows(set(item.cells), full)))
+            if item.spin:
+                return _can_rest(board, cells) and _srs_reachable(board, item.piece, cells, item.piece == "T")
+            if _can_hard_drop(board, cells):
+                return True
+            return allow_tuck and _can_rest(board, cells) and _srs_reachable(board, item.piece, cells, False)
         if item.must_clear:
             # 【2026-09-23・教育モードの実画面】合流させたTSTのTを、形ができる前
             # (2巡目の最初)に穴へ置く手を推奨していた。Tスピンにならず教育用として
@@ -398,6 +475,9 @@ def plan_form(
     memo: dict[tuple, tuple[tuple[int, int], list[OpenerStep]] | None] = {}
 
     def tuck_cost(item: FormItem, current_placed: set[tuple[int, int]]) -> int:
+        if item.gap_rows and not item.spin:
+            full = {r for r, _c in current_placed if all((r, c) in current_placed for c in range(BOARD_COLS))}
+            return 0 if _can_hard_drop(_drop_rows(current_placed, full), tuple(_drop_rows(set(item.cells), full))) else 1
         return 0 if item.spin or _can_hard_drop(current_placed, item.cells) else 1
 
     def is_tetris(item: FormItem, current_placed: set[tuple[int, int]]) -> bool:
