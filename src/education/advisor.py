@@ -43,6 +43,8 @@ from src.engine.openers import (
     TDTD_DISCARDS,
 )
 from src.education.pc_odds import best_odds_move
+from src.education import ren_stack
+from src.education.ren_search import find_ren_plan
 from src.education.pc_search import TIMEOUT, PCStep, find_perfect_clear, has_tetris
 from src.education.six_three import WELL_COL, best_move
 from src.engine.srs_reach import difficulty_mark, find_path, find_path_min_soft
@@ -71,6 +73,17 @@ CARRY_TEMPLATES = frozenset({"DPC"})
 # 【2026-10-02・利用者の要望】候補が多すぎるので、設定欄で表示を切り替える(Advisor.hidden)。
 # テンプレはテンプレ名、それ以外はこのID。隠した候補は計算もしない(動作を軽くする)
 TDTD_ID = "TDTD"
+# 【2026-10-03・利用者の要望】種3の中あけRENを積んで消す練習。積む部分はテンプレ(中開け4列REN)、
+# 積み終えて中央4列に3マスのタネだけが残った形になったら、無限中あけRENと同じ推奨手で消し続ける
+REN_ID = "ren"
+REN_LABEL = "中あけREN"
+REN_WELL = range(3, 7)  # 中央4列(src/education/ren.py の WELL と同じ)
+# 積み増し(図が続かなくなった後、左右3列ずつを評価で積む。src/education/ren_stack.py)
+REN_STACK_ID = "ren-stack"
+REN_STACK_LABEL = "中あけ積み"
+# 左右の低い方がこの段数に達したら、積み増しから消すRENへ切り替える。【2026-10-03・利用者の指示】
+# 20段目(可視の一番上)まで積み込むことを想定する。20段以内に積める手が無くなったときも切り替える
+REN_STACK_TARGET = 20
 
 __all__ = ["AI_ID", "PC_ID", "PC_ODDS_ID", "SIX_THREE_ID", "Advisor", "Candidate", "Recommendation", "find_path", "rejoin_form"]
 
@@ -177,7 +190,26 @@ def candidate_templates() -> tuple[OpenerTemplate, ...]:
     【2026-09-30・利用者の要望】TDTD向けに集めたTD系テンプレも並べる。オリーブ積み(EXCLUDED_TEMPLATES)は
     通常は出さず、TDTD(袋がずれたまま組み直す)として始めたときだけ使う(_sync_track)。
     """
-    return tuple(openers.OPENER_TEMPLATES) + tuple(openers.TD_EXTRA_TEMPLATES) + tuple(openers.EDUCATION_TEMPLATES)
+    return (
+        tuple(openers.OPENER_TEMPLATES)
+        + tuple(openers.TD_EXTRA_TEMPLATES)
+        + tuple(openers.EDUCATION_TEMPLATES)
+        + tuple(openers.REN_TEMPLATES)
+    )
+
+
+def manual_templates() -> frozenset[str]:
+    """候補欄で選んだときだけ使うテンプレ(自動では選ばない)。中開け4列RENはTD系の開幕と相いれないため。"""
+    return frozenset(t.name_ja for t in openers.REN_TEMPLATES)
+
+
+def ren_ready(board) -> bool:
+    """中あけRENを消していける形か: 中央4列にタネの3マスだけがあり、その行の左右6列が埋まっている。"""
+    well = [(r, c) for r, c in board if c in REN_WELL]
+    if len(well) != 3:
+        return False
+    side = [c for c in range(COLS) if c not in REN_WELL]
+    return all((r, c) in board for r in {r for r, _c in well} for c in side)
 
 
 def placed_count(sequence_index: int, hold: str | None) -> int:
@@ -357,6 +389,9 @@ class Advisor:
     # 継続パフェ(成功率つき)。odds_searchは計算の関数(テストでは差し替える)
     odds_search: object = best_odds_move
     _odds_rec: Recommendation | None = None
+    _ren_rec: Recommendation | None = None  # 中あけRENを消していく推奨手
+    _ren_stack_rec: Recommendation | None = None  # 中あけRENの積み増しの推奨手
+    _ren_tall: bool = False  # 左右が積み増しの目標の高さに達している
     _odds_future: object = None
     _odds_cancel: object = None
     odds_pending: bool = False
@@ -417,6 +452,11 @@ class Advisor:
             self._s63_future = None
             self.s63_pending = False
             self._odds_rec = None
+            self._ren_rec = self._ren_recommendation(state) if self.opener_enabled else None
+            self._ren_stack_rec = self._ren_stack_recommendation(state) if self.opener_enabled else None
+            if self.opener_enabled and self._ren_rec is None and self._ren_stack_rec is None and self._wants_ren():
+                # 積み増せる手が無い(20段以内に置けない等): 消していくRENの推奨手を計算する
+                self._ren_rec = self._ren_recommendation(state, force=True)
             if self.opener_enabled:
                 self._start_pc(state)
                 self._start_odds(state)
@@ -431,6 +471,10 @@ class Advisor:
             return self._pc_rec
         if self.active_id == PC_ODDS_ID:
             return self._odds_rec
+        if self.active_id == REN_ID:
+            return self._ren_rec
+        if self.active_id == REN_STACK_ID:
+            return self._ren_stack_rec
         if self.active_id == SIX_THREE_ID:
             return self._six_three(state)
         if self.active_id == AI_ID:
@@ -451,6 +495,11 @@ class Advisor:
         if self._pc_rec is not None:
             # 【2026-09-24・利用者の指示】パフェは候補欄に分岐として出す
             result.append(Candidate(PC_ID, _candidate_label(self._pc_rec, "パフェ"), difficulty_mark(self._pc_rec.soft_sections), self._pc_rec.scope))
+        if self._ren_stack_rec is not None:
+            rec = self._ren_stack_rec
+            result.append(Candidate(REN_STACK_ID, rec.label, difficulty_mark(rec.soft_sections), rec.scope))
+        if self._ren_rec is not None:
+            result.append(Candidate(REN_ID, self._ren_rec.label, difficulty_mark(self._ren_rec.soft_sections), self._ren_rec.scope))
         if self._odds_rec is not None:
             result.append(Candidate(PC_ODDS_ID, self._odds_rec.label, difficulty_mark(self._odds_rec.soft_sections), self._odds_rec.scope))
         elif self.odds_pending:
@@ -496,6 +545,23 @@ class Advisor:
     def _select(self) -> None:
         """希望(preferred_id)を保ったまま、今の局面で実際に提示する候補を決める。"""
         available = [t.name_ja for t in candidate_templates() if t.name_ja in self._template_recs]
+        manual = manual_templates()
+        if self.preferred_id in manual and self.preferred_id not in available:
+            # 中開け4列RENの図が続かなくなった: 左右が目標の高さになるまで積み増し、なったら消していくRENへ
+            # いったんRENを始めたら、続く限りRENのまま(消すと左右が低くなるが、積み増しに戻るとRENが途切れる)
+            tall = self._ren_stack_rec is None or self._ren_tall or self.active_id == REN_ID
+            if self._ren_rec is not None and tall:
+                self.active_id = REN_ID
+                return
+            if self._ren_stack_rec is not None:
+                self.active_id = REN_STACK_ID
+                return
+        if self.preferred_id == REN_ID and self._ren_rec is not None:
+            self.active_id = REN_ID
+            return
+        if self.preferred_id == REN_STACK_ID and self._ren_stack_rec is not None:
+            self.active_id = REN_STACK_ID
+            return
         if self.preferred_id is None and self._pc_rec is not None and self._pc_rec.tetris:
             # 【2026-09-24・利用者の指示】テトリスを含むパフェが取れるなら、ソフトドロップが
             # 要ってもテンプレより優先する(利用者が候補を選んでいる間は選択を尊重する)
@@ -523,6 +589,8 @@ class Advisor:
         if self.prefer_ai:
             self.active_id = fallback
             return
+        # 中開け4列RENは候補欄で選んだときだけ(自動では選ばない)
+        available = [name for name in available if name not in manual]
         if self._auto_id not in available and available:
             # 【2026-09-23・利用者の指示】ソフトドロップの少ないテンプレを選ぶ(同じなら並び順)
             def cost(name: str) -> tuple:
@@ -546,8 +614,13 @@ class Advisor:
 
     def _compute_template_recs(self, state: GameState) -> dict[str, Recommendation]:
         recs: dict[str, Recommendation] = {}
+        # 中あけRENの練習中は、ほかのテンプレを計算しない(左右が高い盤面では図の照合が重く、使わない)。
+        # 積み増し・消す段階に入った後は、中開け4列RENの図(1巡目)にも戻らないので計算しない
+        if self._wants_ren() and self.active_id in (REN_ID, REN_STACK_ID):
+            return recs
+        only = manual_templates() if self._wants_ren() else None
         for template in candidate_templates():
-            if template.name_ja in self.hidden:
+            if template.name_ja in self.hidden or (only is not None and template.name_ja not in only):
                 continue
             rec = self._from_track(state, self._sync_track(state, template))
             # 実際に置ける操作手順が無い手は候補にしない
@@ -714,6 +787,89 @@ class Advisor:
             after_pc=_after_pc(state, [s.use_hold for s in found]),
             tetris=tetris,
             guide=_pc_guide(board, found),
+        )
+
+    # ---- 中あけREN(積み増し) ----
+    def _wants_ren(self) -> bool:
+        """中あけRENの練習中か(候補欄で中開け4列REN・中あけ積み・中あけRENのどれかを選んでいる)。"""
+        return self.preferred_id in manual_templates() | {REN_ID, REN_STACK_ID}
+
+    def _ren_stack_recommendation(self, state: GameState) -> Recommendation | None:
+        """中央4列を空けたまま左右3列ずつを積む手(図が続かなくなった後)。中あけRENの練習中だけ計算する。"""
+        self._ren_tall = False
+        if REN_STACK_ID in self.hidden or not self._wants_ren():
+            return None
+        board = frozenset((r, c) for r in range(ROWS) for c in range(COLS) if state.board[r][c] is not None)
+        if sum(1 for _r, c in board if c in REN_WELL) > 3:
+            return None  # 中央4列が埋まっている(中あけの形ではない)
+        self._ren_tall = min(ren_stack.side_heights(board)) >= REN_STACK_TARGET
+        # 要らないときは計算しない(2手先まで読むので重い): 図に従っている間と、RENが続いている間。
+        # 候補欄で中あけ積みを選んでいるときは常に計算する
+        if self.preferred_id != REN_STACK_ID:
+            if any(name in self._template_recs for name in manual_templates()):
+                return None
+            if self._ren_rec is not None and (self._ren_tall or self.active_id == REN_ID):
+                return None
+        move = ren_stack.best_move(board, state.current, state.hold, list(state.visible_next()), not state.hold_used)
+        if move is None:
+            return None
+        use_hold = move.use_hold and not state.hold_used
+        path = find_path_min_soft(state, move.piece, move.cells)
+        if path is None:
+            return None
+        left, right = ren_stack.side_heights(board)
+        return Recommendation(
+            piece=move.piece,
+            use_hold=use_hold,
+            cells=move.cells,
+            source=f"中あけ積み 左右3列ずつを{REN_STACK_TARGET}段目まで積む(今 左{left}段・右{right}段)",
+            steps=(("ホールド",) if use_hold else ()) + path[0],
+            soft_sections=path[1],
+            scope="この1手",
+            label=REN_STACK_LABEL,
+        )
+
+    # ---- 中あけREN(積み終えた後に消していく) ----
+    def _ren_recommendation(self, state: GameState, force: bool = False) -> Recommendation | None:
+        """中央4列にタネの3マスが残る形なら、RENが最も長く続く手順の1手目(無限中あけRENと同じ探索)。"""
+        if REN_ID in self.hidden:
+            return None
+        board = frozenset((r, c) for r in range(ROWS) for c in range(COLS) if state.board[r][c] is not None)
+        if not ren_ready(board):
+            return None
+        # 積み増しの途中(左右が目標の高さに達しておらず、RENを始めていない)は計算しない(重い)。
+        # 積み増せる手が無くなったときは呼び出し側が force で計算し直す
+        if (
+            not force
+            and self._wants_ren()
+            and self.preferred_id != REN_ID
+            and self.active_id != REN_ID
+            and min(ren_stack.side_heights(board)) < REN_STACK_TARGET
+        ):
+            return None
+        inputs = self._pc_inputs(state)
+        if inputs is None:
+            return None
+        _board, sequence, hold, can_hold = inputs
+        plan = find_ren_plan(board, sequence, hold, can_hold, REN_WELL)
+        if plan is None:
+            return None
+        first = plan.steps[0]
+        use_hold = first.use_hold and not state.hold_used
+        path = find_path_min_soft(state, first.piece, first.cells)
+        if path is None:
+            return None
+        known = f"見えている{plan.visible}個すべてで" if plan.complete else f"見えている{plan.visible}個のうち{len(plan.steps)}手先まで"
+        return Recommendation(
+            piece=first.piece,
+            use_hold=use_hold,
+            cells=first.cells,
+            source=f"中あけREN {known}RENが続く",
+            steps=(("ホールド",) if use_hold else ()) + path[0],
+            soft_sections=path[1],
+            scope="この1手",
+            label=f"{REN_LABEL} {len(plan.steps)}手",
+            guide=_pc_guide(board, [PCStep(st.piece, st.cells, st.use_hold) for st in plan.steps]),
         )
 
     # ---- 継続パフェ(成功率つき) ----

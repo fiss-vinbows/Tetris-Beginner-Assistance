@@ -25,6 +25,8 @@ from src.education import gamepad, keybindings
 from src.education.advisor import (
     EXCLUDED_TEMPLATES,
     PC_ODDS_ID,
+    REN_ID,
+    REN_STACK_ID,
     SIX_THREE_ID,
     TDTD_ID,
     Advisor,
@@ -605,6 +607,9 @@ class PracticeWindow(QtWidgets.QWidget):
             ("パフェ後", TDTD_ID, "TDTD"),
             ("パフェ", "開幕パフェ積み", "開幕パフェ積み"),
             ("パフェ", PC_ODDS_ID, "継続パフェ"),
+            ("REN", "中開け4列REN(種3)", "中開け4列REN(種3)"),
+            ("REN", REN_STACK_ID, "中あけ積み(積み増し)"),
+            ("REN", REN_ID, "中あけREN(消す)"),
             ("その他", SIX_THREE_ID, "6-3積み"),
         ]
         return groups

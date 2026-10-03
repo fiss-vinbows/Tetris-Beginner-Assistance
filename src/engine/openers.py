@@ -23,6 +23,7 @@ import time
 from dataclasses import dataclass, replace
 
 from .opener_data import EDUCATION_SOURCE_FORMS, OPENER_SOURCE_FORMS
+from .opener_data_ren import REN_SOURCE_FORMS
 from .opener_data_td import TD_EXTRA_SOURCE_FORMS
 
 BOARD_ROWS = 20
@@ -298,6 +299,8 @@ EDUCATION_TEMPLATES: tuple[OpenerTemplate, ...] = _build_templates(EDUCATION_SOU
 # 【2026-09-30・利用者の要望】TDTD向けに集めたTD系テンプレ(opener_data_td.py)。シミュレーターとTDTDで使い、
 # 支援モードの対局開始時のテンプレ選び(choose_opener)には入れない(従来の選択を変えない)
 TD_EXTRA_TEMPLATES: tuple[OpenerTemplate, ...] = _build_templates(TD_EXTRA_SOURCE_FORMS)
+# 【2026-10-03・利用者の要望】種3の中あけRENを積む練習(opener_data_ren.py)。シミュレーターだけで使う
+REN_TEMPLATES: tuple[OpenerTemplate, ...] = _build_templates(REN_SOURCE_FORMS)
 
 
 @dataclass(frozen=True)

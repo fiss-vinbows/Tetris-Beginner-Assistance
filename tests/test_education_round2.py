@@ -114,7 +114,8 @@ class TestEducationOnlyTemplates(unittest.TestCase):
             [t.name_ja for t in candidate_templates()],
             ["迷走砲", "はちみつ砲", "山岳積み2号", "オリーブ積み", "ガムシロ積み"]
             + ["ホットケーキ積み", "くろみつ砲", "PC-Spin", "皐月積み", "ベーカリーTD", "タンドリーチキン積み"]
-            + ["開幕パフェ積み", "DPC"],
+            + ["開幕パフェ積み", "DPC"]
+            + ["中開け4列REN(種3)"],
         )
         dpc = EDUCATION_TEMPLATES[1]
         self.assertTrue(any("組み方" in f.section for f in dpc.forms))
