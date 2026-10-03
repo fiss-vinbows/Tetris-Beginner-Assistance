@@ -1,0 +1,11 @@
+[package]
+name = "pc-odds"
+version = "0.1.0"
+edition = "2021"
+
+# 外部クレートは使わない(ネットワークなしでビルドできるように)
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

@@ -1,7 +1,7 @@
 """TBA.exe をビルドして dist/TBA/ に配布物一式を揃える。
 
 使い方: ./venv/Scripts/python.exe tools/build_exe.py
-前提: venv に pyinstaller が入っていること、Cold Clear 2 がビルド済みであること。
+前提: venv に pyinstaller が入っていること、Cold Clear 2 と pc-odds(native/pc-odds)がビルド済みであること。
 """
 
 from __future__ import annotations
@@ -24,6 +24,11 @@ def main() -> None:
     if not cold_clear.exists():
         sys.exit(f"Cold Clear 2 がビルドされていません: {cold_clear}")
     shutil.copy2(cold_clear, DIST / "cold-clear-2.exe")
+    # 継続パフェの成功率の計算(native/pc-odds。src/education/pc_odds.py 参照)
+    pc_odds = ROOT / "native" / "pc-odds" / "target" / "release" / "pc-odds.exe"
+    if not pc_odds.exists():
+        sys.exit(f"pc-odds がビルドされていません(native/pc-odds で cargo build --release): {pc_odds}")
+    shutil.copy2(pc_odds, DIST / "pc-odds.exe")
     (DIST / "config").mkdir(exist_ok=True)
     shutil.copy2(ROOT / "config" / "cold_clear_beginner.json", DIST / "config" / "cold_clear_beginner.json")
     calibration = ROOT / "config" / "calibration.json"

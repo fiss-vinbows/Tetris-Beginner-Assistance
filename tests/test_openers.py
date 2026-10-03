@@ -14,6 +14,7 @@ from src.engine.openers import (
     OPENER_TEMPLATES,
     OpenerStep,
     _can_hard_drop,
+    _drop_rows,
     apply_step,
     choose_form,
     choose_opener,
@@ -110,8 +111,10 @@ class TestTemplateForms(unittest.TestCase):
             self.assertTrue(template.forms, f"{template.name_ja}に図が無い")
             for form in template.forms:
                 for item in form.items:
+                    # 行をまたいで描かれたミノは、間の行が消えた後の形で確かめる
+                    cells = _drop_rows(set(item.cells), item.gap_rows) if item.gap_rows else set(item.cells)
                     self.assertEqual(
-                        match_piece_shape(frozenset(item.cells)),
+                        match_piece_shape(frozenset(cells)),
                         item.piece,
                         f"{template.name_ja} [{form.section}]: {item.piece}の形が違う {item.cells}",
                     )
@@ -126,9 +129,16 @@ class TestTemplateForms(unittest.TestCase):
         # 左端のjは右端に移り、鏡像なのでlになる。
         self.assertEqual(mirror_form_text("jl--------\nsz-------U"), "--------jl\nU-------sz")
 
-    def test_composite_figures_after_line_clears_are_skipped(self) -> None:
-        # ライン消去後の合成図(同じ記号が2マスずつに分かれている)は解釈しない。
-        self.assertIsNone(parse_form("iiiijsszzl\nccccjjjlll\nccccsscczz\nccctttcccc\ncccctccccc"))
+    def test_figures_drawn_across_cleared_lines_are_read(self) -> None:
+        # 【2026-10-01・利用者の指示】行をまたいで描かれた図(消える前の座標で描かれたミノ)も読む。
+        # 以前は解釈しなかった(同じ記号が分かれて見えるため)。分かれたミノは、間の行が揃って消えた後に置く。
+        form = parse_form("iiiijsszzl\nccccjjjlll\nccccsscczz\nccctttcccc\ncccctccccc")
+        self.assertIsNotNone(form)
+        split = [item for item in form.items if item.gap_rows]
+        self.assertTrue(split)
+        final = set(form.existing) | {cell for item in form.items for cell in item.cells}
+        for item in split:
+            self.assertTrue(all((r, c) in final for r in item.gap_rows for c in range(10)), "間の行が揃わない")
 
 
 class TestPlanForm(unittest.TestCase):

@@ -17,6 +17,8 @@ TT.aup2
 
 # Cold Clear 2 のビルド成果物(README の手順でビルドする)
 external/cold-clear-2/target/
+# 継続パフェの成功率の計算(Rust)のビルド成果物
+native/pc-odds/target/
 
 # エディタ・ツール
 .claude/

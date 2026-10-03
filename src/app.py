@@ -59,6 +59,7 @@ from src.capture.screen_capture import CaptureRegion, ScreenCapture
 from src.engine.board_state import BoardState
 from src.engine.cold_clear_client import ColdClearClient, ColdClearMove
 from src.engine.opener_recovery import RecoveryGate, RecoveryState, RecoveryStep, TurnState, find_recovery
+from src.education.pc_odds import best_odds_move
 from src.education.pc_search import find_perfect_clear
 from src.education.rules import HIDDEN_ROWS as PC_HIDDEN_ROWS
 from src.engine.openers import (
@@ -69,6 +70,8 @@ from src.engine.openers import (
     DPC_TEMPLATE_NAME,
     apply_step,
     choose_dpc,
+    choose_tdtd,
+    TDTD_DISCARDS,
     choose_form,
     choose_opener,
     full_rows_after,
@@ -1786,6 +1789,43 @@ class _PerfectClearSearch:
             self.done.set()
 
 
+# 【2026-09-29・利用者の要望】継続パフェ(src.education.pc_odds)。盤面(おじゃま込み)が6段以下で、
+# おじゃまが偶数行のとき、見えないミノも含めて成功率が一番高いパフェの手順を探して提示する。
+_PC_ODDS_TEMPLATE = OpenerTemplate("継続パフェ", "Continuous Perfect Clear", "", ())
+# 提示するのは成功率がこれ以上のとき(シミュレーターの自動選択と同じ)
+PC_ODDS_MIN_RATE = 0.5
+# 計算の上限(秒)と使うスレッド数(画像認識と取り合わないよう、16本すべては使わない)
+PC_ODDS_TIME_LIMIT_SEC = 1.0
+PC_ODDS_THREADS = 8
+# パフェを狙う盤面の高さ(おじゃま込み)の上限。pc-odds.exe が扱う6段まで
+PC_ODDS_MAX_HEIGHT = 6
+
+
+class _PcOddsSearch:
+    """継続パフェの成功率を別スレッドで1回計算する(src.education.pc_odds.best_odds_move)。"""
+
+    def __init__(self, key, search, board, sequence, hold, pool, can_hold: bool) -> None:
+        self.key = key
+        self.cancel = threading.Event()
+        self.done = threading.Event()
+        self.result = None
+        thread = threading.Thread(
+            target=self._run, args=(search, board, list(sequence), hold, pool, can_hold), daemon=True
+        )
+        thread.start()
+
+    def _run(self, search, board, sequence, hold, pool, can_hold) -> None:
+        try:
+            self.result = search(
+                board, sequence, hold, pool, can_hold=can_hold, time_limit=PC_ODDS_TIME_LIMIT_SEC,
+                cancel=self.cancel, threads=PC_ODDS_THREADS,
+            )
+        except Exception:  # noqa: BLE001 - 計算の失敗で支援モードを止めない
+            self.result = None
+        finally:
+            self.done.set()
+
+
 @dataclass
 class _OpenerRun:
     """進行中の開幕テンプレの1つの図(src.engine.openers参照)。"""
@@ -1800,6 +1840,8 @@ class _OpenerRun:
     # 手順の座標が「消去前の図の座標」(テンプレ)ならTrue。ライン消去のたびに残りを下へずらす。
     # パフェ探索の手順は置く時点の実際の座標なのでFalse(ずらすと二重になる)。
     shift_on_clear: bool = True
+    # 盤面をおじゃまも含めて照合する(継続パフェ: おじゃま行も一緒に消してパフェにする)。
+    with_garbage: bool = False
     # 固定を検知してから、盤面が手順どおりになったのをまだ確認できていない
     # 場合の検知時刻。Noneなら確認待ちではない。
     awaiting_since: float | None = None
@@ -1860,6 +1902,28 @@ class _OpenerRun:
             placement=None,
             plan=plan,
         )
+
+
+def _all_cells(board: BoardState) -> set[tuple[int, int]]:
+    """おじゃまも含めた占有マス。"""
+    return {(r, c) for r, row in enumerate(board.grid) for c, cell in enumerate(row) if cell is not None}
+
+
+def _bag_pool(bag_position: int | None, sequence: list[str]) -> frozenset[str]:
+    """見えているミノ順(先頭が通し番号bag_positionの操作ミノ)の後に、今の袋から出る残りの種類。
+
+    袋の区切りは置いた数から分かる(未表示の配列は見ない)。袋の最後まで見えていれば空(次は新しい袋)。
+    袋の位置が分からないときは、見えている最後の袋が始まった位置も分からないので、見えている
+    ミノが1つの袋の途中までとみなす(近似)。
+    """
+    pieces = frozenset("IOTSZJL")
+    if bag_position is None:
+        return pieces - set(sequence[-(len(sequence) % 7 or 7) :])
+    last = bag_position + len(sequence) - 1
+    if (last + 1) % 7 == 0:
+        return frozenset()
+    start = last // 7 * 7
+    return pieces - set(sequence[max(start - bag_position, 0) :])
 
 
 def _non_garbage_cells(board: BoardState) -> set[tuple[int, int]]:
@@ -2113,12 +2177,28 @@ class AssistWorker(QtCore.QThread):
         video_path: Path | None = None,
         opener_enabled: bool = False,
         plan_depth: int = 3,
+        pc_odds_enabled: bool = False,
+        pc_odds_first: bool = False,
+        tdtd_mode: str = "off",
     ) -> None:
         super().__init__()
         self.calibration = calibration
         self.cold_clear = cold_clear
         # 対局開始時に開幕テンプレ(src.engine.openers)を提示するか。
         self._opener_enabled = opener_enabled
+        # 継続パフェを提示するか。pc_odds_first: パフェの後などテンプレ(DPC等)も組めるとき継続パフェを優先
+        # (【2026-09-29・利用者の指示】選べるようにする。対局開始(盤面もHOLDも空)は常にテンプレ優先)
+        self._pc_odds_enabled = pc_odds_enabled
+        # 【2026-09-30・利用者の要望】TDTD: パフェ後、袋がずれたままTD系テンプレを1巡目から組み直す。
+        # "off"=DPCのみ、"fallback"=DPCが組めないときTDTD、"first"=TDTDを優先(組めないときDPC)。
+        # DPCはパフェ後ほぼ必ず組めるため、"fallback"ではTDTDはほとんど出ない
+        self._tdtd_mode = tdtd_mode
+        self._opener_tdtd = False  # 進めているテンプレがTDTD(袋がずれたまま)で始めたものか
+        self._pc_odds_first = pc_odds_first
+        self._pc_odds_search_func = best_odds_move  # 計算の関数(テストでは差し替える)
+        self._pc_odds_search: _PcOddsSearch | None = None
+        self._pc_odds_declined_key = None  # 組めない・成功率が低いと分かった局面(同じ局面では探し直さない)
+        self._pc_odds_logged_skip = None
         # 表示する手数(1=今の手だけ、最大5)。2手目以降が読み筋ドットになる。
         self._plan_depth = max(1, min(5, plan_depth))
         self._debug_log_path = debug_log_path
@@ -3804,6 +3884,11 @@ class AssistWorker(QtCore.QThread):
         手順どおりになったか毎tick確かめる。
         """
         opener = self._opener
+        if opener is not None and opener.with_garbage and garbage_rise:
+            # 継続パフェはおじゃま行も数えた手順なので、せり上がったら組み直す(次のtickで探し直す)
+            self._log_opener(f"継続パフェ中断(おじゃま{garbage_rise}行のせり上がり)")
+            self._opener = None
+            opener = None
         if opener is not None:
             if garbage_rise and recognition.board_key == self._last_board_key:
                 # 【2026-09-12・利用者の指示】おじゃまがせり上がっても、テンプレの
@@ -3834,6 +3919,27 @@ class AssistWorker(QtCore.QThread):
                 opener.awaiting_since = time.monotonic()
 
     def _maybe_start_opener(self, recognition: RecognitionResult) -> None:
+        """テンプレ・継続パフェが進行中でなければ、始められる図・手順を探す(毎tick)。
+
+        【2026-09-29・利用者の指示】継続パフェとテンプレのどちらを優先するかは設定で選ぶ。
+        継続パフェが組めない(おじゃまが奇数行・盤面が高い・成功率が低い)ときは通常のAIに戻す。
+        """
+        if self._opener is not None or not recognition.hold_known:
+            return
+        if not _non_garbage_cells(recognition.board):
+            self._opener_continuing = None  # 盤面が空: 前のテンプレの続きは忘れる
+            self._opener_tdtd = False
+            if recognition.hold_piece is None:
+                self._opener_locks = 0  # 対局の最初の手番とみなす(_maybe_start_templateと同じ)
+        game_start = not _all_cells(recognition.board) and recognition.hold_piece is None
+        if self._pc_odds_enabled and self._pc_odds_first and not game_start:
+            if self._maybe_start_pc_odds(recognition) != "none":
+                return  # 継続パフェを始めた・計算中(計算中はAIの提示)
+        self._maybe_start_template(recognition)
+        if self._pc_odds_enabled and self._opener is None and self._opener_continuing is None:
+            self._maybe_start_pc_odds(recognition)
+
+    def _maybe_start_template(self, recognition: RecognitionResult) -> None:
         """テンプレが進行中でなければ、始められる図を探す(毎tick)。
 
         図を置き終えるのは固定の数tick後(確認待ちの解消時)で、その時点では
@@ -3865,7 +3971,9 @@ class AssistWorker(QtCore.QThread):
         garbage_rows = _garbage_row_count(recognition.board)
         matched_cells = {(r + garbage_rows, c) for r, c in board_cells}
         if self._opener_continuing is not None:
-            chosen_form = choose_form(self._opener_continuing, matched_cells, sequence, hold)
+            # TDTDの2巡目以降は、余りのミノを図の外へ置く手を許す(plan_formのdiscards)
+            discards = TDTD_DISCARDS if self._opener_tdtd else 0
+            chosen_form = choose_form(self._opener_continuing, matched_cells, sequence, hold, discards=discards)
             pc_run = None
             if chosen_form is None:
                 pc_run = self._perfect_clear_run(recognition, board_cells, sequence, hold, garbage_rows)
@@ -3908,11 +4016,20 @@ class AssistWorker(QtCore.QThread):
                 dpc_sequence = known_sequence(head, recognition.next_queue, None, self._opener_locks + 1)
                 if swapped and dpc_sequence is not None:
                     dpc_sequence = [self._last_current_piece, *dpc_sequence[1:]]
-                chosen = choose_dpc(dpc_sequence or sequence, hold, carried=carried, can_hold=not swapped)
+                chosen = None
+                if self._tdtd_mode == "first":
+                    chosen = choose_tdtd(dpc_sequence or sequence, hold, can_hold=not swapped)
+                if chosen is None:
+                    chosen = choose_dpc(dpc_sequence or sequence, hold, carried=carried, can_hold=not swapped)
+                if chosen is None and self._tdtd_mode == "fallback":
+                    chosen = choose_tdtd(dpc_sequence or sequence, hold, can_hold=not swapped)
+                if chosen is not None and chosen[0].name_ja != DPC_TEMPLATE_NAME:
+                    self._log_opener(f"TDTD(袋がずれたまま{chosen[0].name_ja}を組み直す)")
+                    self._opener_tdtd = True
                 if chosen is None:
                     if self._opener_declined_sequence != sequence:
                         self._opener_declined_sequence = sequence
-                        self._log_opener(f"DPC該当なし ミノ順={''.join(sequence)} hold={hold}")
+                        self._log_opener(f"DPC{'・TDTD' if self._tdtd_mode != 'off' else ''}該当なし ミノ順={''.join(sequence)} hold={hold}")
                     return
                 template, form, steps = chosen
             else:
@@ -3957,6 +4074,84 @@ class AssistWorker(QtCore.QThread):
             f" ミノ順={''.join(sequence)} hold={hold} 手順="
             + " ".join(f"{s.piece}{'(H)' if s.use_hold else ''}{'(spin)' if s.spin else ''}" for s in steps)
         )
+
+    def _maybe_start_pc_odds(self, recognition: RecognitionResult) -> str:
+        """継続パフェの手順を探し、成功率が十分なら提示を始める。
+
+        戻り値: "started"(提示を始めた)・"pending"(計算中)・"none"(狙えない)。
+        盤面(おじゃま込み)が6段以下で、おじゃまが偶数行のときだけ計算する。おじゃま1行は穴が1つ
+        (9マス)なので、奇数行だと埋まったマスが奇数になり、何段で消してもパフェにならない。
+        """
+        board = recognition.board
+        cells = _all_cells(board)
+        if any(r < board.height - PC_ODDS_MAX_HEIGHT for r, _c in cells):
+            return "none"
+        if any(cell is not None and cell[0] is None for row in recognition.pending_grid for cell in row):
+            return "none"  # 盤面がまだ確定していない(消えた行が残っている等)
+        garbage_rows = _garbage_row_count(board)
+        if garbage_rows % 2:
+            if self._pc_odds_logged_skip != garbage_rows:
+                self._pc_odds_logged_skip = garbage_rows
+                self._log_opener(f"継続パフェ: おじゃま{garbage_rows}行(奇数)のためAIの提示")
+            return "none"
+        hold = recognition.hold_piece
+        bag_position = None if self._opener_locks is None else self._opener_locks + (1 if hold is not None else 0)
+        sequence = known_sequence(self._last_current_piece, recognition.next_queue, hold, bag_position)
+        if sequence is None:
+            return "none"
+        pool = _bag_pool(bag_position, sequence)
+        can_hold = not self._disallow_hold_active
+        key = (frozenset(cells), tuple(sequence), hold, pool, can_hold)
+        if key == self._pc_odds_declined_key:
+            return "none"
+        search = self._pc_odds_search
+        if search is None or search.key != key:
+            if search is not None:
+                search.cancel.set()
+            board22 = frozenset((r + PC_HIDDEN_ROWS, c) for r, c in cells)
+            self._pc_odds_search = _PcOddsSearch(
+                key, self._pc_odds_search_func, board22, sequence, hold, pool, can_hold
+            )
+            return "pending"
+        if not search.done.is_set():
+            return "pending"
+        move = search.result
+        self._pc_odds_search = None
+        if move is None or move.success == 0 or move.rate < PC_ODDS_MIN_RATE:
+            self._pc_odds_declined_key = key
+            rate = "組めない" if move is None or move.success == 0 else f"成功率{int(move.rate * 100)}%"
+            self._log_opener(f"継続パフェ: {rate}のためAIの提示 ミノ順={''.join(sequence)} hold={hold}")
+            return "none"
+        plan = move.plan or ()
+        steps = [
+            OpenerStep(st.piece, tuple((r - PC_HIDDEN_ROWS, c) for r, c in st.cells), st.use_hold, False)
+            for st in plan
+        ] or [OpenerStep(move.piece, tuple((r - PC_HIDDEN_ROWS, c) for r, c in move.cells), move.use_hold, False)]
+        percent = int(move.rate * 100)
+        form = OpenerForm(
+            f"成功率{percent}%({move.height}段パフェ)",
+            frozenset(cells),
+            tuple(FormItem(st.piece, st.cells) for st in steps),
+            "",
+        )
+        self._opener = _OpenerRun(
+            template=_PC_ODDS_TEMPLATE, form=form, steps=steps, board=set(cells), shift_on_clear=False, with_garbage=True
+        )
+        self._pc_search = None
+        turn = self._observed_turn(recognition)
+        if turn is not None:
+            self._opener.recovery_snapshot = self._snapshot_opener(self._opener, turn)
+        self._opener_continuing = None
+        self._opener_continue_since = None
+        # AIの提案を先に出していた場合でも、この手番から継続パフェの手に切り替える。
+        self._committed_placement = None
+        self._committed_placement_tbp = None
+        self._committed_move = None
+        self._log_opener(
+            f"継続パフェ開始 成功率{percent}%({move.success}/{move.total}通り) ミノ順={''.join(sequence)} hold={hold} 手順="
+            + " ".join(f"{st.piece}{'(H)' if st.use_hold else ''}" for st in steps)
+        )
+        return "started"
 
     # 3巡目の図が無いときのパフェ探索の時間上限(秒)。シミュレーターの画面用と同じ。
     PC_SEARCH_TIME_LIMIT_SEC = 3.0
@@ -4043,6 +4238,11 @@ class AssistWorker(QtCore.QThread):
         opener = self._opener
         if opener is None:
             return
+        if opener.recovery_pending and opener.with_garbage:
+            # 継続パフェは局面から探し直せるので、手順位置の復元はせずにやめる
+            self._log_opener("継続パフェ中断(認識の欠落)")
+            self._opener = None
+            return
         if opener.recovery_pending:
             # 認識欠落を経た直後。固定の検知(awaiting_since)自体を取り逃して
             # いる可能性があるので、旧来の「期待外4マスで即中断」より前に
@@ -4051,10 +4251,10 @@ class AssistWorker(QtCore.QThread):
             return
         if opener.awaiting_since is None:
             return
-        actual = _non_garbage_cells(recognition.board)
+        actual = _all_cells(recognition.board) if opener.with_garbage else _non_garbage_cells(recognition.board)
         expected = opener.expected_after_current()
         board_confirmed = recognition.board_key == self._last_board_key
-        if not expected <= actual and board_confirmed:
+        if not expected <= actual and board_confirmed and not opener.with_garbage:
             # 【2026-09-15実機 迷走砲2巡目】固定とおじゃまのせり上がりが同じ
             # フレームで観測されると、_detect_garbage_rise(全行がそのまま上へ
             # 移動する条件)では検出できず、_update_openerの座標ずらしが働かない。
@@ -4100,6 +4300,10 @@ class AssistWorker(QtCore.QThread):
                 opener.recovery_snapshot = self._snapshot_opener(opener, turn)
             if opener.current_step() is None:
                 self._log_opener(f"図を置き終えた [{opener.form.section}]")
+                if opener.with_garbage:
+                    # 継続パフェ: 読めていた手数を置き終えた。次のtickで今の局面から探し直す
+                    self._opener = None
+                    return
                 self._opener_finished_section = opener.form.section
                 self._opener_continuing = opener.template
                 self._opener_continue_since = None
@@ -4567,6 +4771,21 @@ class MainWindow(QtWidgets.QWidget):
 
         self.opener_checkbox = QtWidgets.QCheckBox("開幕テンプレを提示する(はちみつ砲・迷走砲・山岳積み2号・オリーブ積み・ガムシロ積み・パフェ後のDPC)")
         self.opener_checkbox.setChecked(True)
+        # 【2026-09-29・利用者の要望】継続パフェ(盤面が低いとき、パフェを取れる可能性が高い手順)
+        self.pc_odds_checkbox = QtWidgets.QCheckBox("継続パフェを提示する(盤面が6段以下のとき、パフェを狙える手順を成功率つきで表示)")
+        self.pc_odds_checkbox.setChecked(True)
+        self.pc_odds_checkbox.setToolTip(
+            "盤面(おじゃま込み)が6段以下のとき、見えていないミノも含めてパフェを取れる確率が一番高い"
+            "手順を探し、成功率が50%以上なら読めている手数だけ表示します。おじゃまが奇数行のとき"
+            "(パフェにならない)や成功率が低いときは、通常のAIの提案を表示します。"
+        )
+        pc_first_row = QtWidgets.QHBoxLayout()
+        pc_first_row.addWidget(QtWidgets.QLabel("テンプレ(DPC等)と継続パフェの両方を組めるとき:"))
+        self.pc_odds_priority_combo = QtWidgets.QComboBox()
+        self.pc_odds_priority_combo.addItems(["テンプレを優先", "継続パフェを優先"])
+        self.pc_odds_priority_combo.setToolTip("対局開始(盤面もHOLDも空)は、どちらでも開幕テンプレを優先します。")
+        pc_first_row.addWidget(self.pc_odds_priority_combo)
+        pc_first_row.addStretch(1)
 
         depth_row = QtWidgets.QHBoxLayout()
         depth_row.addWidget(QtWidgets.QLabel("最善手の表示手数(1〜5):"))
@@ -4587,6 +4806,21 @@ class MainWindow(QtWidgets.QWidget):
             "条件がそろえば、DPCも提示します。提示と違う場所に置くと通常のAI提案に戻ります。"
         )
         layout.addWidget(self.opener_checkbox)
+        layout.addWidget(self.pc_odds_checkbox)
+        tdtd_row = QtWidgets.QHBoxLayout()
+        tdtd_row.addWidget(QtWidgets.QLabel("パフェ後(繰り越しあり)のテンプレ:"))
+        self.tdtd_combo = QtWidgets.QComboBox()
+        self.tdtd_combo.addItems(["DPCのみ", "DPC優先(組めないときTDTD)", "TDTD優先(組めないときDPC)"])
+        self.tdtd_combo.setCurrentIndex(1)
+        self.tdtd_combo.setToolTip(
+            "TDTD: TD系テンプレ(迷走砲・はちみつ砲・山岳積み2号・ガムシロ積み)で8段パフェを取った後、HOLDに前の袋の"
+            "ミノが残って袋がずれたまま、TD系テンプレを1巡目から組み直します。\n"
+            "DPCはパフェ後ほぼ必ず組めるため、「DPC優先」ではTDTDはほとんど出ません。"
+        )
+        tdtd_row.addWidget(self.tdtd_combo)
+        tdtd_row.addStretch(1)
+        layout.addLayout(tdtd_row)
+        layout.addLayout(pc_first_row)
 
         # 【教育モード(2026-09-22着手・第1段階)】画像認識を使わない一人用の練習画面。
         # 仕様は input/教育/教育モード仕様書_説明と参照資料.txt。実装は src/education/。
@@ -4719,6 +4953,9 @@ class MainWindow(QtWidgets.QWidget):
             video_path=video_path,
             opener_enabled=self.opener_checkbox.isChecked(),
             plan_depth=self.plan_depth_spin.value(),
+            pc_odds_enabled=self.pc_odds_checkbox.isChecked(),
+            pc_odds_first=self.pc_odds_priority_combo.currentIndex() == 1,
+            tdtd_mode=("off", "fallback", "first")[self.tdtd_combo.currentIndex()],
         )
         # 別スレッド(worker)からのシグナルなので、必ずメインスレッドの
         # イベントループ経由で_on_draw_data_readyが呼ばれるよう明示する

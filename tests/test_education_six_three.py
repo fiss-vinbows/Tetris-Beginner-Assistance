@@ -13,6 +13,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6 import QtWidgets  # noqa: E402
 
+import tests.config_isolation  # noqa: E402,F401  本番の設定ファイルを使わない
 from src.education.advisor import SIX_THREE_ID, Advisor  # noqa: E402
 from src.education.rules import COLS, ROWS, GameState  # noqa: E402
 from src.education.six_three import WELL_COL, best_move, evaluate  # noqa: E402
