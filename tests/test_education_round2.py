@@ -18,6 +18,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6 import QtCore, QtGui, QtWidgets  # noqa: E402
 
+import tests.config_isolation  # noqa: E402,F401  本番の設定ファイルを使わない
 from src.education import keybindings  # noqa: E402
 from src.education.advisor import AI_ID, PC_ID, Advisor, Recommendation, candidate_templates, startable_template  # noqa: E402
 from src.education.pc_search import TIMEOUT, find_perfect_clear, placements  # noqa: E402

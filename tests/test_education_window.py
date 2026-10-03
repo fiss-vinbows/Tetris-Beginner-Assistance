@@ -12,6 +12,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6 import QtCore, QtGui, QtWidgets  # noqa: E402
 
+import tests.config_isolation  # noqa: E402,F401  本番の設定ファイルを使わない
 from src.education import keybindings  # noqa: E402
 from src.education.window import PracticeWindow  # noqa: E402
 

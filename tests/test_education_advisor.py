@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import unittest
 
+import tests.config_isolation  # noqa: E402,F401  本番の設定ファイルを使わない
 from src.education.advisor import Advisor, find_path
 from src.education.rules import COLS, HIDDEN_ROWS, ROWS, GameState
 from src.engine.cold_clear_client import ColdClearMove

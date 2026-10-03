@@ -63,8 +63,9 @@ _MODIFIERS = {
 }
 
 
-def load_bindings(path: Path = KEYS_PATH) -> dict[str, str]:
+def load_bindings(path: Path | None = None) -> dict[str, str]:
     """保存済みの割り当てを読む。無い・壊れている・不足している項目は初期値で補う。"""
+    path = KEYS_PATH if path is None else path  # 呼んだ時点の置き場所(テストで差し替えられる)
     bindings = dict(DEFAULT_BINDINGS)
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -78,7 +79,8 @@ def load_bindings(path: Path = KEYS_PATH) -> dict[str, str]:
     return bindings
 
 
-def save_bindings(bindings: dict[str, str], path: Path = KEYS_PATH) -> None:
+def save_bindings(bindings: dict[str, str], path: Path | None = None) -> None:
+    path = KEYS_PATH if path is None else path  # 呼んだ時点の置き場所(テストで差し替えられる)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(bindings, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -108,11 +110,14 @@ REPEAT_PATH = app_root() / "config" / "education_repeat.json"
 # 連続入力が始まるまで / 左右移動の繰り返しの間隔 / ソフトドロップの繰り返しの間隔
 # 【2026-09-23・利用者の指示】ソフトドロップはもっと速く: 左右移動と別に設定し、
 # 押しっぱなしにしたらすぐ(待ち時間なしで)この間隔で降り続ける。
-DEFAULT_REPEAT = {"delay_ms": 170, "interval_ms": 50, "soft_interval_ms": 20}
-REPEAT_LIMITS = {"delay_ms": (50, 1000), "interval_ms": (0, 500), "soft_interval_ms": (0, 500)}
+# 【2026-10-03・利用者の要望】左右移動とソフトドロップ(下移動)で、リピート開始と間隔をそれぞれ設定する。
+# ソフトドロップのリピート開始(soft_delay_ms)の既定は、以前の動き(押してすぐ自分の間隔で降り続ける)と同じ値
+DEFAULT_REPEAT = {"delay_ms": 170, "interval_ms": 50, "soft_delay_ms": 20, "soft_interval_ms": 20}
+REPEAT_LIMITS = {"delay_ms": (50, 1000), "interval_ms": (0, 500), "soft_delay_ms": (0, 1000), "soft_interval_ms": (0, 500)}
 
 
-def load_repeat(path: Path = REPEAT_PATH) -> dict[str, int]:
+def load_repeat(path: Path | None = None) -> dict[str, int]:
+    path = REPEAT_PATH if path is None else path  # 呼んだ時点の置き場所(テストで差し替えられる)
     settings = dict(DEFAULT_REPEAT)
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -125,7 +130,8 @@ def load_repeat(path: Path = REPEAT_PATH) -> dict[str, int]:
     return settings
 
 
-def save_repeat(settings: dict[str, int], path: Path = REPEAT_PATH) -> None:
+def save_repeat(settings: dict[str, int], path: Path | None = None) -> None:
+    path = REPEAT_PATH if path is None else path  # 呼んだ時点の置き場所(テストで差し替えられる)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -136,7 +142,12 @@ VIEW_PATH = app_root() / "config" / "education_view.json"
 DEFAULT_VIEW = {"show_hints": True, "prefer_ai": False, "ren_analysis": True}  # ren_analysis: 無限中あけRENのAI解析
 
 
-def load_view(path: Path = VIEW_PATH) -> dict[str, bool]:
+# 【2026-10-02・利用者の要望】候補欄に出す候補の表示/非表示。キーは "show:<候補のID>"(既定は表示)
+SHOW_PREFIX = "show:"
+
+
+def load_view(path: Path | None = None) -> dict[str, bool]:
+    path = VIEW_PATH if path is None else path  # 呼んだ時点の置き場所(テストで差し替えられる)
     settings = dict(DEFAULT_VIEW)
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -144,11 +155,15 @@ def load_view(path: Path = VIEW_PATH) -> dict[str, bool]:
             value = data.get(key) if isinstance(data, dict) else None
             if isinstance(value, bool):
                 settings[key] = value
+        for key, value in (data.items() if isinstance(data, dict) else ()):
+            if key.startswith(SHOW_PREFIX) and isinstance(value, bool):
+                settings[key] = value
     except (OSError, ValueError):
         pass
     return settings
 
 
-def save_view(settings: dict[str, bool], path: Path = VIEW_PATH) -> None:
+def save_view(settings: dict[str, bool], path: Path | None = None) -> None:
+    path = VIEW_PATH if path is None else path  # 呼んだ時点の置き場所(テストで差し替えられる)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")

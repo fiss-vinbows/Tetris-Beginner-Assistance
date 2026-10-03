@@ -9,6 +9,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6 import QtCore, QtGui, QtWidgets  # noqa: E402
 
+import tests.config_isolation  # noqa: E402,F401  本番の設定ファイルを使わない
 from src.education.ren import SIDES, TANES, WELL, RenGame, RenWindow, playable_tanes  # noqa: E402
 from src.education.rules import COLS, GARBAGE, ROWS  # noqa: E402
 from src.engine.srs_reach import find_path, lock_positions  # noqa: E402

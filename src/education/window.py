@@ -22,7 +22,16 @@ from pathlib import Path
 from PyQt6 import QtCore, QtGui, QtWidgets
 
 from src.education import gamepad, keybindings
-from src.education.advisor import SIX_THREE_ID, Advisor, Recommendation
+from src.education.advisor import (
+    EXCLUDED_TEMPLATES,
+    PC_ODDS_ID,
+    SIX_THREE_ID,
+    TDTD_ID,
+    Advisor,
+    Recommendation,
+    candidate_templates,
+)
+from src.engine.openers import TD_TEMPLATE_NAMES
 from src.education.six_three import WELL_COL
 from src.education.rules import (
     COLS,
@@ -62,23 +71,41 @@ class RepeatTracker:
         self.repeat_at: dict[str, float] = {}
 
     def update(
-        self, actions: set[str], now_ms: float, perform, delay_ms: int, interval_ms: int, soft_interval_ms: int = 20
+        self,
+        actions: set[str],
+        now_ms: float,
+        perform,
+        delay_ms: int,
+        interval_ms: int,
+        soft_interval_ms: int = 20,
+        soft_delay_ms: int | None = None,
     ) -> None:
         for action in actions - self.pressed:
             perform(action)
-            # ソフトドロップは待ち時間なしで、すぐ自分の間隔で降り続ける
-            self.repeat_at[action] = now_ms + (soft_interval_ms if action == "soft_drop" else delay_ms)
+            # ソフトドロップは左右移動と別のリピート開始(省略時は自分の間隔ですぐ降り続ける)
+            soft_delay = soft_interval_ms if soft_delay_ms is None else soft_delay_ms
+            self.repeat_at[action] = now_ms + (soft_delay if action == "soft_drop" else delay_ms)
         for action in actions & self.pressed:
             if action in REPEATABLE_ACTIONS and now_ms >= self.repeat_at.get(action, now_ms):
-                if action == "soft_drop":
-                    interval_ms = soft_interval_ms
-                if interval_ms <= 0:
+                interval = soft_interval_ms if action == "soft_drop" else interval_ms
+                if interval <= 0:
                     for _ in range(ROWS):
                         if not perform(action):
                             break
-                else:
-                    perform(action)
-                self.repeat_at[action] = now_ms + interval_ms
+                    self.repeat_at[action] = now_ms
+                    continue
+                # 【2026-10-03・利用者の指摘(ソフトドロップが速い時と遅い時がある)】次の時刻を「判定した時刻+間隔」
+                # にしていたため、16msごとの判定では18msの設定が約31msに丸められ、裏の計算(パフェ探索)で判定が
+                # 遅れるとさらに遅くなった。予定の時刻を間隔ずつ積み上げ、遅れた分はまとめて行う(上限は盤面の段数)。
+                due = self.repeat_at.get(action, now_ms)
+                for _ in range(ROWS):
+                    if now_ms < due:
+                        break
+                    if not perform(action):
+                        due = now_ms + interval  # 壁・床で止まった: 遅れを持ち越さない
+                        break
+                    due += interval
+                self.repeat_at[action] = max(due, now_ms - interval)
         self.pressed = set(actions)
 
     def clear(self) -> None:
@@ -226,6 +253,8 @@ class ToggleSwitch(QtWidgets.QAbstractButton):
     def paintEvent(self, _event: QtGui.QPaintEvent) -> None:
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        if not self.isEnabled():
+            painter.setOpacity(0.35)  # 操作できないとき(優先がAIのときの候補の設定など)
         text_color = self.palette().color(QtGui.QPalette.ColorRole.WindowText)
         dim = QtGui.QColor(text_color)
         dim.setAlpha(110)
@@ -255,6 +284,39 @@ class ToggleSwitch(QtWidgets.QAbstractButton):
         painter.setPen(text_color if on else dim)
         left = int(track.right()) + 6
         painter.drawText(QtCore.QRect(left, y, self.width() - left, self.TRACK_H), QtCore.Qt.AlignmentFlag.AlignVCenter, self.on_text)
+
+
+class MiniSwitch(QtWidgets.QAbstractButton):
+    """文字の無い小さなトグルスイッチ(名前の右に置く)。
+
+    【2026-10-03・利用者の指示】候補の設定欄は「表示/非表示」の文字をなくし、テンプレ名の右に
+    直接スイッチを置く。オンでつまみが右・青、オフで左・灰色。操作できないときは薄く描く。
+    """
+
+    TRACK_W = 36
+    TRACK_H = 18
+
+    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setCheckable(True)
+        self.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)  # 盤面のキー操作を奪わない
+        self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.setFixedSize(self.TRACK_W, self.TRACK_H)
+        self.toggled.connect(lambda _v: self.update())
+
+    def paintEvent(self, _event: QtGui.QPaintEvent) -> None:
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        if not self.isEnabled():
+            painter.setOpacity(0.35)
+        on = self.isChecked()
+        painter.setPen(QtCore.Qt.PenStyle.NoPen)
+        painter.setBrush(QtGui.QColor(70, 170, 255) if on else QtGui.QColor(110, 110, 120))
+        h = self.TRACK_H
+        painter.drawRoundedRect(QtCore.QRectF(0, 0, self.TRACK_W, h), h / 2, h / 2)
+        knob_x = self.TRACK_W - h + 2 if on else 2
+        painter.setBrush(QtGui.QColor(255, 255, 255))
+        painter.drawEllipse(QtCore.QRectF(knob_x, 2, h - 4, h - 4))
 
 
 class PracticeWindow(QtWidgets.QWidget):
@@ -339,6 +401,9 @@ class PracticeWindow(QtWidgets.QWidget):
         center.addLayout(hold_box)
         center.addWidget(self.board_view)
         center.addLayout(next_box)
+        # 【2026-10-02・利用者の要望】候補が多すぎるので、横の設定欄で表示する候補を切り替える
+        self.filter_panel = self._build_filter_panel()
+        center.addWidget(self.filter_panel)
 
         buttons = QtWidgets.QHBoxLayout()
         self.undo_btn = QtWidgets.QPushButton("一手戻す")
@@ -388,26 +453,38 @@ class PracticeWindow(QtWidgets.QWidget):
         self.interval_spin = QtWidgets.QSpinBox()
         self.interval_spin.setRange(*keybindings.REPEAT_LIMITS["interval_ms"])
         self.interval_spin.setValue(repeat["interval_ms"])
+        self.soft_delay_spin = QtWidgets.QSpinBox()
+        self.soft_delay_spin.setRange(*keybindings.REPEAT_LIMITS["soft_delay_ms"])
+        self.soft_delay_spin.setValue(repeat["soft_delay_ms"])
         self.soft_spin = QtWidgets.QSpinBox()
         self.soft_spin.setRange(*keybindings.REPEAT_LIMITS["soft_interval_ms"])
         self.soft_spin.setValue(repeat["soft_interval_ms"])
         for spin, tip in (
             (self.delay_spin, "左右移動: 押しっぱなしで連続入力が始まるまでの時間"),
             (self.interval_spin, "左右移動: 連続入力の間隔(0にすると壁まで一気に動く)"),
+            (self.soft_delay_spin, "ソフトドロップ: 押しっぱなしで降り続けるまでの時間"),
             (self.soft_spin, "ソフトドロップ: 押しっぱなしで降りる間隔(0にすると床まで一気に落ちる。固定はしない)"),
         ):
             spin.setSuffix(" ms")
             spin.setToolTip(tip)
             spin.setFocusPolicy(QtCore.Qt.FocusPolicy.ClickFocus)
             spin.valueChanged.connect(self._on_repeat_changed)
-        repeat_row = QtWidgets.QHBoxLayout()
-        repeat_row.addWidget(QtWidgets.QLabel("リピート開始"))
-        repeat_row.addWidget(self.delay_spin)
-        repeat_row.addWidget(QtWidgets.QLabel("間隔"))
-        repeat_row.addWidget(self.interval_spin)
-        repeat_row.addWidget(QtWidgets.QLabel("ソフトドロップ"))
-        repeat_row.addWidget(self.soft_spin)
-        repeat_row.addStretch(1)
+        # 【2026-10-03・利用者の要望】左右移動とソフトドロップ(下移動)の設定を別の行に
+        repeat_row = QtWidgets.QVBoxLayout()
+        for title, delay, interval in (
+            ("左右移動", self.delay_spin, self.interval_spin),
+            ("ソフトドロップ", self.soft_delay_spin, self.soft_spin),
+        ):
+            row = QtWidgets.QHBoxLayout()
+            label = QtWidgets.QLabel(title)
+            label.setFixedWidth(90)
+            row.addWidget(label)
+            row.addWidget(QtWidgets.QLabel("リピート開始"))
+            row.addWidget(delay)
+            row.addWidget(QtWidgets.QLabel("間隔"))
+            row.addWidget(interval)
+            row.addStretch(1)
+            repeat_row.addLayout(row)
         # 【2026-09-24・利用者の要望】キーボードの割り当ても画面で変更できるようにする
         self.keys_btn = QtWidgets.QPushButton("キーボードの割り当て")
         self.keys_btn.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
@@ -447,6 +524,7 @@ class PracticeWindow(QtWidgets.QWidget):
         self.view_path = keybindings.VIEW_PATH
         self.view = keybindings.load_view(self.view_path)
         self.advisor.prefer_ai = self.view["prefer_ai"]
+        self._apply_filters()
         self._last_advisor_status = ""
         self._last_pc_pending = (False, False, False)  # (パフェ探索中, 6-3積み計算中, 継続パフェ計算中)
         self.pad_timer = QtCore.QTimer(self)
@@ -508,10 +586,98 @@ class PracticeWindow(QtWidgets.QWidget):
         self.priority_btn.setChecked(prefer_ai)
         self.priority_btn.set_title(f"優先 ({keys.get('toggle_priority', '')})")
         # 非表示のときは推奨配置・操作手順・候補欄をまとめて隠す(自力で練習する用)
-        widgets = [self.show_rec_check, self.show_steps_check, self.rec_label, self.candidate_title,
+        # 【2026-10-03・利用者の指示】提示を非表示にしたときは優先(テンプレ⇔AI)も隠す
+        widgets = [self.priority_btn, self.show_rec_check, self.show_steps_check, self.rec_label, self.candidate_title,
                    self.cycle_btn, self.candidate_scope, *self.candidate_buttons]
         for widget in widgets:
             widget.setVisible(show)
+        # 【2026-10-03・利用者の指示】優先がAIのときは、候補(テンプレ等)の表示の設定を操作できない
+        for check in [*getattr(self, "filter_checks", {}).values(), *getattr(self, "filter_buttons", [])]:
+            check.setEnabled(not prefer_ai)
+
+    # ---- 表示する候補の設定欄 ----
+    def _filter_items(self) -> list[tuple[str, str, str]]:
+        """(見出し, 候補のID, 表示名)。テンプレはテンプレ名がID。"""
+        groups = [("開幕TD", t.name_ja, t.name_ja) for t in candidate_templates()
+                  if t.name_ja in TD_TEMPLATE_NAMES and t.name_ja not in EXCLUDED_TEMPLATES]
+        groups += [
+            ("パフェ後", "DPC", "DPC"),
+            ("パフェ後", TDTD_ID, "TDTD"),
+            ("パフェ", "開幕パフェ積み", "開幕パフェ積み"),
+            ("パフェ", PC_ODDS_ID, "継続パフェ"),
+            ("その他", SIX_THREE_ID, "6-3積み"),
+        ]
+        return groups
+
+    def _build_filter_panel(self) -> QtWidgets.QWidget:
+        panel = QtWidgets.QGroupBox("表示する候補")
+        box = QtWidgets.QVBoxLayout(panel)
+        box.setSpacing(3)
+        self.filter_checks: dict[str, MiniSwitch] = {}
+        heading = None
+        for group, source_id, label in self._filter_items():
+            if group != heading:
+                # 【2026-10-03・利用者の指示】カテゴリ(開幕・パフェ等)を区切り線で見やすく分ける
+                if heading is not None:
+                    line = QtWidgets.QFrame()
+                    line.setFrameShape(QtWidgets.QFrame.Shape.HLine)
+                    line.setFrameShadow(QtWidgets.QFrame.Shadow.Sunken)
+                    box.addSpacing(4)
+                    box.addWidget(line)
+                heading = group
+                title = QtWidgets.QLabel(f"<b>{group}</b>")
+                box.addWidget(title)
+            # 【2026-10-03・利用者の指示】候補はトグルスイッチ。文字は付けず、テンプレ名の右に直接置く
+            row = QtWidgets.QHBoxLayout()
+            row.setContentsMargins(8, 0, 0, 0)
+            row.addWidget(QtWidgets.QLabel(label))
+            row.addStretch(1)
+            check = MiniSwitch()
+            check.toggled.connect(lambda _on, s=source_id: self._on_filter_toggled(s))
+            row.addWidget(check)
+            box.addLayout(row)
+            self.filter_checks[source_id] = check
+        line = QtWidgets.QFrame()
+        line.setFrameShape(QtWidgets.QFrame.Shape.HLine)
+        line.setFrameShadow(QtWidgets.QFrame.Shadow.Sunken)
+        box.addSpacing(4)
+        box.addWidget(line)
+        buttons = QtWidgets.QHBoxLayout()
+        self.filter_buttons: list[QtWidgets.QPushButton] = []
+        for text, value in (("すべて表示", True), ("TDを全部外す", False)):
+            btn = QtWidgets.QPushButton(text)
+            btn.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+            btn.clicked.connect(lambda _c=False, v=value: self._set_all_filters(v))
+            buttons.addWidget(btn)
+            self.filter_buttons.append(btn)
+        box.addLayout(buttons)
+        box.addStretch(1)
+        return panel
+
+    def _set_all_filters(self, value: bool) -> None:
+        for group, source_id, _label in self._filter_items():
+            if value or group == "開幕TD":
+                self.view[keybindings.SHOW_PREFIX + source_id] = value
+        keybindings.save_view(self.view, self.view_path)
+        self._apply_filters()
+        self.refresh()
+
+    def _on_filter_toggled(self, source_id: str) -> None:
+        if getattr(self, "_syncing_filters", False):
+            return
+        self.view[keybindings.SHOW_PREFIX + source_id] = self.filter_checks[source_id].isChecked()
+        keybindings.save_view(self.view, self.view_path)
+        self._apply_filters()
+        self.refresh()
+
+    def _apply_filters(self) -> None:
+        """設定欄のチェックと推奨手の計算(Advisor.hidden)を、保存した表示設定に合わせる。"""
+        hidden = {s for _g, s, _l in self._filter_items() if not self.view.get(keybindings.SHOW_PREFIX + s, True)}
+        self._syncing_filters = True
+        for source_id, check in self.filter_checks.items():
+            check.setChecked(source_id not in hidden)
+        self._syncing_filters = False
+        self.advisor.set_hidden(hidden)
 
     # ---- 候補欄 ----
     def _choose_candidate(self, source_id: str) -> None:
@@ -632,6 +798,7 @@ class PracticeWindow(QtWidgets.QWidget):
         self.repeat = {
             "delay_ms": self.delay_spin.value(),
             "interval_ms": self.interval_spin.value(),
+            "soft_delay_ms": self.soft_delay_spin.value(),
             "soft_interval_ms": self.soft_spin.value(),
         }
         keybindings.save_repeat(self.repeat)

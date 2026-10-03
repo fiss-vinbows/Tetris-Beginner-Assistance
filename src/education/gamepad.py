@@ -111,7 +111,8 @@ class Gamepad:
         return inputs_from_raw(info.dwButtons, info.dwPOV, info.dwXpos, info.dwYpos)
 
 
-def load_pad_bindings(path: Path = PAD_PATH) -> dict[str, list[str]]:
+def load_pad_bindings(path: Path | None = None) -> dict[str, list[str]]:
+    path = PAD_PATH if path is None else path  # 呼んだ時点の置き場所(テストで差し替えられる)
     bindings = {action: list(inputs) for action, inputs in DEFAULT_PAD_BINDINGS.items()}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -125,7 +126,8 @@ def load_pad_bindings(path: Path = PAD_PATH) -> dict[str, list[str]]:
     return bindings
 
 
-def save_pad_bindings(bindings: dict[str, list[str]], path: Path = PAD_PATH) -> None:
+def save_pad_bindings(bindings: dict[str, list[str]], path: Path | None = None) -> None:
+    path = PAD_PATH if path is None else path  # 呼んだ時点の置き場所(テストで差し替えられる)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(bindings, ensure_ascii=False, indent=2), encoding="utf-8")
 

@@ -68,6 +68,9 @@ SIX_THREE_LABEL = "6-3積み"
 EXCLUDED_TEMPLATES = frozenset({"オリーブ積み"})
 # パフェ後にHOLDへ繰り越したミノを使って組むテンプレ(1巡目の図はHOLDがあるときだけ使う)
 CARRY_TEMPLATES = frozenset({"DPC"})
+# 【2026-10-02・利用者の要望】候補が多すぎるので、設定欄で表示を切り替える(Advisor.hidden)。
+# テンプレはテンプレ名、それ以外はこのID。隠した候補は計算もしない(動作を軽くする)
+TDTD_ID = "TDTD"
 
 __all__ = ["AI_ID", "PC_ID", "PC_ODDS_ID", "SIX_THREE_ID", "Advisor", "Candidate", "Recommendation", "find_path", "rejoin_form"]
 
@@ -142,6 +145,9 @@ class _OpenerTrack:
     index: int = 0
     rejoined: bool = False  # 手順を外れた後、盤面が合流して復帰した
     tdtd: bool = False  # TDTD(袋がずれたままTD系テンプレを組み直している)
+    # 手順の各手(添字)のソフトドロップの区間数。図に従っている間は変わらないので覚えて使い回す
+    # (【2026-10-02・利用者の指摘(動作が重い)】毎手番、全テンプレの残りの手を全部探し直していた)
+    soft_steps: dict = field(default_factory=dict)
 
     def current(self) -> OpenerStep | None:
         return self.steps[self.index] if self.index < len(self.steps) else None
@@ -233,7 +239,7 @@ def bag_status(placed: int, hold: str | None, current_index: int | None = None, 
 
 
 def startable_template(
-    template: OpenerTemplate, hold: str | None, status: str, continuing: bool = False
+    template: OpenerTemplate, hold: str | None, status: str, continuing: bool = False, allow_tdtd: bool = True
 ) -> OpenerTemplate:
     """今の手番から使える図だけのテンプレ。
 
@@ -252,7 +258,7 @@ def startable_template(
     carry = template.name_ja in CARRY_TEMPLATES
     # 【2026-09-30・利用者の要望】TDTD: DPCを組める状態(前の袋のミノを繰り越し)でも、TD系テンプレは
     # 袋がずれたまま1巡目の図から組み直せる(候補として並べ、自動選択はDPCを優先する)
-    tdtd = template.name_ja in TD_TEMPLATE_NAMES and status == "DPC"
+    tdtd = allow_tdtd and template.name_ja in TD_TEMPLATE_NAMES and status == "DPC"
     allow_empty = status == ("DPC" if carry else "開幕") or tdtd
     forms = template.forms
     if not allow_empty:
@@ -342,6 +348,8 @@ class Advisor:
     # 手番(固定した数) → 進めているパフェの残り手順。手順どおりに置いている間は探し直さない
     # (【2026-09-24】2段パフェの途中で見えるミノが増え、7手のテトリスパフェへ切り替わった)
     _pc_plans: dict = field(default_factory=dict)
+    # 表示しない候補(テンプレ名・DPC・TDTD_ID・SIX_THREE_ID・PC_ODDS_ID)。計算もしない
+    hidden: frozenset = frozenset()
     # 6-3積みの推奨手(選んでいるときだけ計算する。画面では別スレッド)
     _s63_rec: Recommendation | None = None
     _s63_future: object = None
@@ -457,7 +465,7 @@ class Advisor:
             mark, scope = "", ""
         s63 = self._s63_rec
         s63_mark = "探索中" if self.s63_pending else (difficulty_mark(s63.soft_sections) if s63 else "")
-        if self.opener_enabled:
+        if self.opener_enabled and SIX_THREE_ID not in self.hidden:
             result.append(Candidate(SIX_THREE_ID, SIX_THREE_LABEL, s63_mark, "この1手" if s63 else ""))
         result.append(Candidate(AI_ID, AI_LABEL, mark, scope))
         return tuple(result)
@@ -527,9 +535,20 @@ class Advisor:
         self.active_id = self._auto_id if self._auto_id in available else fallback
 
     # ---- 開幕テンプレ ----
+    def set_hidden(self, hidden) -> None:
+        """表示しない候補を変える。次の更新で候補を計算し直す。"""
+        self.hidden = frozenset(hidden)
+        self._turn_key = None
+        self._tracks = {}  # 隠したテンプレ・TDTDで始めた手順を使い続けない
+        self._auto_id = None
+        if self.preferred_id in self.hidden:
+            self.preferred_id = None
+
     def _compute_template_recs(self, state: GameState) -> dict[str, Recommendation]:
         recs: dict[str, Recommendation] = {}
         for template in candidate_templates():
+            if template.name_ja in self.hidden:
+                continue
             rec = self._from_track(state, self._sync_track(state, template))
             # 実際に置ける操作手順が無い手は候補にしない
             if rec is not None and rec.steps is not None:
@@ -704,6 +723,8 @@ class Advisor:
 
     def _wants_odds(self, state: GameState, board) -> bool:
         """継続パフェの成功率を計算する局面か(1回に数秒かかるので限る)。"""
+        if PC_ODDS_ID in self.hidden:
+            return False
         if board and min(r for r, _c in board) < ROWS - 6:
             return False  # 6段より高い盤面はパフェを狙わない
         if self.preferred_id == PC_ODDS_ID:
@@ -958,7 +979,10 @@ class Advisor:
         status = bag_status(placed_count(snap.sequence_index, hold), hold, snap.current_index, snap.hold_index)
         # TDTDの2巡目以降は、余りのミノを図の外へ置く手を許す(【2026-10-01・利用者の指示】TSDまでは打ち切る)
         discards = TDTD_DISCARDS if tdtd and continuing else 0
-        got = choose_form(startable_template(template, hold, status, continuing), board, sequence, hold, discards=discards)
+        allow_tdtd = TDTD_ID not in self.hidden
+        got = choose_form(
+            startable_template(template, hold, status, continuing, allow_tdtd), board, sequence, hold, discards=discards
+        )
         if got is None:
             # 盤面エディタで図の途中形を作って始めた場合も、ここで合流する
             got = rejoin_form(template, board, sequence, hold)
@@ -980,7 +1004,9 @@ class Advisor:
         before = _board20(state.history[-1].board)
         cleared = full_rows_after(before, step.cells)
         rest = [replace(st, cells=shift_cells_for_clears(st.cells, cleared)) if cleared else st for st in prev.steps[prev.index + 1 :]]
-        track = _OpenerTrack(prev.template, prev.form, prev.steps[: prev.index + 1] + rest, prev.index + 1, prev.rejoined, prev.tdtd)
+        track = _OpenerTrack(
+            prev.template, prev.form, prev.steps[: prev.index + 1] + rest, prev.index + 1, prev.rejoined, prev.tdtd, prev.soft_steps
+        )
         if track.current() is None:
             # 図を置き終えた: 同じテンプレの続きの図(2巡目以降)を探す
             return self._start_track(state, prev.template, continuing=True, tdtd=prev.tdtd)
@@ -1082,19 +1108,28 @@ def _form_soft_sections(state: GameState, track: _OpenerTrack) -> int | None:
     """今の手から図の完成までに必要なソフトドロップの区間数(置けない手があればNone)。
 
     盤面に図の手を順に置き(揃った行は消して残りの手の座標をずらす)、各手を
-    ソフトドロップの区間が最少の経路で数えて合計する。
+    ソフトドロップの区間が最少の経路で数えて合計する。各手の区間数は track.soft_steps に覚え、
+    次の手番からは探し直さない(図に従っている間は変わらない)。
     """
+    cache = track.soft_steps
+    indices = range(track.index, len(track.steps))
+    if all(i in cache for i in indices):
+        return None if any(cache[i] is None for i in indices) else sum(cache[i] for i in indices)
     sim = GameState(sequence=state.sequence)
     sim.board = [list(row) for row in state.board]
     steps = list(track.steps[track.index :])
     total = 0
+    index = track.index
     while steps:
         step = steps.pop(0)
         cells = _to22(step.cells)
-        path = find_path_min_soft(sim, step.piece, cells, spin_entry=step.spin and step.piece == "T")
-        if path is None:
+        if index not in cache:
+            path = find_path_min_soft(sim, step.piece, cells, spin_entry=step.spin and step.piece == "T")
+            cache[index] = None if path is None else path[1]
+        if cache[index] is None:
             return None
-        total += path[1]
+        total += cache[index]
+        index += 1
         cleared = full_rows_after(_board20(sim.board), step.cells)
         for r, c in cells:
             sim.board[r][c] = step.piece
