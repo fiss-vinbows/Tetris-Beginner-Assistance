@@ -52,7 +52,9 @@ class TestRenReady(unittest.TestCase):
     def test_ready_when_only_the_seed_is_in_the_well(self) -> None:
         board = frozenset((r, c) for r in range(16, 22) for c in SIDES) | {(21, 3), (21, 4), (21, 5)}
         self.assertTrue(ren_ready(board))
-        self.assertFalse(ren_ready(board | {(20, 3)}), "中央4列が4マス")
+        # 【2026-10-04】種は3マスとは限らない(おじゃまの段が消えると変わる)。種のある行の左右が埋まっていればよい
+        self.assertTrue(ren_ready(board | {(20, 3)}), "種が4マス")
+        self.assertFalse(ren_ready(frozenset((r, c) for r in range(16, 22) for c in SIDES)), "種が無い")
         self.assertFalse(ren_ready(board - {(21, 0)}), "タネの行の左右が埋まっていない")
 
     def test_stack_evaluation_dislikes_a_one_column_slot(self) -> None:
@@ -116,6 +118,122 @@ class TestPanel(unittest.TestCase):
         self.addCleanup(window.close)
         for source_id in (REN_TEMPLATE, REN_STACK_ID, REN_ID):
             self.assertIn(source_id, window.filter_checks)
+
+
+class TestRenAfterUndo(unittest.TestCase):
+    """【2026-10-04・利用者の指摘/実画面 practice_20261004_145206】REN消化中に置き間違えて中あけの形を崩し、
+    一手戻すと、提示が中あけ積みに変わってREN消化のガイドが出なくなっていた。"""
+
+    def test_undo_after_mistake_returns_to_ren(self) -> None:
+        from src.education.rules import COLS, GARBAGE, HIDDEN_ROWS, ROWS
+
+        board = [[None] * COLS for _ in range(ROWS)]
+        for r in range(HIDDEN_ROWS, ROWS):
+            for c in (0, 1, 2, 7, 8, 9):
+                board[r][c] = GARBAGE
+        for c in (3, 4, 5):
+            board[ROWS - 1][c] = GARBAGE  # タネ(3マス)
+        state = GameState.new(5, board=tuple(tuple(r) for r in board))
+        advisor = Advisor(engine_factory=FakeEngine, odds_search=lambda *a, **k: None)
+        advisor.preferred_id = next(iter(manual_templates()))
+        for _ in range(6):
+            _follow(state, advisor.update(state, now=0.0))  # RENを6回(左右が20段より低くなる)
+        self.assertEqual(advisor.active_id, REN_ID)
+        # 中央に縦にして置き、中あけの形を崩す(RENが途切れる)
+        state.rotate_cw()
+        while state.move_left():
+            pass
+        for _ in range(3):
+            state.move_right()
+        state.hard_drop()
+        advisor.update(state, now=0.0)
+        # 置き間違えで提示がAIに切り替わった状態(実画面と同じ)。種の数が変わっても中あけとみなすようになった
+        # (2026-10-04)ため、この置き方ではRENのまま続くことがあるので、切り替わった状態を作る
+        advisor.active_id = "cc2"
+        state.undo()
+        rec = advisor.update(state, now=0.0)
+        self.assertEqual(advisor.active_id, REN_ID, "一手戻した後に中あけ積みへ切り替わった")
+        self.assertTrue(rec.guide, "REN消化のガイドが無い")
+
+
+class TestRenWithGarbageBelow(unittest.TestCase):
+    """【2026-10-04・利用者の指摘/実画面 practice_20261004_152417】中あけの形のまま下からおじゃまが4段せり上がると、
+    下の段の中央4列のマスまで数えて中あけではないと判定し、REN消化・積み増しの提示がAIに変わっていた。"""
+
+    def _state(self, height: int, tane: bool):
+        import random
+
+        from src.education.rules import COLS, ROWS
+
+        board = [[None] * COLS for _ in range(ROWS)]
+        for r in range(ROWS - height, ROWS):
+            for c in (0, 1, 2, 7, 8, 9):
+                board[r][c] = "L"  # 実際の練習と同じく、左右はミノのブロック
+        if tane:
+            for c in (3, 4, 5):
+                board[ROWS - 1][c] = "J"
+        state = GameState.new(5, board=tuple(tuple(r) for r in board))
+        return state, random
+
+    def _advisor(self):
+        advisor = Advisor(engine_factory=FakeEngine, odds_search=lambda *a, **k: None)
+        advisor.preferred_id = next(iter(manual_templates()))
+        return advisor
+
+    def test_ren_continues_after_garbage(self) -> None:
+        state, random = self._state(20, tane=True)
+        advisor = self._advisor()
+        advisor.update(state, now=0.0)
+        self.assertEqual(advisor.active_id, REN_ID)
+        state.add_garbage(4, random.Random(0))
+        rec = advisor.update(state, now=0.0)
+        self.assertEqual(advisor.active_id, REN_ID, "おじゃまの後にAIへ変わった")
+        self.assertTrue(rec.guide)
+
+    def test_stacking_continues_after_garbage(self) -> None:
+        state, random = self._state(10, tane=False)
+        advisor = self._advisor()
+        advisor.preferred_id = REN_STACK_ID
+        advisor.update(state, now=0.0)
+        self.assertEqual(advisor.active_id, REN_STACK_ID)
+        state.add_garbage(4, random.Random(0))
+        advisor.update(state, now=0.0)
+        self.assertEqual(advisor.active_id, REN_STACK_ID, "おじゃまの後に積み増しがAIへ変わった")
+
+
+class TestRenWithChangedSeed(unittest.TestCase):
+    """【2026-10-04・利用者の指摘】おじゃまの穴にミノが入っておじゃまの段も消えると、種(中央4列のマス)が3マスから
+    5・9マス等に変わる。以前は種がちょうど3マスでないとRENの提示をやめていた。"""
+
+    def test_ren_is_shown_while_it_can_continue(self) -> None:
+        from src.education.advisor import REN_WELL
+        from src.education.ren_search import find_ren_plan
+        from src.education.rules import COLS, GARBAGE, ROWS
+
+        board = [[None] * COLS for _ in range(ROWS)]
+        for r in range(2, ROWS - 2):
+            for c in (0, 1, 2, 7, 8, 9):
+                board[r][c] = "L"
+        for c in (3, 4, 5):
+            board[ROWS - 3][c] = "J"  # 種3
+        for r in (ROWS - 2, ROWS - 1):  # おじゃま2段(中央の3列目に穴)
+            board[r] = [GARBAGE] * COLS
+            board[r][3] = None
+        state = GameState.new(6, board=tuple(tuple(r) for r in board))  # 4手目に種が5マスになる配列
+        advisor = Advisor(engine_factory=FakeEngine, odds_search=lambda *a, **k: None)
+        advisor.preferred_id = next(iter(manual_templates()))
+        seeds = set()
+        for turn in range(12):
+            rec = advisor.update(state, now=0.0)
+            cells = frozenset((r, c) for r in range(ROWS) for c in range(COLS) if state.board[r][c] is not None)
+            seeds.add(sum(1 for _r, c in cells if c in REN_WELL and state.board[_r][c] != GARBAGE))
+            if advisor.active_id != REN_ID:
+                inputs = advisor._pc_inputs(state)
+                self.assertIsNone(find_ren_plan(cells, inputs[1], inputs[2], inputs[3], REN_WELL),
+                                  f"{turn}手目: RENを続けられるのに提示が止まった")
+                break
+            _follow(state, rec)
+        self.assertTrue(seeds - {3}, "前提: 種が3マス以外になる流れ")
 
 
 if __name__ == "__main__":

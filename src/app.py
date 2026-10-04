@@ -4991,8 +4991,27 @@ class MainWindow(QtWidgets.QWidget):
         self._refresh_calibration_status()
 
     # ---------- 通常モードUI ----------
+    # タブの番号
+    TAB_ASSIST, TAB_PRACTICE, TAB_REN = 0, 1, 2
+
     def _build_normal_ui(self) -> None:
-        outer = QtWidgets.QHBoxLayout(self)
+        # 【2026-10-04・利用者の要望】支援モード・シミュレーター・無限中あけRENを別画面にせず、タブで切り替える。
+        # シミュレーター・無限中あけRENは初めて開いたときに作り、表示していない間は思考しない(各画面のhideEvent)
+        root = QtWidgets.QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        self.tabs = QtWidgets.QTabWidget()
+        root.addWidget(self.tabs)
+        assist_page = QtWidgets.QWidget()
+        self.tabs.addTab(assist_page, "支援モード")
+        for title in ("シミュレーター", "無限中あけREN"):
+            page = QtWidgets.QWidget()
+            QtWidgets.QVBoxLayout(page).setContentsMargins(0, 0, 0, 0)
+            self.tabs.addTab(page, title)
+        self.practice_window: QtWidgets.QWidget | None = None
+        self.ren_window: QtWidgets.QWidget | None = None
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+
+        outer = QtWidgets.QHBoxLayout(assist_page)
         layout = QtWidgets.QVBoxLayout()
         outer.addLayout(layout, 1)
         # 【2026-10-04・利用者の要望】開幕テンプレ・DPC/TDTD・継続パフェ・表示手数の設定欄
@@ -5049,27 +5068,6 @@ class MainWindow(QtWidgets.QWidget):
         # 【2026-10-04・利用者の要望】開幕テンプレ・DPC/TDTD・継続パフェの切り替えは設定欄
         # (src.assist_view)にまとめ、シミュレーターと同じく候補ごとのトグルスイッチにした
 
-        # 【教育モード(2026-09-22着手・第1段階)】画像認識を使わない一人用の練習画面。
-        # 仕様は input/教育/教育モード仕様書_説明と参照資料.txt。実装は src/education/。
-        # 【2026-09-25・利用者の指示】表示名を「シミュレーター」に変更(内部の名前はそのまま)。
-        self.practice_btn = QtWidgets.QPushButton("シミュレーターを開く")
-        self.practice_btn.setToolTip(
-            "自前の盤面で積み方を練習します(画像認識・キャプチャ不要)。"
-            "自動落下なし、ハードドロップでのみ固定。一手戻す・同一配列/別配列でリセットができます。"
-        )
-        self.practice_btn.clicked.connect(self._open_practice_window)
-        layout.addWidget(self.practice_btn)
-        self.practice_window: QtWidgets.QWidget | None = None
-        # 【2026-09-25・利用者の要望】無限中あけREN(シミュレーターとは別のモード)
-        self.ren_btn = QtWidgets.QPushButton("無限中あけRENを開く")
-        self.ren_btn.setToolTip(
-            "左右6列が埋まった中央4列だけで4列RENを練習します。"
-            "消せない置き方をするとRENが途切れて終了です(無限モード/25RENまでのタイムアタック)。"
-        )
-        self.ren_btn.clicked.connect(self._open_ren_window)
-        layout.addWidget(self.ren_btn)
-        self.ren_window: QtWidgets.QWidget | None = None
-
         hint = QtWidgets.QLabel(
             "支援モード中は画面右上の「終了」ボタンで終了できます"
             "（ゲーム側のEscキー操作と競合しないよう、Escキーは使いません）"
@@ -5088,25 +5086,30 @@ class MainWindow(QtWidgets.QWidget):
             self.calibration = None
             self.status_label.setText("キャリブレーション: 未設定")
 
-    def _open_practice_window(self) -> None:
-        from src.education.window import PracticeWindow
+    def _on_tab_changed(self, index: int) -> None:
+        """シミュレーター・無限中あけRENのタブは、初めて開いたときに画面を作る。"""
+        widget = None
+        if index == self.TAB_PRACTICE:
+            if self.practice_window is None:
+                from src.education.window import PracticeWindow
 
-        if self.practice_window is None or not self.practice_window.isVisible():
-            self.practice_window = PracticeWindow()
-        self.practice_window.show()
-        self.practice_window.raise_()
-        self.practice_window.activateWindow()
-        self.practice_window.setFocus()
+                self.practice_window = self._embed(PracticeWindow(), index)
+            widget = self.practice_window
+        elif index == self.TAB_REN:
+            if self.ren_window is None:
+                from src.education.ren import RenWindow
 
-    def _open_ren_window(self) -> None:
-        from src.education.ren import RenWindow
+                self.ren_window = self._embed(RenWindow(), index)
+            widget = self.ren_window
+        if widget is not None:
+            widget.setFocus()  # キー操作を受け取れるように
 
-        if self.ren_window is None or not self.ren_window.isVisible():
-            self.ren_window = RenWindow()
-        self.ren_window.show()
-        self.ren_window.raise_()
-        self.ren_window.activateWindow()
-        self.ren_window.setFocus()
+    def _embed(self, widget: QtWidgets.QWidget, index: int) -> QtWidgets.QWidget:
+        """別画面として作られる画面(Qt.WindowType.Window)を、タブのページの中に入れる。"""
+        widget.setWindowFlags(QtCore.Qt.WindowType.Widget)
+        self.tabs.widget(index).layout().addWidget(widget)
+        widget.show()
+        return widget
 
     def _on_calibrate_clicked(self) -> None:
         run_calibration()
@@ -5163,6 +5166,7 @@ class MainWindow(QtWidgets.QWidget):
             )
 
         self.assist_mode = True
+        self._set_other_tabs_enabled(False)
         self.last_valid_draw_data = None
 
         debug_log_enabled = self.debug_log_checkbox is not None and self.debug_log_checkbox.isChecked()
@@ -5228,7 +5232,13 @@ class MainWindow(QtWidgets.QWidget):
             self.badge = None
 
         self.assist_mode = False
+        self._set_other_tabs_enabled(True)
         self.show()
+
+    def _set_other_tabs_enabled(self, enabled: bool) -> None:
+        """【2026-10-04・利用者の指示】支援モード中はシミュレーター等のタブへ切り替えられないようにする。"""
+        for index in (self.TAB_PRACTICE, self.TAB_REN):
+            self.tabs.setTabEnabled(index, enabled)
 
     def _on_draw_data_ready(self, draw_data: OverlayDrawData | None) -> None:
         self.last_valid_draw_data = draw_data
@@ -5251,6 +5261,9 @@ class MainWindow(QtWidgets.QWidget):
         )
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802
+        for widget in (self.practice_window, self.ren_window):
+            if widget is not None:
+                widget.close()
         if self.worker is not None:
             # ワーカーはCold Clear 2が応答不能になったとき自分で作り直す
             # (_handle_cold_clear_failure参照)。その場合こちらが持っている

@@ -26,7 +26,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 
 import src.engine.openers as openers
-from src.education.rules import COLS, HIDDEN_ROWS, NEXT_VISIBLE, PIECES, ROWS, Cell, GameState
+from src.education.rules import COLS, GARBAGE, HIDDEN_ROWS, NEXT_VISIBLE, PIECES, ROWS, Cell, GameState
 from src.engine.board_state import BoardState
 from src.engine.openers import (
     OpenerForm,
@@ -203,13 +203,37 @@ def manual_templates() -> frozenset[str]:
     return frozenset(t.name_ja for t in openers.REN_TEMPLATES)
 
 
-def ren_ready(board) -> bool:
-    """中あけRENを消していける形か: 中央4列にタネの3マスだけがあり、その行の左右6列が埋まっている。"""
-    well = [(r, c) for r, c in board if c in REN_WELL]
-    if len(well) != 3:
-        return False
+def ren_ready(board, garbage_rows: int = 0) -> bool:
+    """中あけRENを消していける形か: 中央4列に種(1マス以上。普通は3マス)があり、その行の左右6列が埋まっている。
+
+    garbage_rows: 盤面の一番下に連続するおじゃまの段の数(_garbage_rows参照)。そのうち下から何段かを除いて
+    数えれば中あけの形になるなら、消していける(タネをおじゃまで描いた盤面は、タネの段もおじゃまの段に見えるため、
+    除く段数を0段から順に試す)。
+    """
     side = [c for c in range(COLS) if c not in REN_WELL]
-    return all((r, c) in board for r in {r for r, _c in well} for c in side)
+    for excluded in range(garbage_rows + 1):
+        well = [(r, c) for r, c in board if c in REN_WELL and r < ROWS - excluded]
+        # 【2026-10-04・利用者の指摘】種は3マスとは限らない(おじゃまの穴にミノが入っておじゃまの段も消えると5・9マス等に
+        # なる)。種が1マス以上あり、種のある行の左右が埋まっていれば消していける形とし、続くかはREN探索に任せる
+        if well and all((r, c) in board for r in {r for r, _c in well} for c in side):
+            return True
+    return False
+
+
+def _garbage_rows(state: GameState) -> int:
+    """盤面の一番下に連続する、せり上げたおじゃまの段の数。
+
+    【2026-10-04・利用者の指摘/実画面 practice_20261004_152417】中あけの形かを盤面全体の中央4列のマスで
+    数えていたため、おじゃまがせり上がって下の段の中央4列が埋まると、上の中あけの形が崩れていなくても
+    中あけではないと判定し、REN消化の提示がAIに変わった。おじゃまの段は中央4列のRENでは消せないので除いて数える。
+    """
+    count = 0
+    for row in reversed(state.board):
+        # せり上げたおじゃまの段: 穴が1つで、ほかはすべておじゃまブロック
+        if row.count(None) != 1 or any(cell not in (None, GARBAGE) for cell in row):
+            break
+        count += 1
+    return count
 
 
 def placed_count(sequence_index: int, hold: str | None) -> int:
@@ -392,6 +416,7 @@ class Advisor:
     _ren_rec: Recommendation | None = None  # 中あけRENを消していく推奨手
     _ren_stack_rec: Recommendation | None = None  # 中あけRENの積み増しの推奨手
     _ren_tall: bool = False  # 左右が積み増しの目標の高さに達している
+    _ren_ongoing: bool = False  # 直前の手でラインを消してRENが続いている(盤面の状態。_ren_started参照)
     _odds_future: object = None
     _odds_cancel: object = None
     odds_pending: bool = False
@@ -452,6 +477,7 @@ class Advisor:
             self._s63_future = None
             self.s63_pending = False
             self._odds_rec = None
+            self._ren_ongoing = state.combo >= 0
             self._ren_rec = self._ren_recommendation(state) if self.opener_enabled else None
             self._ren_stack_rec = self._ren_stack_recommendation(state) if self.opener_enabled else None
             if self.opener_enabled and self._ren_rec is None and self._ren_stack_rec is None and self._wants_ren():
@@ -549,7 +575,7 @@ class Advisor:
         if self.preferred_id in manual and self.preferred_id not in available:
             # 中開け4列RENの図が続かなくなった: 左右が目標の高さになるまで積み増し、なったら消していくRENへ
             # いったんRENを始めたら、続く限りRENのまま(消すと左右が低くなるが、積み増しに戻るとRENが途切れる)
-            tall = self._ren_stack_rec is None or self._ren_tall or self.active_id == REN_ID
+            tall = self._ren_stack_rec is None or self._ren_tall or self._ren_started()
             if self._ren_rec is not None and tall:
                 self.active_id = REN_ID
                 return
@@ -790,6 +816,16 @@ class Advisor:
         )
 
     # ---- 中あけREN(積み増し) ----
+    def _ren_started(self) -> bool:
+        """中あけRENを消し始めているか(積み増しの途中ではないか)。
+
+        【2026-10-04・利用者の指摘/実画面 practice_20261004_145206】以前は今提示している候補(active_id)だけで
+        判断していた。置き間違えて中あけの形が崩れ、提示がAIに切り替わった後に一手戻すと「RENを始めておらず
+        左右が20段未満=積み増しの途中」とみなし、REN消化の提示が中あけ積みに変わった。一手戻すと戻る
+        盤面の状態(直前の手でラインを消してRENが続いている)でも判断する。
+        """
+        return self.active_id == REN_ID or self._ren_ongoing
+
     def _wants_ren(self) -> bool:
         """中あけRENの練習中か(候補欄で中開け4列REN・中あけ積み・中あけRENのどれかを選んでいる)。"""
         return self.preferred_id in manual_templates() | {REN_ID, REN_STACK_ID}
@@ -800,7 +836,8 @@ class Advisor:
         if REN_STACK_ID in self.hidden or not self._wants_ren():
             return None
         board = frozenset((r, c) for r in range(ROWS) for c in range(COLS) if state.board[r][c] is not None)
-        if sum(1 for _r, c in board if c in REN_WELL) > 3:
+        top = ROWS - _garbage_rows(state)  # おじゃまの段は除いて数える
+        if sum(1 for r, c in board if c in REN_WELL and r < top) > 3:
             return None  # 中央4列が埋まっている(中あけの形ではない)
         self._ren_tall = min(ren_stack.side_heights(board)) >= REN_STACK_TARGET
         # 要らないときは計算しない(2手先まで読むので重い): 図に従っている間と、RENが続いている間。
@@ -808,7 +845,7 @@ class Advisor:
         if self.preferred_id != REN_STACK_ID:
             if any(name in self._template_recs for name in manual_templates()):
                 return None
-            if self._ren_rec is not None and (self._ren_tall or self.active_id == REN_ID):
+            if self._ren_rec is not None and (self._ren_tall or self._ren_started()):
                 return None
         move = ren_stack.best_move(board, state.current, state.hold, list(state.visible_next()), not state.hold_used)
         if move is None:
@@ -835,7 +872,7 @@ class Advisor:
         if REN_ID in self.hidden:
             return None
         board = frozenset((r, c) for r in range(ROWS) for c in range(COLS) if state.board[r][c] is not None)
-        if not ren_ready(board):
+        if not ren_ready(board, _garbage_rows(state)):
             return None
         # 積み増しの途中(左右が目標の高さに達しておらず、RENを始めていない)は計算しない(重い)。
         # 積み増せる手が無くなったときは呼び出し側が force で計算し直す
@@ -843,7 +880,7 @@ class Advisor:
             not force
             and self._wants_ren()
             and self.preferred_id != REN_ID
-            and self.active_id != REN_ID
+            and not self._ren_started()
             and min(ren_stack.side_heights(board)) < REN_STACK_TARGET
         ):
             return None
