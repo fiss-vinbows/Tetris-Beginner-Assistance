@@ -320,6 +320,19 @@ class RenWindow(QtWidgets.QWidget):
         self.timer.stop()
         super().closeEvent(event)
 
+    def hideEvent(self, event: QtGui.QHideEvent) -> None:
+        """【2026-10-04・利用者の指示】タブで表示していない間は動かさない(AI解析は画面の更新時だけ計算する)。"""
+        self.timer.stop()
+        self._held_key_actions.clear()
+        self._key_tracker.clear()
+        super().hideEvent(event)
+
+    def showEvent(self, event: QtGui.QShowEvent) -> None:
+        super().showEvent(event)
+        if not self.timer.isActive():
+            self.timer.start(PAD_POLL_MS)
+            self.refresh()
+
     # ---- AI解析 ----
     def _on_analysis_toggled(self, on: bool) -> None:
         self.view["ren_analysis"] = on

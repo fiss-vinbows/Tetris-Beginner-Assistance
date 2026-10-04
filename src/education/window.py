@@ -854,6 +854,24 @@ class PracticeWindow(QtWidgets.QWidget):
         self.advisor.close()  # CC2のプロセスを残さない
         super().closeEvent(event)
 
+    def hideEvent(self, event: QtGui.QHideEvent) -> None:
+        """【2026-10-04・利用者の指示】タブで表示していない間は思考しない。
+
+        定期処理を止め、AI(CC2)・パフェ探索・継続パフェ・先読みを止める(Advisor.close。次に要るとき作り直す)。
+        """
+        self.pad_timer.stop()
+        self._held_key_actions.clear()
+        self._key_tracker.clear()
+        self.advisor.close()
+        super().hideEvent(event)
+
+    def showEvent(self, event: QtGui.QShowEvent) -> None:
+        super().showEvent(event)
+        if not self.pad_timer.isActive():
+            self.advisor._turn_key = None  # 止めていた計算を今の局面でやり直す
+            self.pad_timer.start(PAD_POLL_MS)
+            self.refresh()
+
     def _on_tick(self) -> None:
         self._update_recommendation()
         if self._held_key_actions:

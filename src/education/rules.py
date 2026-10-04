@@ -27,6 +27,9 @@ import random
 from dataclasses import dataclass, field
 
 ROWS = 22  # 内部の行数(非表示2行 + 可視20行)
+# 【2026-10-04・利用者の指摘】実機(ガイドライン)の盤面は40行(可視20行の上に20行)。おじゃまで盤面(22行)の
+# 上へ押し出された行は GameState.overflow に取っておき、ライン消去で戻す。取っておけるのは残りの18行まで
+OVERFLOW_ROWS = 40 - ROWS
 HIDDEN_ROWS = 2
 COLS = 10
 NEXT_VISIBLE = 5
@@ -179,6 +182,8 @@ class Snapshot:
     # 操作ミノ・HOLDのミノが配列の何番目か(途中局面から始めた練習ではNone=不明)
     current_index: int | None = None
     hold_index: int | None = None
+    # 盤面の上へ押し出された行(GameState.overflow)
+    overflow: tuple[tuple[str | None, ...], ...] = ()
 
 
 @dataclass
@@ -223,6 +228,10 @@ class GameState:
     # ミノを先に置いた状態を区別できない)。途中局面から始めた練習ではNone(不明)。
     current_index: int | None = None
     hold_index: int | None = None
+    # 【2026-10-04・利用者の指摘】おじゃまで盤面(22行)の上へ押し出された行。末尾が盤面のすぐ上の行。
+    # 以前は押し出された時点で積み上がり(ゲームオーバー)にしていたため、両端を20段まで積んだ
+    # 中あけRENが、出現位置は空いているのに3段以上のおじゃまで終わっていた。ライン消去で上から戻す
+    overflow: list[list[str | None]] = field(default_factory=list)
 
     @classmethod
     def new(cls, seed: int, bags=None, board=None, position=None) -> "GameState":
@@ -285,7 +294,8 @@ class GameState:
         【2026-09-23・利用者の指示】穴の位置はランダム。複数段では、全段が同じ列に
         穴がある「直列」か、段ごとに穴の列が違う「バラ」かもランダムに決める。
         一手戻すで、せり上げる前(その手番の開始時点)に戻れる。
-        操作中のミノが重なる場合は上へ押し上げる。上端からはみ出したら積み上がり。
+        操作中のミノが重なる場合は上へ押し上げる。上端からはみ出した行は overflow に取っておき、
+        出現位置が塞がったときか、実機の盤面(40行)を超えたときだけ積み上がり(ゲームオーバー)にする。
         """
         if self.game_over or not 1 <= count <= 5:
             return False
@@ -297,7 +307,12 @@ class GameState:
         else:
             holes = [rng.randrange(COLS) for _ in range(count)]  # バラ
         self.last_lock = None
-        overflow = any(cell is not None for row in self.board[:count] for cell in row)
+        pushed = self.overflow + [list(row) for row in self.board[:count]]
+        # ブロックの無い押し出し行は取っておかない(一番上のブロックのある行より上は空)
+        while pushed and all(cell is None for cell in pushed[0]):
+            pushed.pop(0)
+        self.overflow = pushed
+        overflow = len(pushed) > OVERFLOW_ROWS
         self.board = self.board[count:] + [
             [GARBAGE if c != hole else None for c in range(COLS)] for hole in holes
         ]
@@ -331,7 +346,8 @@ class GameState:
         cleared = [r for r in range(ROWS) if all(cell is not None for cell in self.board[r])]
         for r in cleared:
             del self.board[r]
-            self.board.insert(0, [None] * COLS)
+            # 盤面の上へ押し出されていた行があれば、すぐ上の行から戻す
+            self.board.insert(0, self.overflow.pop() if self.overflow else [None] * COLS)
         self.lines_cleared += len(cleared)
         self._score_clear(len(cleared), spin)
         self.hold_used = False
@@ -367,7 +383,7 @@ class GameState:
         difficult = spin is not None or lines == 4
         self.back_to_back = self.back_to_back + 1 if difficult else -1
         self.combo += 1
-        if all(cell is None for row in self.board for cell in row):
+        if all(cell is None for row in self.board for cell in row) and not self.overflow:
             name += " + パーフェクトクリア"
         self.last_clear = name
 
@@ -405,6 +421,7 @@ class GameState:
         self.last_clear = snap.last_clear
         self.current_index = snap.current_index
         self.hold_index = snap.hold_index
+        self.overflow = [list(row) for row in snap.overflow]
         self.game_over = False
         self._spawn(snap.current)
         self.turn_start = snap
@@ -437,6 +454,7 @@ class GameState:
             last_clear=self.last_clear,
             current_index=self.current_index,
             hold_index=self.hold_index,
+            overflow=tuple(tuple(row) for row in self.overflow),
         )
 
     def _take_next(self) -> str:

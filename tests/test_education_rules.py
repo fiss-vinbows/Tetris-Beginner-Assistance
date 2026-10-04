@@ -167,10 +167,53 @@ class TestGarbage(unittest.TestCase):
         state.add_garbage(2)
         self.assertEqual(state.row, row - 2, "操作中のミノが押し上げられていない")
         self.assertFalse(state.game_over)
+        # 【2026-10-04】盤面の上へ押し出されただけ(出現位置は空き)では続く。出現位置が塞がれば積み上がり
         state2 = GameState.new(3)
         _fill(state2, {(1, 0)})
         state2.add_garbage(2)
-        self.assertTrue(state2.game_over, "上端からはみ出したのに積み上がりにならない")
+        self.assertFalse(state2.game_over, "出現位置が空いているのに積み上がりになった")
+        self.assertEqual(len(state2.overflow), 1, "押し出された行を取っておいていない")
+        state3 = GameState.new(3)
+        _fill(state3, {(r, c) for r in (3, 4) for c in range(3, 7)})  # せり上げ後に出現位置(行0・1の中央)を塞ぐ
+        state3.add_garbage(3)
+        self.assertTrue(state3.game_over, "出現位置が塞がったのに積み上がりにならない")
+
+    def test_four_wide_sides_survive_garbage_and_come_back(self) -> None:
+        # 【2026-10-04・利用者の指摘】両端を20段まで積んだ中あけRENが、3段以上のおじゃまで終わっていた
+        import random
+
+        state = GameState.new(1)
+        sides = {(r, c) for r in range(HIDDEN_ROWS, ROWS) for c in (0, 1, 2, 7, 8, 9)}
+        _fill(state, sides)
+        state.turn_start = state._snapshot()
+        self.assertTrue(state.add_garbage(5, random.Random(0)))
+        self.assertFalse(state.game_over)
+        self.assertEqual(len(state.overflow), 3, "盤面の上へ押し出された3行を取っておく")
+        # 一手戻すで取っておいた行も元に戻る
+        self.assertTrue(state.undo())
+        self.assertEqual(state.overflow, [])
+        # ラインを消すと、押し出された行が上から戻る(最下段を手で揃え、消去の処理だけ確かめる)
+        state.add_garbage(5, random.Random(0))
+        nearest = list(state.overflow[-1])
+        count = len(state.overflow)
+        state.board[ROWS - 1] = ["X"] * COLS  # 揃った行は次の固定で消える
+        state.hard_drop()
+        self.assertGreaterEqual(state.lines_cleared, 1, "前提: ラインが消えていない")
+        self.assertEqual(len(state.overflow), count - state.lines_cleared)
+        self.assertIn(nearest, state.board[: state.lines_cleared], "押し出された行が上から戻っていない")
+
+    def test_tops_out_beyond_the_forty_row_field(self) -> None:
+        import random
+
+        from src.education.rules import OVERFLOW_ROWS
+
+        state = GameState.new(1)
+        _fill(state, {(r, c) for r in range(ROWS) for c in (0, 9)})
+        for _ in range(OVERFLOW_ROWS // 5):
+            state.add_garbage(5, random.Random(1))
+        self.assertFalse(state.game_over, "40行以内は続く")
+        state.add_garbage(5, random.Random(1))
+        self.assertTrue(state.game_over, "40行を超えたら積み上がり")
 
 
 class TestSRS(unittest.TestCase):
