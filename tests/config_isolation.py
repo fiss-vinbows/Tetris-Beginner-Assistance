@@ -21,3 +21,7 @@ keybindings.KEYS_PATH = _DIR / "education_keys.json"
 keybindings.REPEAT_PATH = _DIR / "education_repeat.json"
 keybindings.VIEW_PATH = _DIR / "education_view.json"
 gamepad.PAD_PATH = _DIR / "education_pad.json"
+
+from src import assist_view  # noqa: E402
+
+assist_view.ASSIST_VIEW_PATH = _DIR / "assist_view.json"

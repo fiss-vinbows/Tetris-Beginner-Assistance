@@ -60,6 +60,7 @@ from src.engine.board_state import BoardState
 from src.engine.cold_clear_client import ColdClearClient, ColdClearMove
 from src.engine.opener_recovery import RecoveryGate, RecoveryState, RecoveryStep, TurnState, find_recovery
 from src.education.pc_odds import best_odds_move
+from src.assist_view import AssistSettingsPanel, load_assist_view, worker_options
 from src.education.pc_search import find_perfect_clear
 from src.education.rules import HIDDEN_ROWS as PC_HIDDEN_ROWS
 from src.engine.openers import (
@@ -72,13 +73,16 @@ from src.engine.openers import (
     choose_dpc,
     choose_tdtd,
     TDTD_DISCARDS,
+    OPENER_TEMPLATES,
     choose_form,
     choose_opener,
     full_rows_after,
     known_sequence,
     plan_form,
     shift_cells_for_clears,
+    _assist_template,
 )
+from src.education.advisor import rejoin_form
 from src.paths import APP_TITLE, app_root, is_frozen, resource_root
 from src.overlay.renderer import (
     PLAN_DOT_ALPHA,
@@ -1904,6 +1908,27 @@ class _OpenerRun:
         )
 
 
+def _join_midway(
+    template: OpenerTemplate, board: set[tuple[int, int]], sequence: list[str], hold: str | None
+) -> tuple[OpenerForm, list[OpenerStep]] | None:
+    """盤面が図の途中形(既存ブロック+図のミノの一部)と一致すれば、残りの図と手順(rejoin_form)。
+
+    置き済みのミノを既存ブロックに含めた図に書き換える(手順の基準の盤面・砲のみの判定を合わせる)。
+    """
+    joined = rejoin_form(template, board, sequence, hold)
+    if joined is None:
+        return None
+    form, steps = joined
+    done = board - form.existing
+    form = dataclass_replace(
+        form,
+        existing=frozenset(board),
+        items=tuple(it for it in form.items if not set(it.cells) <= done),
+        required=None,
+    )
+    return form, steps
+
+
 def _all_cells(board: BoardState) -> set[tuple[int, int]]:
     """おじゃまも含めた占有マス。"""
     return {(r, c) for r, row in enumerate(board.grid) for c, cell in enumerate(row) if cell is not None}
@@ -2180,6 +2205,9 @@ class AssistWorker(QtCore.QThread):
         pc_odds_enabled: bool = False,
         pc_odds_first: bool = False,
         tdtd_mode: str = "off",
+        dpc_enabled: bool = True,
+        template_full_plan: bool = False,
+        excluded_templates: frozenset[str] = frozenset(),
     ) -> None:
         super().__init__()
         self.calibration = calibration
@@ -2193,6 +2221,12 @@ class AssistWorker(QtCore.QThread):
         # "off"=DPCのみ、"fallback"=DPCが組めないときTDTD、"first"=TDTDを優先(組めないときDPC)。
         # DPCはパフェ後ほぼ必ず組めるため、"fallback"ではTDTDはほとんど出ない
         self._tdtd_mode = tdtd_mode
+        # 【2026-10-04・利用者の要望】支援モードの設定画面(src.assist_view)で候補を個別に切り替える。
+        # dpc_enabled: パフェ後にDPCを提示するか。excluded_templates: 使わない開幕TDテンプレの名前
+        self._dpc_enabled = dpc_enabled
+        # template_full_plan: テンプレの間は表示手数(plan_depth)に関係なく図の残りの手をすべて表示する
+        self._template_full_plan = template_full_plan
+        self._excluded_templates = excluded_templates
         self._opener_tdtd = False  # 進めているテンプレがTDTD(袋がずれたまま)で始めたものか
         self._pc_odds_first = pc_odds_first
         self._pc_odds_search_func = best_odds_move  # 計算の関数(テストでは差し替える)
@@ -2371,6 +2405,15 @@ class AssistWorker(QtCore.QThread):
         self._opener_declined_sequence: list[str] | None = None
         # 直前に置き終えた図のセクション名(2巡目の後のパフェ探索の判定に使う)。
         self._opener_finished_section: str | None = None
+        # 【2026-10-04・利用者の要望】手順を外れて(または次の図が見つからず)やめたテンプレ。シミュレーターと
+        # 同じく、盤面が図の途中形や次の図の開始形に合流したらテンプレの提示へ戻す(_rejoin_run)
+        self._opener_rejoin: OpenerTemplate | None = None
+        self._opener_rejoin_declined = None  # 合流できないと分かった局面(同じ局面では探し直さない)
+        self._continue_miss_logged = None  # 次の図が見つからない理由を書いた局面(同じ内容は1回だけ)
+        # おじゃまがある盤面で、テンプレのTスピンを打ち終えた(この後は、先頭がTスピンの図しか続けない)
+        self._opener_spun_with_garbage = False
+        # 開幕の1手目が置けなくなった(実在しない操作ミノで選んでいた)と最初に見た時刻(_restart_stale_opener)
+        self._opener_stale_since: float | None = None
         # 3巡目の図が無いときのパフェ探索(別スレッド)。_PerfectClearSearch参照。
         self._pc_search: _PerfectClearSearch | None = None
         # キャプチャごとに増える通し番号。復元の確定に「別のキャプチャで同じ
@@ -2399,6 +2442,8 @@ class AssistWorker(QtCore.QThread):
                 f"\n===== 支援モード開始 {QtCore.QDateTime.currentDateTime().toString()} "
                 f"(app.pyロード時刻: {_APP_MODULE_LOAD_TIME}) =====\n"
             )
+            # 【2026-10-04・利用者の要望】どの設定で動かしたかをログから分かるようにする
+            self._debug_log_file.write(f"----- 設定: {self._settings_text()} -----\n")
         try:
             while self._running:
                 try:
@@ -3371,6 +3416,7 @@ class AssistWorker(QtCore.QThread):
                     return
 
         self._check_opener_progress(recognition)
+        self._restart_stale_opener(recognition)
         self._maybe_start_opener(recognition)
         if self._opener is not None and self._opener.recovery_pending:
             # 復元待ち: 手順位置が確定していないので古い手も、テンプレの履歴と
@@ -3424,9 +3470,9 @@ class AssistWorker(QtCore.QThread):
                 piece=best.piece,
                 landing_cells=best.landing_cells,
                 use_hold=best.use_hold,
-                plan_steps=_plan_steps_on_screen(recognition.board, best)[: self._plan_depth - 1],
+                plan_steps=_plan_steps_on_screen(recognition.board, best)[: self._shown_plan_count()],
                 label=(
-                    f"開幕テンプレ\n{self._opener.template.name_ja}\n{self._opener.label_section()}"
+                    f"{self._opener_kind()}\n{self._opener.template.name_ja}\n{self._opener.label_section()}"
                     if self._opener is not None
                     else _tspin_label(recognition.board, best)
                 ),
@@ -3911,6 +3957,8 @@ class AssistWorker(QtCore.QThread):
                 if opener.recovery_snapshot is not None:
                     opener.recovery_snapshot = self._snapshot_opener(opener, opener.recovery_snapshot.turn)
                 self._log_opener(f"おじゃま{garbage_rise}行: 手順を上へずらして続行")
+                if not self._limit_steps_for_garbage(opener, placed_current=opener.awaiting_since is not None):
+                    return
             if locked_now and opener.awaiting_since is None:
                 # 固定を検知した。盤面が手順どおりになったかは、光っている
                 # 置いたばかりのミノが読み切れていない等で同じtickには確定
@@ -3953,6 +4001,7 @@ class AssistWorker(QtCore.QThread):
         if not board_cells:
             # 盤面が空: 新しい対局。前のテンプレの続きは忘れる。
             self._opener_continuing = None
+            self._opener_rejoin = None
             # HOLDも空なら対局の最初の手番とみなし、袋の先頭から数え始める
             # (全消去後や途中起動でも盤面は空になりうるが、その区別は
             # 付けられないので、以前からの「空なら開幕」の前提を引き継ぐ)。
@@ -3960,26 +4009,57 @@ class AssistWorker(QtCore.QThread):
             if hold is None:
                 self._opener_locks = 0
         if any(cell is not None and cell[0] is None for row in recognition.pending_grid for cell in row):
+            self._log_continue_miss("盤面が未確定", recognition, None)
             return  # 盤面がまだ確定していない(消えた行が残っている等)
         bag_position = None if self._opener_locks is None else self._opener_locks + (1 if hold is not None else 0)
-        sequence = known_sequence(self._last_current_piece, recognition.next_queue, hold, bag_position)
+        sequence = self._known_sequence(recognition, hold, bag_position)
         if sequence is None:
+            self._log_continue_miss("ミノ順が読めない", recognition, None)
             return
         # 【2026-09-12・利用者の指示】おじゃまが来ていても図は続ける。図は
         # 盤面の最下段から描かれているので、おじゃま行の数だけ下へずらした
         # 座標で既存ブロックを照合し、手順は上へ戻す。
         garbage_rows = _garbage_row_count(recognition.board)
         matched_cells = {(r + garbage_rows, c) for r, c in board_cells}
-        if self._opener_continuing is not None:
+        if self._opener_continuing is not None and garbage_rows:
+            # 【2026-10-04・利用者の指示(案A)】テンプレの続行はおじゃまが無いときだけ。ただし次の図の
+            # 先頭がTスピン(前の図で作った形のTSD等)なら、そのTスピンだけ提示してからAIにする
+            # まだTスピンを打っていなければ(1巡目の後におじゃまが来た等)、次の図のTスピンまでは組む
+            chosen_form = choose_form(self._opener_continuing, matched_cells, sequence, hold)
+            spins = [i for i, st in enumerate(chosen_form[1]) if st.spin] if chosen_form is not None else []
+            if spins and spins[0] == 0:
+                keep = 1
+            elif spins and not self._opener_spun_with_garbage:
+                keep = spins[-1] + 1
+            else:
+                self._log_opener(f"おじゃま{garbage_rows}行が残っているためテンプレを続けない(AIの提示)")
+                self._opener_continuing = None
+                self._opener_continue_since = None
+                return
+            template = self._opener_continuing
+            form, steps = chosen_form[0], chosen_form[1][:keep]
+            self._log_opener(f"おじゃま{garbage_rows}行: 次の図はTスピンまで提示する({keep}手)")
+        elif self._opener_continuing is not None:
             # TDTDの2巡目以降は、余りのミノを図の外へ置く手を許す(plan_formのdiscards)
             discards = TDTD_DISCARDS if self._opener_tdtd else 0
             chosen_form = choose_form(self._opener_continuing, matched_cells, sequence, hold, discards=discards)
+            if chosen_form is None:
+                # 【2026-10-04・実機ログ debug_log_20261004_103551 124〜137行目】迷走砲の1巡目の最後に先置きした
+                # Sが、2巡目の妥協形(通常形 > %S>%Oの場合)では置き済みの1手に当たる。開始形としか照らし合わせず、
+                # 3秒の時間切れの後に合流(_rejoin_run)が拾うまで提示が遅れた。途中形への合流もすぐ探す
+                # (シミュレーターのAdvisor._start_trackと同じ順)
+                # 続きの図(既存ブロックのある図)だけ。1巡目の図は、置いたばかりの最後のミノが読めていないとき
+                # 途中形に見え、置き済みのミノをもう一度提示してしまう
+                follow = self._opener_continuing
+                follow = dataclass_replace(follow, forms=tuple(f for f in follow.forms if f.existing))
+                chosen_form = _join_midway(follow, matched_cells, sequence, hold)
             pc_run = None
             if chosen_form is None:
                 pc_run = self._perfect_clear_run(recognition, board_cells, sequence, hold, garbage_rows)
             if pc_run is not None:
                 template, form, steps = pc_run
             elif chosen_form is None:
+                self._log_continue_miss("図が一致しない・組めない", recognition, sequence)
                 # 【2026-09-12実機】図を置き終えた直後のtickは、置いたばかりの
                 # ミノが光っていて盤面が図と厳密に一致しないことがあり、1回で
                 # 諦めると2巡目が始まらなかった(はちみつ砲)。しばらく探し続ける。
@@ -3989,6 +4069,7 @@ class AssistWorker(QtCore.QThread):
                     self._log_opener(
                         f"次の図が見つからず終了 {self._opener_continuing.name_ja} ミノ順={''.join(sequence)} hold={hold} 盤面={sorted(board_cells)}"
                     )
+                    self._opener_rejoin = self._opener_continuing
                     self._opener_continuing = None
                     self._opener_continue_since = None
                 return
@@ -3996,9 +4077,16 @@ class AssistWorker(QtCore.QThread):
                 template = self._opener_continuing
                 form, steps = chosen_form
         else:
-            if board_cells:
+            if garbage_rows:
+                # 【2026-10-04・利用者の指示】おじゃまが残っている盤面ではテンプレ(合流・DPC・TDTD・開幕)を
+                # 始めない。おじゃまだけの盤面をパフェ後と取り違えてTDTDを始めていた
                 return
-            if hold is not None:
+            if board_cells:
+                rejoined = self._rejoin_run(matched_cells, sequence, hold)
+                if rejoined is None:
+                    return
+                template, form, steps = rejoined
+            elif hold is not None:
                 # 【2026-09-26・利用者の指示】DPCを組める条件のときに限りDPCを提示する:
                 # テンプレを手順どおりに進めてパフェを取った直後で、置いた数が7の倍数-1
                 # (HOLDに前の袋のミノを繰り越し、操作ミノが袋の先頭)。外れたらAI提示に戻る。
@@ -4018,11 +4106,11 @@ class AssistWorker(QtCore.QThread):
                     dpc_sequence = [self._last_current_piece, *dpc_sequence[1:]]
                 chosen = None
                 if self._tdtd_mode == "first":
-                    chosen = choose_tdtd(dpc_sequence or sequence, hold, can_hold=not swapped)
-                if chosen is None:
+                    chosen = choose_tdtd(dpc_sequence or sequence, hold, can_hold=not swapped, excluded=self._excluded_templates)
+                if chosen is None and self._dpc_enabled:
                     chosen = choose_dpc(dpc_sequence or sequence, hold, carried=carried, can_hold=not swapped)
                 if chosen is None and self._tdtd_mode == "fallback":
-                    chosen = choose_tdtd(dpc_sequence or sequence, hold, can_hold=not swapped)
+                    chosen = choose_tdtd(dpc_sequence or sequence, hold, can_hold=not swapped, excluded=self._excluded_templates)
                 if chosen is not None and chosen[0].name_ja != DPC_TEMPLATE_NAME:
                     self._log_opener(f"TDTD(袋がずれたまま{chosen[0].name_ja}を組み直す)")
                     self._opener_tdtd = True
@@ -4033,7 +4121,7 @@ class AssistWorker(QtCore.QThread):
                     return
                 template, form, steps = chosen
             else:
-                chosen = choose_opener(sequence, hold, matched_cells)
+                chosen = choose_opener(sequence, hold, matched_cells, excluded=self._excluded_templates)
                 if chosen is None:
                     if self._opener_declined_sequence != sequence:
                         self._opener_declined_sequence = sequence
@@ -4065,6 +4153,7 @@ class AssistWorker(QtCore.QThread):
             self._opener.recovery_snapshot = self._snapshot_opener(self._opener, turn)
         self._opener_continuing = None
         self._opener_continue_since = None
+        self._opener_rejoin = None
         # AIの提案を先に出していた場合でも、この手番からテンプレの手に切り替える。
         self._committed_placement = None
         self._committed_placement_tbp = None
@@ -4074,6 +4163,147 @@ class AssistWorker(QtCore.QThread):
             f" ミノ順={''.join(sequence)} hold={hold} 手順="
             + " ".join(f"{s.piece}{'(H)' if s.use_hold else ''}{'(spin)' if s.spin else ''}" for s in steps)
         )
+
+    # 開幕の1手目が置けない状態がこの秒数続いたら選び直す。固定の直後は置いたミノが一瞬読めず
+    # 盤面が空に見えることがあるので、すぐには選び直さない(実機では1.5秒間消えたままだった)
+    OPENER_STALE_START_SEC = 0.3
+
+    def _restart_stale_opener(self, recognition: RecognitionResult) -> None:
+        """開幕の図の1手目のミノが、置かれないまま操作ミノにもHOLDにも無くなったら選び直す。
+
+        【2026-10-04・実機ログ debug_log_20261004_102916 34〜58行目・debug_log_20261004_100918 1390〜1428行目】
+        対局開始の直前に、実在しない操作ミノ(前の対局の最後のミノ・読み違い)を先頭にして開幕テンプレを
+        選び、本当の1手目が出てきても、置かれるはずのない1手目の固定を確認待ちの時間切れ(1.5秒)まで
+        待ち続けたため、その間ガイドが消えた。盤面とHOLDが空のままなら、今のミノ順で選び直す。
+        """
+        opener = self._opener
+        stale = (
+            opener is not None
+            and opener.shift_on_clear
+            and not opener.recovery_pending
+            and opener.index == 0
+            and not opener.form.existing
+            and not opener.board
+            and recognition.hold_known
+            and recognition.hold_piece is None
+            and not _all_cells(recognition.board)
+            and self._last_current_piece is not None
+            and opener.steps[0].piece
+            not in _available_pieces(self._last_current_piece, recognition.hold_piece, recognition.next_queue)
+        )
+        if not stale:
+            self._opener_stale_since = None
+            return
+        now = time.monotonic()
+        if self._opener_stale_since is None:
+            self._opener_stale_since = now
+            return
+        if now - self._opener_stale_since < self.OPENER_STALE_START_SEC:
+            return
+        self._log_opener(
+            f"開幕のミノ順が変わったため選び直す({opener.template.name_ja}の1手目{opener.steps[0].piece}が"
+            f"操作={self._last_current_piece}・HOLD=空・NEXT={''.join(p or '?' for p in recognition.next_queue)}で置けない)"
+        )
+        self._opener = None
+        self._opener_stale_since = None
+        self._opener_declined_sequence = None
+
+    def _limit_steps_for_garbage(self, opener: _OpenerRun, placed_current: bool) -> bool:
+        """おじゃまがせり上がったら、残りの手順をTスピン(TSD等)までに切り詰める。
+
+        Tスピンを含まない図は、まだTスピンを打つ前の積み(1巡目等)ならそのまま続ける(次の図のTスピンまで)。
+        Tスピンを打った後の残り(パフェ狙い等)や、テンプレの続きで探したパフェの手順はやめる。
+
+        【2026-10-04・利用者の指示/実機ログ debug_log_20261004_101920 177・231行目】おじゃまがあると
+        パフェは取れないのに、パフェ狙いの手順を最後まで出していた。Tスピンを打ったらAIの提示にする。
+        placed_current: 今の手は置き済み(確認待ち)で、切り詰めの対象外。
+        戻り値: テンプレを続けるか(Tスピンの手が残っておらず、今の手も置いていなければやめてAIにする)。
+        """
+        # テンプレの続きで探したパフェの手順(Tスピンを含まない)は、おじゃまがあればパフェにならないのでやめる
+        start = opener.index + (1 if placed_current else 0)
+        rest = opener.steps[start:]
+        last_spin = max((i for i, st in enumerate(rest) if st.spin), default=None)
+        if last_spin is None and opener.shift_on_clear and not any(st.spin for st in opener.steps[:start]):
+            return True  # Tスピンを打つ前の積み(1巡目等): 次の図のTスピンまで積み続ける
+        kept = [] if last_spin is None else rest[: last_spin + 1]
+        if len(kept) == len(rest):
+            return True
+        opener.steps = opener.steps[:start] + kept
+        if start >= len(opener.steps) and not placed_current:
+            self._log_opener("おじゃまがあり、Tスピンの手が残っていないためテンプレをやめる(AIの提示)")
+            self._opener = None
+            self._opener_continuing = None
+            return False
+        self._log_opener(f"おじゃまがあるためTスピンまでで切り上げる(残り{len(opener.steps) - opener.index}手)")
+        return True
+
+    def _opener_kind(self) -> str:
+        """HOLD欄の下に出すテンプレの種類。
+
+        【2026-10-04・利用者の指示】開幕テンプレは最初だけ。パフェ後に袋がずれたまま組み直すTD系
+        テンプレ(2回目以降)は「TDTD」と表記する。
+        """
+        return "TDTD" if self._opener_tdtd else "開幕テンプレ"
+
+    def _known_sequence(self, recognition: RecognitionResult, hold: str | None, bag_position: int | None) -> list[str] | None:
+        """操作ミノ+NEXT5枠から分かるミノ順(袋の位置が分かれば7個目も補う)。
+
+        【2026-10-04・実機ログ debug_log_20261004_105351 117〜128行目】HOLDのミノ(前の袋の繰り越し)も袋の
+        先頭の候補にしていたため、HOLDのミノがNEXTに見えていないと先頭を決められず7個目を補えず、
+        HOLD+次の袋7個を使うはちみつ砲の2巡目が組めなかった(シミュレーターで2026-09-24に直したものと同じ)。
+        この手番でまだHOLDしていなければ、袋の先頭は操作ミノ(HOLDのミノは前の手番から持っているもの)。
+        HOLD済みなら、新しく出たミノがHOLD欄に入った可能性があるので、従来どおり両方を候補にする。
+        """
+        head_hold = hold if self._disallow_hold_active else None
+        return known_sequence(self._last_current_piece, recognition.next_queue, head_hold, bag_position)
+
+    def _rejoin_run(
+        self, board: set[tuple[int, int]], sequence: list[str], hold: str | None
+    ) -> tuple[OpenerTemplate, OpenerForm, list[OpenerStep]] | None:
+        """やめたテンプレ(_opener_rejoin)か別の開幕テンプレに、今の盤面が合流していれば続きの図と手順。
+
+        【2026-10-04・利用者の要望】支援モードは手順を一度外れるとテンプレの提示をやめ、2巡目を早々に
+        あきらめていた。シミュレーター(Advisor._start_track)と同じく、毎手番、盤面が
+        ①図の開始形(既存ブロック+光った残像程度)か ②図の途中形(既存ブロック+図のミノの一部、rejoin_form)
+        に一致したら提示へ戻す。Tスピンだけの図は一致判定がゆるいので使わない(startable_templateと同じ)。
+        """
+        if self._opener_rejoin is None:
+            return None
+        key = (self._opener_rejoin.name_ja, frozenset(board), tuple(sequence), hold)
+        if key == self._opener_rejoin_declined:
+            return None
+        # 【2026-10-04・利用者の要望】はちみつ砲と迷走砲のどちらでも組める局面で、提示と違う方を組み始めたら、
+        # その別のテンプレの途中形に合流して提示を切り替える。やめたテンプレを先に探す
+        others = [t for t in OPENER_TEMPLATES if t.name_ja != self._opener_rejoin.name_ja]
+        for candidate in [self._opener_rejoin, *others]:
+            if candidate.name_ja in self._excluded_templates:
+                continue
+            template = _assist_template(candidate)
+            # 開始形の一致は続きの図(既存ブロックあり)だけ。途中形は1巡目の図も(盤面と完全一致のときだけ合流する)
+            joinable = dataclass_replace(template, forms=tuple(f for f in template.forms if not f.is_spin_only()))
+            if candidate is self._opener_rejoin:
+                startable = dataclass_replace(joinable, forms=tuple(f for f in joinable.forms if f.existing))
+                chosen = choose_form(startable, board, sequence, hold) or _join_midway(joinable, board, sequence, hold)
+            else:
+                # 別のテンプレは、盤面が図の途中形と完全に一致するときだけ(開始形の一致はゆるく、取り違えやすい)
+                chosen = _join_midway(joinable, board, sequence, hold)
+            if chosen is None:
+                continue
+            form, steps = chosen
+            if candidate is self._opener_rejoin:
+                self._log_opener(f"合流: {template.name_ja} [{form.section}] に戻る")
+            else:
+                self._log_opener(f"合流: {self._opener_rejoin.name_ja}から{template.name_ja} [{form.section}] に切り替える")
+            return template, form, steps
+        self._opener_rejoin_declined = key
+        return None
+
+    def _shown_plan_count(self) -> int | None:
+        """読み筋(2手目以降)を何手まで表示するか。Noneは制限なし。"""
+        # 【2026-10-04・利用者の要望】途中で見えたパフェ(テンプレの続きのパフェ・継続パフェ)も、すべての手を表示する
+        if self._template_full_plan and self._opener is not None:
+            return None  # テンプレの図(7種1巡)・パフェの手順の残りをすべて
+        return self._plan_depth - 1
 
     def _maybe_start_pc_odds(self, recognition: RecognitionResult) -> str:
         """継続パフェの手順を探し、成功率が十分なら提示を始める。
@@ -4096,7 +4326,7 @@ class AssistWorker(QtCore.QThread):
             return "none"
         hold = recognition.hold_piece
         bag_position = None if self._opener_locks is None else self._opener_locks + (1 if hold is not None else 0)
-        sequence = known_sequence(self._last_current_piece, recognition.next_queue, hold, bag_position)
+        sequence = self._known_sequence(recognition, hold, bag_position)
         if sequence is None:
             return "none"
         pool = _bag_pool(bag_position, sequence)
@@ -4276,6 +4506,8 @@ class AssistWorker(QtCore.QThread):
                         opener.recovery_snapshot = self._snapshot_opener(opener, opener.recovery_snapshot.turn)
                     expected = opener.expected_after_current()
                     self._log_opener(f"固定と同時におじゃま{rise}行: 手順を上へずらして続行")
+                    # 今の手は置き済み(確認待ち)。残りはTスピンまで(無ければこの手で図を終える)
+                    self._limit_steps_for_garbage(opener, placed_current=True)
                     break
         extra = actual - expected
         if expected <= actual and len(extra) < 4:
@@ -4305,6 +4537,8 @@ class AssistWorker(QtCore.QThread):
                     self._opener = None
                     return
                 self._opener_finished_section = opener.form.section
+                # おじゃまがある盤面でTスピンを打ち終えたか(この後は、先頭がTスピンの図しか続けない)
+                self._opener_spun_with_garbage = bool(_garbage_row_count(recognition.board)) and any(st.spin for st in opener.steps)
                 self._opener_continuing = opener.template
                 self._opener_continue_since = None
                 self._opener = None
@@ -4320,6 +4554,8 @@ class AssistWorker(QtCore.QThread):
             self._log_opener(
                 f"中断(手順と異なる盤面 {elapsed:.1f}秒) 期待={sorted(expected)} 実際={sorted(actual)}"
             )
+            if opener.shift_on_clear:  # テンプレの図(パフェ探索の手順は合流先にしない)
+                self._opener_rejoin = opener.template
             self._opener = None
             self._opener_continuing = None
             # 固定は起きている(awaiting_since)ので、置いた数には含める(以後はAI提示の手として数える)
@@ -4365,7 +4601,7 @@ class AssistWorker(QtCore.QThread):
             items.append(dataclass_replace(item, cells=tuple(st.cells)))
         locks = None if self._opener_locks is None else self._opener_locks + 1
         bag_position = None if locks is None else locks + (1 if hold is not None else 0)
-        sequence = known_sequence(self._last_current_piece, recognition.next_queue, hold, bag_position)
+        sequence = self._known_sequence(recognition, hold, bag_position)
         if sequence is None:
             return False
         new_board = opener.board | set(opener.steps[done].cells)
@@ -4389,6 +4625,8 @@ class AssistWorker(QtCore.QThread):
         if opener.current_step() is None:
             self._log_opener(f"図を置き終えた [{opener.form.section}]")
             self._opener_finished_section = opener.form.section
+            # おじゃまがある盤面でTスピンを打ち終えたか(この後は、先頭がTスピンの図しか続けない)
+            self._opener_spun_with_garbage = bool(_garbage_row_count(recognition.board)) and any(st.spin for st in opener.steps)
             self._opener_continuing = opener.template
             self._opener_continue_since = None
             self._opener = None
@@ -4477,6 +4715,8 @@ class AssistWorker(QtCore.QThread):
             if opener.current_step() is None:
                 self._log_opener(f"図を置き終えた [{opener.form.section}]")
                 self._opener_finished_section = opener.form.section
+                # おじゃまがある盤面でTスピンを打ち終えたか(この後は、先頭がTスピンの図しか続けない)
+                self._opener_spun_with_garbage = bool(_garbage_row_count(recognition.board)) and any(st.spin for st in opener.steps)
                 self._opener_continuing = opener.template
                 self._opener_continue_since = None
                 self._opener = None
@@ -4492,6 +4732,36 @@ class AssistWorker(QtCore.QThread):
         self._opener = None
         self._opener_continuing = None
         self._opener_locks = None
+
+    def _log_continue_miss(self, reason: str, recognition: RecognitionResult, sequence: list[str] | None) -> None:
+        """【2026-10-04・調査用】図を置き終えた後、次の図が見つからない理由(同じ内容は1回だけ)。
+
+        実機で、はちみつ砲の1巡目の直後に2巡目が始まらなかった。置いた数(袋の位置)の数え違いか、
+        盤面が未確定だったのかをログから見分けるため、ミノ順・HOLD・置いた数・盤面を書く。
+        """
+        if self._opener_continuing is None:
+            return
+        cells = sorted(_non_garbage_cells(recognition.board))
+        key = (reason, self._last_current_piece, recognition.next_queue, recognition.hold_piece, self._opener_locks, tuple(cells))
+        if key == self._continue_miss_logged:
+            return
+        self._continue_miss_logged = key
+        self._log_opener(
+            f"次の図を探索中({reason}) {self._opener_continuing.name_ja} 操作={self._last_current_piece}"
+            f" NEXT={''.join(p or '?' for p in recognition.next_queue)} hold={recognition.hold_piece}"
+            f" 置いた数={self._opener_locks} ミノ順={''.join(sequence) if sequence else '-'} 盤面={cells}"
+        )
+
+    def _settings_text(self) -> str:
+        """支援モードの設定(src.assist_view)をログ用の1行にする。"""
+        excluded = "・".join(sorted(self._excluded_templates)) or "なし"
+        return (
+            f"テンプレ={'あり' if self._opener_enabled else 'なし'} 外したテンプレ={excluded}"
+            f" DPC={'あり' if self._dpc_enabled else 'なし'} TDTD={self._tdtd_mode}"
+            f" 継続パフェ={'あり' if self._pc_odds_enabled else 'なし'}"
+            f" 途中のパフェ優先={'あり' if self._pc_odds_first else 'なし'}"
+            f" 表示手数={self._plan_depth} テンプレ・パフェは全手表示={'あり' if self._template_full_plan else 'なし'}"
+        )
 
     def _log_opener(self, text: str) -> None:
         if self._debug_log_file is not None:
@@ -4700,6 +4970,7 @@ class MainWindow(QtWidgets.QWidget):
         super().__init__()
         self.setWindowTitle(APP_TITLE)
         self.resize(360, 160)
+        # 【2026-10-04・利用者の指示】設定項目(src.assist_view)は右半分に置く
 
         self.calibration: CalibrationResult | None = None
         self.assist_mode = False
@@ -4721,7 +4992,13 @@ class MainWindow(QtWidgets.QWidget):
 
     # ---------- 通常モードUI ----------
     def _build_normal_ui(self) -> None:
-        layout = QtWidgets.QVBoxLayout(self)
+        outer = QtWidgets.QHBoxLayout(self)
+        layout = QtWidgets.QVBoxLayout()
+        outer.addLayout(layout, 1)
+        # 【2026-10-04・利用者の要望】開幕テンプレ・DPC/TDTD・継続パフェ・表示手数の設定欄
+        # (src.assist_view)。シミュレーターと同じく候補ごとのトグルスイッチ。右半分に置く
+        self.assist_settings = AssistSettingsPanel()
+        outer.addWidget(self.assist_settings, 1)
 
         self.status_label = QtWidgets.QLabel()
         layout.addWidget(self.status_label)
@@ -4769,58 +5046,8 @@ class MainWindow(QtWidgets.QWidget):
             )
             layout.addWidget(self.record_video_checkbox)
 
-        self.opener_checkbox = QtWidgets.QCheckBox("開幕テンプレを提示する(はちみつ砲・迷走砲・山岳積み2号・オリーブ積み・ガムシロ積み・パフェ後のDPC)")
-        self.opener_checkbox.setChecked(True)
-        # 【2026-09-29・利用者の要望】継続パフェ(盤面が低いとき、パフェを取れる可能性が高い手順)
-        self.pc_odds_checkbox = QtWidgets.QCheckBox("継続パフェを提示する(盤面が6段以下のとき、パフェを狙える手順を成功率つきで表示)")
-        self.pc_odds_checkbox.setChecked(True)
-        self.pc_odds_checkbox.setToolTip(
-            "盤面(おじゃま込み)が6段以下のとき、見えていないミノも含めてパフェを取れる確率が一番高い"
-            "手順を探し、成功率が50%以上なら読めている手数だけ表示します。おじゃまが奇数行のとき"
-            "(パフェにならない)や成功率が低いときは、通常のAIの提案を表示します。"
-        )
-        pc_first_row = QtWidgets.QHBoxLayout()
-        pc_first_row.addWidget(QtWidgets.QLabel("テンプレ(DPC等)と継続パフェの両方を組めるとき:"))
-        self.pc_odds_priority_combo = QtWidgets.QComboBox()
-        self.pc_odds_priority_combo.addItems(["テンプレを優先", "継続パフェを優先"])
-        self.pc_odds_priority_combo.setToolTip("対局開始(盤面もHOLDも空)は、どちらでも開幕テンプレを優先します。")
-        pc_first_row.addWidget(self.pc_odds_priority_combo)
-        pc_first_row.addStretch(1)
-
-        depth_row = QtWidgets.QHBoxLayout()
-        depth_row.addWidget(QtWidgets.QLabel("最善手の表示手数(1〜5):"))
-        self.plan_depth_spin = QtWidgets.QSpinBox()
-        self.plan_depth_spin.setRange(1, 5)
-        self.plan_depth_spin.setValue(3)
-        self.plan_depth_spin.setToolTip(
-            "1なら今のミノの置き場所だけ、2以上なら2手目以降の読み筋も"
-            "小さいドット+番号で表示します。ラインが消える手より先は表示しません。"
-        )
-        depth_row.addWidget(self.plan_depth_spin)
-        depth_row.addStretch(1)
-        layout.addLayout(depth_row)
-        self.opener_checkbox.setToolTip(
-            "対局開始時(盤面とHOLDが空)のミノ順から組める開幕テンプレを選び、"
-            "1巡目の手順をAIの提案の代わりに表示します。テンプレ名は"
-            "HOLD欄の下に表示します。テンプレでパフェを取った直後にDPCを組める"
-            "条件がそろえば、DPCも提示します。提示と違う場所に置くと通常のAI提案に戻ります。"
-        )
-        layout.addWidget(self.opener_checkbox)
-        layout.addWidget(self.pc_odds_checkbox)
-        tdtd_row = QtWidgets.QHBoxLayout()
-        tdtd_row.addWidget(QtWidgets.QLabel("パフェ後(繰り越しあり)のテンプレ:"))
-        self.tdtd_combo = QtWidgets.QComboBox()
-        self.tdtd_combo.addItems(["DPCのみ", "DPC優先(組めないときTDTD)", "TDTD優先(組めないときDPC)"])
-        self.tdtd_combo.setCurrentIndex(1)
-        self.tdtd_combo.setToolTip(
-            "TDTD: TD系テンプレ(迷走砲・はちみつ砲・山岳積み2号・ガムシロ積み)で8段パフェを取った後、HOLDに前の袋の"
-            "ミノが残って袋がずれたまま、TD系テンプレを1巡目から組み直します。\n"
-            "DPCはパフェ後ほぼ必ず組めるため、「DPC優先」ではTDTDはほとんど出ません。"
-        )
-        tdtd_row.addWidget(self.tdtd_combo)
-        tdtd_row.addStretch(1)
-        layout.addLayout(tdtd_row)
-        layout.addLayout(pc_first_row)
+        # 【2026-10-04・利用者の要望】開幕テンプレ・DPC/TDTD・継続パフェの切り替えは設定欄
+        # (src.assist_view)にまとめ、シミュレーターと同じく候補ごとのトグルスイッチにした
 
         # 【教育モード(2026-09-22着手・第1段階)】画像認識を使わない一人用の練習画面。
         # 仕様は input/教育/教育モード仕様書_説明と参照資料.txt。実装は src/education/。
@@ -4850,8 +5077,8 @@ class MainWindow(QtWidgets.QWidget):
         hint.setStyleSheet("color: gray;")
         hint.setWordWrap(True)
         layout.addWidget(hint)
+        layout.addStretch(1)  # 左側の項目を上に詰める(右の設定欄の方が縦に長い)
 
-        self.setLayout(layout)
 
     def _refresh_calibration_status(self) -> None:
         if CONFIG_PATH.exists():
@@ -4951,11 +5178,7 @@ class MainWindow(QtWidgets.QWidget):
             debug_log_path,
             record_video=record_video,
             video_path=video_path,
-            opener_enabled=self.opener_checkbox.isChecked(),
-            plan_depth=self.plan_depth_spin.value(),
-            pc_odds_enabled=self.pc_odds_checkbox.isChecked(),
-            pc_odds_first=self.pc_odds_priority_combo.currentIndex() == 1,
-            tdtd_mode=("off", "fallback", "first")[self.tdtd_combo.currentIndex()],
+            **worker_options(load_assist_view()),
         )
         # 別スレッド(worker)からのシグナルなので、必ずメインスレッドの
         # イベントループ経由で_on_draw_data_readyが呼ばれるよう明示する

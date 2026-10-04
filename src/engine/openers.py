@@ -832,7 +832,7 @@ def is_tdtd_form(template: OpenerTemplate, form: OpenerForm) -> bool:
 
 
 def choose_tdtd(
-    sequence: list[str], hold: str | None, can_hold: bool = True
+    sequence: list[str], hold: str | None, can_hold: bool = True, excluded: frozenset[str] = frozenset()
 ) -> tuple[OpenerTemplate, OpenerForm, list[OpenerStep]] | None:
     """パフェ直後(空の盤面・HOLDに前の袋のミノを繰り越し)から、袋がずれたまま組めるTD系テンプレ。
 
@@ -843,7 +843,7 @@ def choose_tdtd(
         return None
     best: tuple[int, OpenerTemplate, OpenerForm, list[OpenerStep]] | None = None
     for template in OPENER_TEMPLATES + TD_EXTRA_TEMPLATES:
-        if template.name_ja not in TD_TEMPLATE_NAMES:
+        if template.name_ja not in TD_TEMPLATE_NAMES or template.name_ja in excluded:
             continue
         template = _assist_template(template)
         first = replace(template, forms=tuple(f for f in template.forms if f.existing or is_tdtd_form(template, f)))
@@ -860,15 +860,23 @@ def choose_tdtd(
 
 
 def choose_opener(
-    sequence: list[str], hold: str | None = None, board_cells: set[tuple[int, int]] | None = None
+    sequence: list[str],
+    hold: str | None = None,
+    board_cells: set[tuple[int, int]] | None = None,
+    excluded: frozenset[str] = frozenset(),
 ) -> tuple[OpenerTemplate, OpenerForm, list[OpenerStep]] | None:
-    """組めるテンプレを探し、最初に見つかったものと図・手順を返す(既定は空の盤面)。"""
+    """組めるテンプレを探し、最初に見つかったものと図・手順を返す(既定は空の盤面)。
+
+    excluded: 使わないテンプレの名前(支援モードの設定画面で非表示にしたもの)。
+    """
     cells = board_cells if board_cells is not None else set()
     # 【2026-09-23・利用者の指示】1巡目はソフトドロップ(回転入れ)を極力避ける。
     # ハードドロップだけで組めるテンプレがあればそれを選び(並び順が先のもの)、
     # どれも回転入れが要る場合だけ、回転入れの最も少ないテンプレを選ぶ。
     best: tuple[int, OpenerTemplate, OpenerForm, list[OpenerStep]] | None = None
     for template in OPENER_TEMPLATES:
+        if template.name_ja in excluded:
+            continue
         template = _assist_template(template)
         chosen = choose_form(template, cells, sequence, hold)
         if chosen is None:
