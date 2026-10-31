@@ -19,6 +19,7 @@ Tスピンを打つ図などは、すべてこの「既存ブロックの一致�
 
 from __future__ import annotations
 
+import itertools
 import time
 from dataclasses import dataclass, replace
 
@@ -341,6 +342,10 @@ def _srs_reachable(placed: set[tuple[int, int]], piece: str, cells: Cells, spin_
     return reachable20(frozenset(placed), piece, tuple(cells), spin_entry)
 
 
+# 見えていない袋の残り(plan_formのpending)を使うのは、この数まで(来る順をすべて試すため)
+PENDING_LIMIT = 2
+
+
 def plan_form(
     form: OpenerForm,
     sequence: list[str],
@@ -350,6 +355,7 @@ def plan_form(
     can_hold: bool = True,
     discards: int = 0,
     deadline: float | None = None,
+    pending: frozenset[str] = frozenset(),
 ) -> list[OpenerStep] | None:
     """実際のミノ順(先頭が操作中のミノ)とホールドに対して、図を組む手順を返す。
 
@@ -373,7 +379,20 @@ def plan_form(
     増やして探す(置ける位置が多く、一度に許すと組めない図の探索に数秒かかったため)。
     deadline: time.monotonic()がこれを超えたら、余りを置く探索をやめて組めない扱い(None)にする
     (余りを4つまで許すと1手番に80秒かかる局面があった)。
+
+    pending: まだ見えていないが、見えているミノの直後に必ず来るミノ(今の袋の残り。来る順は分からない)。
+    【2026-10-04・利用者の要望/実画面 practice_20261004_190514】TDTDでは袋が1つずれるため、2巡目に要るミノ
+    (はちみつ砲のO)がまだ見えず、1手置くまで図を始められなかった。袋の残りがどの順で来ても組めるときだけ
+    組めるとし、その順の1つの手順を返す(来た順に合わせて組み直すのは呼び出し側。PENDING_LIMIT個まで)。
     """
+    if pending:
+        if len(pending) > PENDING_LIMIT:
+            return None
+        plans = [
+            plan_form(form, [*sequence, *order], hold, placed, allow_tuck, can_hold, discards, deadline)
+            for order in itertools.permutations(sorted(pending))
+        ]
+        return None if any(plan is None for plan in plans) else plans[0]
     if discards > 0 and allow_tuck is None:
         for allowed in range(discards + 1):
             if deadline is not None and time.monotonic() > deadline:
@@ -663,8 +682,11 @@ def choose_form(
     hold: str | None,
     can_hold: bool = True,
     discards: int = 0,
+    pending: frozenset[str] = frozenset(),
 ) -> tuple[OpenerForm, list[OpenerStep]] | None:
     """今の盤面(おじゃまを除く占有)に既存ブロックが一致し、ミノ順で組める図を返す。
+
+    pending: まだ見えていない袋の残り(plan_form参照)。
 
     discards: 余りのミノを図の外へ置いてよい数(plan_form参照。TDTDのとき)。0より大きいときは、
     前の図で図の外に置いたミノが盤面に残っているので、図に無いマスが4マス以上あっても、これから置く
@@ -716,7 +738,10 @@ def choose_form(
             elif len(target - form.existing) >= 4:
                 continue
             placed = set(target) if discards else None
-            steps = plan_form(form, sequence, hold, placed=placed, can_hold=can_hold, discards=-allowed - 1 if discards else 0, deadline=deadline)
+            steps = plan_form(
+                form, sequence, hold, placed=placed, can_hold=can_hold, discards=-allowed - 1 if discards else 0,
+                deadline=deadline, pending=pending,
+            )
             if steps is not None:
                 cost = tuck_count(form.existing, steps)
                 if best is None or cost < best[0]:

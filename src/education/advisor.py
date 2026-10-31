@@ -45,6 +45,7 @@ from src.engine.openers import (
 from src.education.pc_odds import best_odds_move
 from src.education import ren_stack
 from src.education.ren_search import find_ren_plan
+from src.education.pc_process import PcSearchProcess
 from src.education.pc_search import TIMEOUT, PCStep, find_perfect_clear, has_tetris
 from src.education.six_three import WELL_COL, best_move
 from src.engine.srs_reach import difficulty_mark, find_path, find_path_min_soft
@@ -161,6 +162,8 @@ class _OpenerTrack:
     # 手順の各手(添字)のソフトドロップの区間数。図に従っている間は変わらないので覚えて使い回す
     # (【2026-10-02・利用者の指摘(動作が重い)】毎手番、全テンプレの残りの手を全部探し直していた)
     soft_steps: dict = field(default_factory=dict)
+    # 手順の後半が、まだ見えていない袋の残り(plan_formのpending)を仮の順で使っている。置くたびに組み直す
+    provisional: bool = False
 
     def current(self) -> OpenerStep | None:
         return self.steps[self.index] if self.index < len(self.steps) else None
@@ -330,7 +333,11 @@ def startable_template(
 
 
 def rejoin_form(
-    template: OpenerTemplate, board: set[tuple[int, int]], sequence: list[str], hold: str | None
+    template: OpenerTemplate,
+    board: set[tuple[int, int]],
+    sequence: list[str],
+    hold: str | None,
+    pending: frozenset[str] = frozenset(),
 ) -> tuple[OpenerForm, list[OpenerStep]] | None:
     """盤面が図の途中形(既存ブロック+図のミノの一部)と完全に一致すれば、残りの手順。
 
@@ -359,7 +366,7 @@ def rejoin_form(
             form.text,
             form.tuck_pieces,
         )
-        steps = plan_form(rest, sequence, hold, placed=set(board))
+        steps = plan_form(rest, sequence, hold, placed=set(board), pending=pending)
         if steps is None:
             continue
         # 回転入れの少ない手順、同じなら置くミノの多い図(choose_formと同じ優先)
@@ -384,6 +391,8 @@ class Advisor:
     prefer_ai: bool = False
     _engine: object = None
     _engine_failed: bool = False
+    # 候補欄・推奨欄に出すAIの名前(set_engineで切り替える)
+    ai_label: str = AI_LABEL
     _turn_key: tuple | None = None
     _requested_at: float | None = None
     _ai_rec: Recommendation | None = None
@@ -431,9 +440,13 @@ class Advisor:
     _prefetch_executor: object = None
     _prefetch_turn: object = None  # 先読みを始めた手番(同じ手番で二重に始めない)
     _odds_key: object = None  # 計算中・表示中の継続パフェの入力
+    _pc_process: object = None  # パフェ探索の子プロセス(pc_process.PcSearchProcess。初めて探すときに作る)
 
     def close(self) -> None:
         self._cancel_pc()
+        if self._pc_process is not None:
+            self._pc_process.close()  # 子プロセスを残さない
+            self._pc_process = None
         self._cancel_odds()
         self._cancel_prefetch()
         if self._prefetch_executor is not None:
@@ -542,7 +555,7 @@ class Advisor:
         s63_mark = "探索中" if self.s63_pending else (difficulty_mark(s63.soft_sections) if s63 else "")
         if self.opener_enabled and SIX_THREE_ID not in self.hidden:
             result.append(Candidate(SIX_THREE_ID, SIX_THREE_LABEL, s63_mark, "この1手" if s63 else ""))
-        result.append(Candidate(AI_ID, AI_LABEL, mark, scope))
+        result.append(Candidate(AI_ID, self.ai_label, mark, scope))
         return tuple(result)
 
     def choose(self, source_id: str) -> bool:
@@ -642,9 +655,12 @@ class Advisor:
         recs: dict[str, Recommendation] = {}
         # 中あけRENの練習中は、ほかのテンプレを計算しない(左右が高い盤面では図の照合が重く、使わない)。
         # 積み増し・消す段階に入った後は、中開け4列RENの図(1巡目)にも戻らないので計算しない
-        if self._wants_ren() and self.active_id in (REN_ID, REN_STACK_ID):
+        # 【2026-10-04・利用者の指示(案B)】中あけの選択がリセット後も残り、中あけ系しか候補に出なかった。
+        # 対局の最初(盤面が空)は、ほかのテンプレ(TD系等)も候補に並べる(空の盤面では照合も軽い)
+        empty = all(cell is None for row in state.board for cell in row)
+        if self._wants_ren() and self.active_id in (REN_ID, REN_STACK_ID) and not empty:
             return recs
-        only = manual_templates() if self._wants_ren() else None
+        only = manual_templates() if self._wants_ren() and not empty else None
         for template in candidate_templates():
             if template.name_ja in self.hidden or (only is not None and template.name_ja not in only):
                 continue
@@ -744,6 +760,9 @@ class Advisor:
         if plan is not None:
             self._pc_rec = self._pc_recommendation(state, plan)
             return
+        if self._wants_ren():
+            # 【2026-10-04・利用者の指摘(重い)】中あけRENの練習中はパフェを探さない(4列の中あけではまず取れない)
+            return
         inputs = self._pc_inputs(state)
         if inputs is None:
             return
@@ -753,18 +772,19 @@ class Advisor:
             self._remember_pc(state, found)
             self._pc_rec = self._pc_recommendation(state, found)
             return
-        if self._executor is None:
-            self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="education_search")
-        self._pc_cancel = threading.Event()
-        self._pc_future = self._executor.submit(
-            find_perfect_clear, board, sequence, hold, can_hold=can_hold, time_limit=3.0, cancel=self._pc_cancel
-        )
+        # 【2026-10-04・利用者の指摘(重い)】裏のスレッドで探すとGILを取り合ってキー入力・画面の更新が最大1秒
+        # 止まっていた。別のプロセスで探す(新しい依頼を出すと前の探索は打ち切られる)
+        if self._pc_process is None:
+            self._pc_process = PcSearchProcess()
+        self._pc_future = self._pc_process.submit(board, sequence, hold, can_hold, 3.0)
         self.pc_pending = True
 
     def _cancel_pc(self) -> None:
         """局面が変わった: 古い探索を打ち切り、結果を使わない。"""
         if self._pc_cancel is not None:
             self._pc_cancel.set()
+        if self._pc_future is not None and self._pc_process is not None:
+            self._pc_process.cancel()
         self._pc_future = None
         self._pc_cancel = None
         self.pc_pending = False
@@ -1162,6 +1182,23 @@ class Advisor:
         sequence = known_sequence(snap.current, nexts, None, snap.sequence_index - 1)
         return sequence, snap.hold, _board20(snap.board)
 
+    def _bag_rest(self, state: GameState, sequence: list[str]) -> frozenset[str]:
+        """見えているミノ順の直後に必ず来る、今の袋の残りの種類(来る順は分からない)。
+
+        袋の区切りは配った数から分かり、袋のうち既に配られたミノは過去の手番で見えている(未表示の配列は見ない)。
+        見えている最後のミノで袋がちょうど終わるときは、次の袋は7種どれでもあり得るので空。
+        """
+        snap = state.turn_start
+        if snap is None or state.start_position is not None:
+            return frozenset()  # 途中局面から始めた練習は、袋の区切りが分からない
+        first = snap.sequence_index - 1  # 操作ミノの通し番号
+        last = first + len(sequence) - 1
+        if (last + 1) % 7 == 0:
+            return frozenset()
+        start = last // 7 * 7
+        seen = {state.sequence.peek(i) for i in range(start, last + 1)}
+        return frozenset(PIECES) - seen
+
     def _start_track(
         self, state: GameState, template: OpenerTemplate, rejoin: bool = False, continuing: bool = False, tdtd: bool = False
     ) -> _OpenerTrack | None:
@@ -1173,9 +1210,13 @@ class Advisor:
         # TDTDの2巡目以降は、余りのミノを図の外へ置く手を許す(【2026-10-01・利用者の指示】TSDまでは打ち切る)
         discards = TDTD_DISCARDS if tdtd and continuing else 0
         allow_tdtd = TDTD_ID not in self.hidden
-        got = choose_form(
-            startable_template(template, hold, status, continuing, allow_tdtd), board, sequence, hold, discards=discards
-        )
+        startable = startable_template(template, hold, status, continuing, allow_tdtd)
+        got = choose_form(startable, board, sequence, hold, discards=discards)
+        provisional = False
+        if got is None and continuing:
+            # 【2026-10-04・利用者の要望】続きの図に要るミノがまだ見えていなくても、袋の残りから必ず来るなら組む
+            got = choose_form(startable, board, sequence, hold, discards=discards, pending=self._bag_rest(state, sequence))
+            provisional = got is not None
         if got is None:
             # 盤面エディタで図の途中形を作って始めた場合も、ここで合流する
             got = rejoin_form(template, board, sequence, hold)
@@ -1186,7 +1227,7 @@ class Advisor:
         form, steps = got
         # 袋がずれた状態(繰り越しあり)から1巡目の図を始めたらTDTD。続きの図(2巡目以降)も引き継ぐ
         tdtd = tdtd or (template.name_ja in TD_TEMPLATE_NAMES and not form.existing and status == "DPC")
-        return _OpenerTrack(template, form, list(steps), rejoined=rejoin, tdtd=tdtd)
+        return _OpenerTrack(template, form, list(steps), rejoined=rejoin, tdtd=tdtd, provisional=provisional)
 
     def _advance_track(self, state: GameState, prev: _OpenerTrack) -> _OpenerTrack | None:
         step = prev.current()
@@ -1203,6 +1244,19 @@ class Advisor:
         if track.current() is None:
             # 図を置き終えた: 同じテンプレの続きの図(2巡目以降)を探す
             return self._start_track(state, prev.template, continuing=True, tdtd=prev.tdtd)
+        if prev.provisional and not cleared:
+            # 仮の順で組んだ手順: 新しく見えたミノで残りを組み直す(来た順に合わせる)
+            sequence, hold, board = self._turn_sequence(state)
+            if sequence is not None:
+                only = replace(prev.template, forms=(prev.form,))
+                got = rejoin_form(only, board, sequence, hold)
+                still = got is None
+                if got is None:
+                    got = rejoin_form(only, board, sequence, hold, self._bag_rest(state, sequence))
+                if got is not None:
+                    track.steps = track.steps[: track.index] + list(got[1])
+                    track.provisional = still
+                    track.soft_steps = {}
         return track
 
     def _from_track(self, state: GameState, track: _OpenerTrack | None) -> Recommendation | None:
@@ -1273,11 +1327,23 @@ class Advisor:
             piece=move.piece,
             use_hold=use_hold,
             cells=cells,
-            source="AI(Cold Clear 2)",
+            source="AI(Cold Clear 2)" if self.ai_label == AI_LABEL else f"AI({self.ai_label})",
             steps=None if path is None else (("ホールド",) if use_hold else ()) + path[0],
             soft_sections=None if path is None else path[1],
             scope="この1手",
         )
+
+    def set_engine(self, factory, label: str) -> None:
+        """AIのエンジンを切り替える(今のエンジンを終了し、次に考えるとき新しいエンジンを起動する)。
+
+        【2026-10-24・利用者の要望】シミュレーターのAIを Cold Clear 2 / プラグインの思考エンジンから選ぶ。
+        """
+        self.close()
+        self.engine_factory = factory
+        self.ai_label = label
+        self._engine_failed = False
+        self.status = ""
+        self._turn_key = None  # 今の局面を新しいエンジンで考え直す
 
     def _get_engine(self):
         if self._engine is None and not self._engine_failed:

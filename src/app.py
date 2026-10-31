@@ -58,9 +58,22 @@ from src.capture.calibrate import CONFIG_PATH, CalibrationResult, load_calibrati
 from src.capture.screen_capture import CaptureRegion, ScreenCapture
 from src.engine.board_state import BoardState
 from src.engine.cold_clear_client import ColdClearClient, ColdClearMove
+from src.engine.registry import Registry, available_engines, selected_engine
 from src.engine.opener_recovery import RecoveryGate, RecoveryState, RecoveryStep, TurnState, find_recovery
 from src.education.pc_odds import best_odds_move
-from src.assist_view import AssistSettingsPanel, load_assist_view, worker_options
+from src.capture.window_detect import (
+    client_rect,
+    find_game_window,
+    layout_calibration,
+    list_windows,
+    save_saved_window,
+    title_bar_rect,
+)
+from src.plugin_dialog import PluginDialog
+from src.window_dialog import WindowPickDialog
+from src.plugin_loader import PluginManager, save_disabled
+from src.assist_view import load_assist_view, worker_options
+from src.side_settings import SideSettings, side_view_path
 from src.education.pc_search import find_perfect_clear
 from src.education.rules import HIDDEN_ROWS as PC_HIDDEN_ROWS
 from src.engine.openers import (
@@ -124,7 +137,7 @@ SAFETY_TIMEOUT_MS = 10 * 60 * 1000  # 10分
 DEBUG_LOG_DIR = app_root() / "debug_logs"
 
 
-def _new_debug_log_paths() -> tuple[Path, Path]:
+def _new_debug_log_paths(side: str = "1p") -> tuple[Path, Path]:
     """支援モード開始のたびに呼び、上書きされない一意なログ・動画パスを返す。
 
     ログと動画を同じタイムスタンプにすることで、あとから同じ支援モードの
@@ -132,6 +145,8 @@ def _new_debug_log_paths() -> tuple[Path, Path]:
     """
     DEBUG_LOG_DIR.mkdir(exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if side == "2p":
+        timestamp += "_2p"  # 【2026-10-31】ローカル対戦の 2P(1P と同時に始めても名前が重ならないように)
     return (
         DEBUG_LOG_DIR / f"debug_log_{timestamp}.txt",
         DEBUG_LOG_DIR / f"debug_capture_{timestamp}.mp4",
@@ -1713,15 +1728,78 @@ class OverlayWindow(QtWidgets.QWidget):
                 )
 
 
-class ControlBadge(QtWidgets.QWidget):
-    """支援モード中に常時表示する、クリックスルーなしの小さな終了バッジ。
+# 止めるボタンの見た目(ゲームの白いタイトルバーの上でも見えるよう、黒地・白の太字。PBA と同じ)
+STOP_BUTTON_STYLE = "QPushButton { color: white; background: #111; font-weight: bold; border: 1px solid #555; padding: 2px 14px; }"
 
-    オーバーレイ本体はクリックスルーにするため、ユーザーが確実にクリックで
-    支援モードを終了できる手段をこのバッジ経由で必ず確保する。
+
+class InfoPanel(QtWidgets.QWidget):
+    """支援モード中の状態の表示(情報パネル)。クリックを通し、フォーカスも奪わない。
+
+    【2026-10-30・利用者の要望】ゲームのウィンドウの左下に置く(place_badge)。
     """
 
-    def __init__(self, on_stop) -> None:  # noqa: ANN001
+    def __init__(self, text: str, background: str = "rgba(0,0,0,190)") -> None:
         super().__init__()
+        self.setWindowFlags(
+            QtCore.Qt.WindowType.FramelessWindowHint
+            | QtCore.Qt.WindowType.WindowStaysOnTopHint
+            | QtCore.Qt.WindowType.Tool
+            | QtCore.Qt.WindowType.WindowTransparentForInput
+        )
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        layout = QtWidgets.QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.label = QtWidgets.QLabel(text)
+        self.label.setStyleSheet(f"color: white; background: {background}; padding: 4px 8px;")
+        layout.addWidget(self.label)
+
+    def set_text(self, text: str) -> None:
+        self.label.setText(text)
+        self.adjustSize()
+
+
+def place_badge(stop_widget: QtWidgets.QWidget, info: QtWidgets.QWidget, game_window, side: str = "1p") -> None:  # noqa: ANN001
+    """止めるボタンをゲームのタイトルバーの中央に、情報パネルをゲームのウィンドウ(描画領域)の左下に置く。
+
+    【2026-10-30・利用者の要望】タイトルバーが分からない時(Switch のキャプチャ・全画面)は、従来どおり画面の右上に置く。
+    Win32 の位置は物理ピクセル、Qt の位置は論理ピクセルなので devicePixelRatio で割る(オーバーレイと同じ)。
+    """
+    dpr = QtWidgets.QApplication.primaryScreen().devicePixelRatio()
+    screen = QtWidgets.QApplication.primaryScreen().geometry()
+    stop_widget.adjustSize()
+    info.adjustSize()
+    bar = title_bar_rect(game_window.hwnd) if game_window is not None else None
+    two_p = side == "2p"  # 【2026-10-31】ローカル対戦の 2P: 1P のボタン・パネルと重ならないよう右にずらす
+    if bar is not None:
+        left, top, width, height = bar
+        stop_widget.setFixedHeight(max(20, round(height / dpr)))
+        center = (left + width / 2) / dpr
+        x = round(center) + 8 if two_p else round(center - stop_widget.width() / 2)
+        stop_widget.move(x, round(top / dpr))
+    else:
+        stop_widget.move(screen.width() - stop_widget.width() - 20, 20)
+    if game_window is not None:
+        bottom = round((game_window.top + game_window.height) / dpr) - info.height() - 12
+        if two_p:  # 2P は右下
+            info.move(round((game_window.left + game_window.width) / dpr) - info.width() - 12, bottom)
+        else:
+            info.move(round(game_window.left / dpr) + 12, bottom)
+    else:
+        info.move(stop_widget.x() + stop_widget.width() - info.width(), stop_widget.y() + stop_widget.height() + 4)
+
+
+class ControlBadge(QtWidgets.QWidget):
+    """支援モード中に常時表示する、クリックスルーなしの小さな終了ボタン(と情報パネル)。
+
+    オーバーレイ本体はクリックスルーにするため、ユーザーが確実にクリックで
+    支援モードを終了できる手段をこのボタン経由で必ず確保する。
+    【2026-10-30・利用者の要望】ボタンはゲームのタイトルバーの中央、状態の表示は左下(place)。
+    """
+
+    def __init__(self, on_stop, side: str = "1p") -> None:  # noqa: ANN001
+        super().__init__()
+        self._side = side  # 【2026-10-31】2P の時はボタン・情報パネルを 1P と重ならない位置に置く
         self.setWindowFlags(
             QtCore.Qt.WindowType.FramelessWindowHint
             | QtCore.Qt.WindowType.WindowStaysOnTopHint
@@ -1734,17 +1812,31 @@ class ControlBadge(QtWidgets.QWidget):
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_ShowWithoutActivating)
 
         layout = QtWidgets.QHBoxLayout(self)
-        label = QtWidgets.QLabel("支援モード中")
-        label.setStyleSheet("color: white; background: rgba(0,0,0,190); padding: 4px 8px;")
-        layout.addWidget(label)
-
-        stop_btn = QtWidgets.QPushButton("終了")
+        layout.setContentsMargins(0, 0, 0, 0)
+        stop_btn = QtWidgets.QPushButton("支援モードを終了")
+        stop_btn.setStyleSheet(STOP_BUTTON_STYLE)
         stop_btn.clicked.connect(on_stop)
         layout.addWidget(stop_btn)
+        self.info = InfoPanel("支援モード中")
+        self._game_window = None
+        place_badge(self, self.info, None, self._side)
 
-        self.resize(220, 44)
-        screen = QtWidgets.QApplication.primaryScreen().geometry()
-        self.move(screen.width() - self.width() - 20, 20)
+    def place(self, game_window) -> None:  # noqa: ANN001
+        self._game_window = game_window
+        place_badge(self, self.info, game_window, self._side)
+
+    def set_plan(self, text: str) -> None:
+        """狙い・今の手(plan_text_ready)を出す。【2026-10-31・利用者の要望】PBA のように情報パネルに出す。"""
+        self.info.set_text("支援モード中" + (f"\n{text}" if text else ""))
+        place_badge(self, self.info, self._game_window, self._side)  # 文字の長さが変わっても左下(2P は右下)にそろえる
+
+    def showEvent(self, event: QtGui.QShowEvent) -> None:  # noqa: N802
+        super().showEvent(event)
+        self.info.show()
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802
+        self.info.close()
+        super().closeEvent(event)
 
 
 @dataclass
@@ -1863,6 +1955,9 @@ class _OpenerRun:
     # 直前のtickが信頼できる観測だった場合、その時刻。無効な観測でNoneに戻す。
     recovery_last_valid_at: float | None = None
     recovery_gate: RecoveryGate = field(default_factory=RecoveryGate)
+    # 手順の後半が、まだ見えていない袋の残り(plan_formのpending)を仮の順で使っている(_replan_provisional)
+    provisional: bool = False
+    replanned_index: int | None = None  # 組み直しを試した手(同じ手で何度も試さない)
 
     def note_invalid_observation(self) -> None:
         """復元待ち中に信頼できない観測(認識失敗・手番不明・盤面保留)があった。
@@ -2022,6 +2117,32 @@ def _tspin_label(board: BoardState, move: ColdClearMove) -> str | None:
     return "狙い: " + names.get(lines, f"Tスピン({lines}ライン)")
 
 
+def plan_panel_text(board: BoardState, move: ColdClearMove, aim: str | None) -> str:
+    """情報パネルに出す「狙い」と「今の手」。
+
+    【2026-10-31・利用者の要望】PBA のように、狙っている手(テンプレの名前など)と今の手を情報パネルに出す。
+    aim: 開幕テンプレ等の名前(無ければ AI の手)。
+    """
+    placed = board.clone()
+    for r, c in move.landing_cells:
+        if 0 <= r < placed.height and 0 <= c < placed.width:
+            placed.grid[r][c] = move.piece
+    _cleared, lines = placed.clear_lines()
+    spin = _tspin_label(board, move)
+    if spin is not None:
+        kind = spin.removeprefix("狙い: ")
+    elif lines == 4:
+        kind = "4ライン消し(テトリス)"
+    elif lines:
+        kind = f"{lines}ライン消し"
+    else:
+        kind = ""
+    if lines and not any(cell is not None for row in _cleared.grid for cell in row):
+        kind = f"パーフェクトクリア({kind})"
+    current = f"今の手: {move.piece}" + ("(HOLDして)" if move.use_hold else "") + (f" {kind}" if kind else "")
+    return f"狙い: {aim or '定型なし(AIの手)'}\n{current}"
+
+
 def _plan_steps_on_screen(board: BoardState, move: ColdClearMove) -> list[PlanStep]:
     """読み筋(2手目以降)のうち、今の画面座標のまま表示できる手を返す。
 
@@ -2064,6 +2185,8 @@ class AssistWorker(QtCore.QThread):
     """
 
     draw_data_ready = QtCore.pyqtSignal(object)  # OverlayDrawData | None
+    # 情報パネルに出す狙い・今の手(plan_panel_text)。【2026-10-31・利用者の要望】
+    plan_text_ready = QtCore.pyqtSignal(str)
     # 【2026-09-07・暫定のデバッグ機能】NEXT欄のテンプレートマッチングが
     # 実際に正しく認識できているかを実機で目視確認できるよう、毎tickの
     # 生の認識結果(recognition.next_slots_raw、5枠・認識失敗はNone)を
@@ -2208,10 +2331,15 @@ class AssistWorker(QtCore.QThread):
         dpc_enabled: bool = True,
         template_full_plan: bool = False,
         excluded_templates: frozenset[str] = frozenset(),
+        separate_recognition: bool = False,
     ) -> None:
         super().__init__()
         self.calibration = calibration
         self.cold_clear = cold_clear
+        # 【2026-10-31・利用者の指摘(ローカル対戦で双方とも遅い)】撮影と認識を別のプロセスで行う(src/recognize_process.py)。
+        # 1P と 2P を同時に動かす時に使う(同じプロセスでは2人分の認識が取り合いになり、1回 75ms → 約125ms に遅くなった)
+        self._separate_recognition = separate_recognition
+        self._recognizer = None
         # 対局開始時に開幕テンプレ(src.engine.openers)を提示するか。
         self._opener_enabled = opener_enabled
         # 継続パフェを提示するか。pc_odds_first: パフェの後などテンプレ(DPC等)も組めるとき継続パフェを優先
@@ -2319,6 +2447,7 @@ class AssistWorker(QtCore.QThread):
         # 認識失敗が連続し始めた時刻(_note_recognition_failure参照)。
         # 失敗していない間はNone。
         self._recognition_failure_started_at: float | None = None
+        self._last_raw_recognition: RecognitionResult | None = None  # 安定化する前の最新の認識結果(全自動用)
         # 現在Cold Clear 2へ質問している局面の識別情報(_turn_key参照)。
         # start_thinkingのたびに更新し、結果を表示する前に照合する。
         self._thinking_turn_key: tuple[str | None, str | None, tuple[str, ...]] | None = None
@@ -2331,6 +2460,8 @@ class AssistWorker(QtCore.QThread):
         self._current_piece_disagreement_ticks = 0
         # 手番キーがCold Clear 2への要求時と食い違い続けたtick数。
         self._turn_key_mismatch_ticks = 0
+        # AIの提案が今の盤面で物理的に成立しない状態が続いた回数(INVALID_SUGGESTION_RETHINK_TICKS参照)。
+        self._invalid_suggestion_ticks = 0
         # NEXTの移動量を判断できなかったtick数(_estimate_next_shift参照)。
         self._next_shift_undecided_ticks = 0
         # 直前tickで観測が基準の1枠だけと矛盾していた場合の(枠番号, 観測値)。
@@ -2410,6 +2541,7 @@ class AssistWorker(QtCore.QThread):
         self._opener_rejoin: OpenerTemplate | None = None
         self._opener_rejoin_declined = None  # 合流できないと分かった局面(同じ局面では探し直さない)
         self._continue_miss_logged = None  # 次の図が見つからない理由を書いた局面(同じ内容は1回だけ)
+        self._pending_declined = None  # 袋の残りを使っても続きの図が組めないと分かった局面
         # おじゃまがある盤面で、テンプレのTスピンを打ち終えた(この後は、先頭がTスピンの図しか続けない)
         self._opener_spun_with_garbage = False
         # 開幕の1手目が置けなくなった(実在しない操作ミノで選んでいた)と最初に見た時刻(_restart_stale_opener)
@@ -2430,6 +2562,13 @@ class AssistWorker(QtCore.QThread):
 
     def run(self) -> None:  # noqa: D102 - QThreadの規約通りの名前
         capture = ScreenCapture()
+        if self._separate_recognition:
+            from src.recognize_process import RecognizerProcess
+
+            try:
+                self._recognizer = RecognizerProcess()
+            except (OSError, TimeoutError) as exc:
+                print(f"画像認識の子プロセスを使えません(このスレッドで認識します): {exc}")
         if self._debug_log_path is not None:
             self._debug_log_path.parent.mkdir(exist_ok=True)
             self._debug_log_file = open(self._debug_log_path, "a", encoding="utf-8")
@@ -2471,6 +2610,9 @@ class AssistWorker(QtCore.QThread):
                     break
         finally:
             capture.close()
+            if self._recognizer is not None:
+                self._recognizer.close()
+                self._recognizer = None
             if self._debug_log_file is not None:
                 self._debug_log_file.close()
             if self._video_writer is not None:
@@ -2487,15 +2629,25 @@ class AssistWorker(QtCore.QThread):
         debug_dir = DEBUG_FRAMES_DIR if self._debug_log_file is not None else None
         recognize_started = time.perf_counter()
         try:
-            recognition = recognize(
-                self.calibration,
-                capture,
+            hints = dict(
                 debug_save_dir=debug_dir,
                 previous_piece_hint=self._last_current_piece,
                 previous_settled_top_row_hint=self._last_settled_top_row,
                 previous_confirmed_grid_hint=self._last_confirmed_grid,
                 previous_pending_grid_hint=self._last_pending_grid,
             )
+            recognition = None
+            if self._recognizer is not None:
+                try:
+                    recognition = self._recognizer.recognize(self.calibration, **hints)
+                except (OSError, EOFError, TimeoutError, RuntimeError) as exc:
+                    # 子プロセスが動かなくなった。以後はこのスレッドで認識する
+                    if self._debug_log_file is not None:
+                        self._debug_log_file.write(f"\n===== 画像認識の子プロセスをやめる: {exc} =====\n")
+                    self._recognizer.close()
+                    self._recognizer = None
+            if self._recognizer is None:
+                recognition = recognize(self.calibration, capture, **hints)
         except Exception as exc:  # noqa: BLE001 - 認識失敗の1フレームでループ全体を止めない
             # pythonw環境ではsys.stdoutがdevnullに差し替えられており、
             # print()だけでは何も報告されないのと同じになる(28番の
@@ -2617,6 +2769,8 @@ class AssistWorker(QtCore.QThread):
         # ためのヒント更新であり、常に生の(今tickの)認識結果を使う。
         # 以降の「新規スポーン検知・提案生成」には、_stabilize_recognitionで
         # 複数tick分の安定を確認した結果を使う(詳細はそのdocstring参照)。
+        # 【2026-10-30】全自動モードがソフトドロップ中のミノの位置を見るため、安定化する前の今tickの結果も残す
+        self._last_raw_recognition = recognition
         recognition = self._stabilize_recognition(recognition)
 
         # 現在表示中の提案が指す着地マスが、最新の盤面認識では既に
@@ -3417,6 +3571,7 @@ class AssistWorker(QtCore.QThread):
 
         self._check_opener_progress(recognition)
         self._restart_stale_opener(recognition)
+        self._replan_provisional(recognition)
         self._maybe_start_opener(recognition)
         if self._opener is not None and self._opener.recovery_pending:
             # 復元待ち: 手順位置が確定していないので古い手も、テンプレの履歴と
@@ -3460,7 +3615,45 @@ class AssistWorker(QtCore.QThread):
             # 盤面認識のズレか座標変換の誤りか特定できていないが、原因を
             # 問わず、少なくともこの種の提案はユーザーに見せるべきではない）。
             # このtickでは新しい提案が得られなかったものとして扱う。
+            best_before_check = best
             best = None
+            self._invalid_suggestion_ticks += 1
+            if (
+                self._invalid_suggestion_ticks >= self.INVALID_SUGGESTION_RETHINK_TICKS
+                and self._last_current_piece is not None
+            ):
+                self._invalid_suggestion_ticks = 0
+                if self._debug_log_file is not None:
+                    # 【2026-10-31・調査ログ】考え直しても同じ成立しない手が返り続けた(debug_log_20261031_095037_2p)。
+                    # AIへ渡す盤面(揃った行を消した後)と、照合に使う盤面が食い違っていないかを確かめるため、両方を書く
+                    sent, cleared = recognition.board.clear_lines()
+                    rows = [
+                        "".join("." if c is None else ("#" if c in ("GARBAGE", "UNKNOWN") else c[0]) for c in row)
+                        for row in recognition.board.grid
+                    ]
+                    first = next((i for i, r in enumerate(rows) if r != ".........."), len(rows))
+                    self._debug_log_file.write(
+                        f"----- 成立しない提案が続いたので今の盤面で考え直す (提案={best_before_check.piece} "
+                        f"{list(best_before_check.landing_cells)} AIへ渡す前に消える揃った行={cleared}) -----\n"
+                        + "\n".join(f"{i:2d} {r}" for i, r in enumerate(rows) if i >= first) + "\n"
+                    )
+                    self._debug_log_file.flush()
+                self._thinking_turn_key = current_turn_key
+                self._cc_continuation = None  # 局面を渡し直すので、Cold Clear 2の内部局面との対応は失われる
+                try:
+                    self.cold_clear.start_thinking(
+                        recognition.board,
+                        self._last_current_piece,
+                        effective_hold_for_key,
+                        list(recognition.next_queue),
+                        disallow_hold=self._disallow_hold_active,
+                    )
+                except COLD_CLEAR_ERRORS as exc:
+                    self._handle_cold_clear_failure(exc)
+                    self.msleep(self.IDLE_SLEEP_MS)
+                    return
+        elif best is not None:
+            self._invalid_suggestion_ticks = 0
 
         if best is not None:
             best = self._stabilize_suggestion(best)
@@ -3481,6 +3674,12 @@ class AssistWorker(QtCore.QThread):
                 self._last_valid_draw_data = draw_data
                 self._last_draw_data_set_time = time.monotonic()
                 self.draw_data_ready.emit(draw_data)
+                aim = (
+                    f"{self._opener_kind()} {self._opener.template.name_ja} {self._opener.label_section()}".strip()
+                    if self._opener is not None
+                    else None
+                )
+                self.plan_text_ready.emit(plan_panel_text(recognition.board, best, aim))
                 if self._debug_log_file is not None:
                     self._save_frame_history(recognition, best)
 
@@ -3590,6 +3789,11 @@ class AssistWorker(QtCore.QThread):
     # やり直す。1tickだけの食い違い(HOLD欄の認識ノイズ等)で毎回
     # start_thinkingし直すと探索がゼロからやり直しになるため。
     TURN_KEY_MISMATCH_RETHINK_TICKS = 3
+    # 【2026-10-31・実機ログ debug_log_20261031_094305_2p】おじゃまで盤面がせり上がると、AIは前の盤面のまま考え続け、
+    # その手が「物理的に成立しない」として捨てられ続けた(6〜20秒、全自動の2Pが手を送れずミノが自然落下して積み上がった)。
+    # 成立しない提案がこの回数続いたら、今の盤面で考え直させる。せり上がりの最中は「信頼できる読み取り」が続かないので、
+    # 手番の食い違いの立て直しと違ってその条件は付けない(考え直しの盤面がまた変わっても、次の3回でまた考え直す)
+    INVALID_SUGGESTION_RETHINK_TICKS = 3
 
     def _apply_hold_swap_if_any(self, recognition: RecognitionResult, next_shift: int | None) -> bool:
         """既存HOLDとの交換を検出し、内部が持つ操作ミノを入れ替える。
@@ -3771,7 +3975,7 @@ class AssistWorker(QtCore.QThread):
         if time.monotonic() < self._cold_clear_retry_at:
             return False
         try:
-            self.cold_clear = ColdClearClient()
+            self.cold_clear = ColdClearClient(selected_engine()[1])  # 【2026-10-31】メイン画面で選んだ思考エンジン
         except Exception as exc:  # noqa: BLE001 - 起動失敗でもループは続ける
             self._cold_clear_retry_at = time.monotonic() + self.COLD_CLEAR_RESTART_COOLDOWN_SEC
             if self._debug_log_file is not None:
@@ -4021,6 +4225,7 @@ class AssistWorker(QtCore.QThread):
         # 座標で既存ブロックを照合し、手順は上へ戻す。
         garbage_rows = _garbage_row_count(recognition.board)
         matched_cells = {(r + garbage_rows, c) for r, c in board_cells}
+        provisional = False
         if self._opener_continuing is not None and garbage_rows:
             # 【2026-10-04・利用者の指示(案A)】テンプレの続行はおじゃまが無いときだけ。ただし次の図の
             # 先頭がTスピン(前の図で作った形のTSD等)なら、そのTスピンだけ提示してからAIにする
@@ -4053,6 +4258,17 @@ class AssistWorker(QtCore.QThread):
                 follow = self._opener_continuing
                 follow = dataclass_replace(follow, forms=tuple(f for f in follow.forms if f.existing))
                 chosen_form = _join_midway(follow, matched_cells, sequence, hold)
+            pending_key = (frozenset(matched_cells), tuple(sequence), hold, bag_position)
+            if chosen_form is None and not garbage_rows and bag_position is not None and pending_key != self._pending_declined:
+                # 【2026-10-04・利用者の要望】続きの図に要るミノがまだ見えていなくても(TDTDで袋がずれているとき等)、
+                # 今の袋の残りから必ず来るなら組む(来た順に合わせて _replan_provisional で組み直す)
+                chosen_form = choose_form(
+                    self._opener_continuing, matched_cells, sequence, hold, discards=discards,
+                    pending=_bag_pool(bag_position, sequence),
+                )
+                provisional = chosen_form is not None
+                if chosen_form is None:
+                    self._pending_declined = pending_key  # 同じ局面では探し直さない(毎tick呼ばれ、TDTDでは最大0.5秒かかる)
             pc_run = None
             if chosen_form is None:
                 pc_run = self._perfect_clear_run(recognition, board_cells, sequence, hold, garbage_rows)
@@ -4145,7 +4361,8 @@ class AssistWorker(QtCore.QThread):
         # (山岳積み2号の3巡目)。余分なマスは従来どおり期待外(4未満)として扱う。
         run_board = {(r - garbage_rows, c) for r, c in form.existing}
         self._opener = _OpenerRun(
-            template=template, form=form, steps=steps, board=run_board, shift_on_clear=template is not _PC_TEMPLATE
+            template=template, form=form, steps=steps, board=run_board, shift_on_clear=template is not _PC_TEMPLATE,
+            provisional=provisional,
         )
         self._pc_search = None
         turn = self._observed_turn(recognition)
@@ -4167,6 +4384,44 @@ class AssistWorker(QtCore.QThread):
     # 開幕の1手目が置けない状態がこの秒数続いたら選び直す。固定の直後は置いたミノが一瞬読めず
     # 盤面が空に見えることがあるので、すぐには選び直さない(実機では1.5秒間消えたままだった)
     OPENER_STALE_START_SEC = 0.3
+
+    def _replan_provisional(self, recognition: RecognitionResult) -> None:
+        """仮の順(まだ見えていない袋の残り)で組んだ手順を、新しく見えたミノで組み直す(手番ごとに1回)。
+
+        【2026-10-04・利用者の要望】TDTDで2巡目に要るミノがまだ見えなくても、袋の残りから必ず来るなら図を始める。
+        そのときの手順は来る順を仮に決めているので、置くたびに今のミノ順で残りを組み直し、来た順に合わせる。
+        """
+        opener = self._opener
+        if (
+            opener is None
+            or not opener.provisional
+            or opener.awaiting_since is not None
+            or opener.recovery_pending
+            or opener.index == 0
+            or opener.replanned_index == opener.index
+            or not recognition.hold_known
+            or _garbage_row_count(recognition.board)
+        ):
+            return
+        hold = recognition.hold_piece
+        bag_position = None if self._opener_locks is None else self._opener_locks + (1 if hold is not None else 0)
+        sequence = self._known_sequence(recognition, hold, bag_position)
+        if sequence is None:
+            return
+        opener.replanned_index = opener.index
+        only = dataclass_replace(opener.template, forms=(opener.form,))
+        joined = rejoin_form(only, opener.board, sequence, hold)
+        still = joined is None
+        if joined is None and bag_position is not None:
+            joined = rejoin_form(only, opener.board, sequence, hold, _bag_pool(bag_position, sequence))
+        if joined is None:
+            return  # 組み直せない(ライン消去を挟んだ等): 今の手順のまま
+        opener.steps = opener.steps[: opener.index] + list(joined[1])
+        opener.provisional = still
+        self._log_opener(
+            f"見えたミノで手順を組み直す ミノ順={''.join(sequence)} hold={hold} 残り="
+            + " ".join(f"{st.piece}{'(H)' if st.use_hold else ''}" for st in joined[1])
+        )
 
     def _restart_stale_opener(self, recognition: RecognitionResult) -> None:
         """開幕の図の1手目のミノが、置かれないまま操作ミノにもHOLDにも無くなったら選び直す。
@@ -4969,7 +5224,6 @@ class MainWindow(QtWidgets.QWidget):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(APP_TITLE)
-        self.resize(360, 160)
         # 【2026-10-04・利用者の指示】設定項目(src.assist_view)は右半分に置く
 
         self.calibration: CalibrationResult | None = None
@@ -4982,27 +5236,61 @@ class MainWindow(QtWidgets.QWidget):
         # current_piece追跡やhold追跡の状態を持っていたが、ワーカースレッド側に
         # 移した（詳細はAssistWorkerのdocstring参照）。
         self.worker: AssistWorker | None = None
+        # 【2026-10-31】ローカル対戦で 2P も全自動で動かす時の、2P の一式(ワーカー・思考エンジン・オーバーレイ・ボタンと情報パネル)
+        self.worker_2p = None
+        self.cold_clear_2p: ColdClearClient | None = None
+        self.overlay_2p: OverlayWindow | None = None
+        self.badge_2p = None
 
         self.safety_timer = QtCore.QTimer(self)
         self.safety_timer.setSingleShot(True)
         self.safety_timer.timeout.connect(self._stop_assist_mode)
 
+        self._game_window = None  # 支援モードで使っているゲームのウィンドウ(動いたら止める)
+        self.window_timer = QtCore.QTimer(self)
+        self.window_timer.timeout.connect(self._check_game_window)
+        self.window_timer.start(1000)
         self._build_normal_ui()
         self._refresh_calibration_status()
 
     # ---------- 通常モードUI ----------
-    # タブの番号
-    TAB_ASSIST, TAB_PRACTICE, TAB_REN = 0, 1, 2
+    # タブの番号。【2026-10-31・利用者の要望】PBA と同じく「対戦モード(1P・2P の枠)」「一人用モード」に分けた
+    TAB_VERSUS, TAB_SOLO, TAB_PRACTICE, TAB_REN = 0, 1, 2, 3
+    TAB_ASSIST = TAB_VERSUS
 
     def _build_normal_ui(self) -> None:
-        # 【2026-10-04・利用者の要望】支援モード・シミュレーター・無限中あけRENを別画面にせず、タブで切り替える。
-        # シミュレーター・無限中あけRENは初めて開いたときに作り、表示していない間は思考しない(各画面のhideEvent)
+        # 【2026-10-31・利用者の要望】画面を PBA と同じ形にする: 上にゲームのウィンドウの状態、タブ(対戦モード・一人用モード・
+        # シミュレーター・無限中あけREN)、下に登録・プラグインのボタンと支援モードの開始ボタン。
+        # 【2026-10-04】シミュレーター・無限中あけRENは初めて開いたときに作り、表示していない間は思考しない(各画面のhideEvent)
         root = QtWidgets.QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
+
+        row = QtWidgets.QHBoxLayout()
+        self.status_label = QtWidgets.QLabel()
+        row.addWidget(self.status_label, 1)
+        # 【2026-10-30・利用者の要望】Steam 版のウィンドウを探して盤面等の位置を求める(標準。src/capture/window_detect.py)
+        self.detect_btn = QtWidgets.QPushButton("ゲームのウィンドウを検出")
+        self.detect_btn.setToolTip("Steam 版のゲームのウィンドウを探します。見つからなければ一覧から選べます(選んだものは覚えます)")
+        self.detect_btn.clicked.connect(self._on_detect_clicked)
+        row.addWidget(self.detect_btn)
+        # 手動のキャリブレーションは Switch 対応プラグイン(plugins/switch_capture)が有効な時だけ出す
+        self.calibrate_btn = QtWidgets.QPushButton("キャリブレーション(Switch 対応)")
+        self.calibrate_btn.clicked.connect(self._on_calibrate_clicked)
+        row.addWidget(self.calibrate_btn)
+        root.addLayout(row)
+
         self.tabs = QtWidgets.QTabWidget()
-        root.addWidget(self.tabs)
-        assist_page = QtWidgets.QWidget()
-        self.tabs.addTab(assist_page, "支援モード")
+        root.addWidget(self.tabs, 1)
+        # 1P・2P・一人用の枠(src/side_settings.py)。枠ごとに思考エンジン・全自動・仮想パッド・支援の設定を持つ
+        self.side_boxes: dict[str, SideSettings] = {}
+        versus = QtWidgets.QWidget()
+        panels = QtWidgets.QHBoxLayout(versus)
+        for key in ("1p", "2p"):
+            self.side_boxes[key] = SideSettings(key, self._open_side_keys)
+            panels.addWidget(self.side_boxes[key], 1)
+        self.tabs.addTab(versus, "対戦モード")
+        solo = QtWidgets.QWidget()
+        QtWidgets.QVBoxLayout(solo).addWidget(self._new_side_box("solo"))
+        self.tabs.addTab(solo, "一人用モード")
         for title in ("シミュレーター", "無限中あけREN"):
             page = QtWidgets.QWidget()
             QtWidgets.QVBoxLayout(page).setContentsMargins(0, 0, 0, 0)
@@ -5011,83 +5299,192 @@ class MainWindow(QtWidgets.QWidget):
         self.ren_window: QtWidgets.QWidget | None = None
         self.tabs.currentChanged.connect(self._on_tab_changed)
 
-        outer = QtWidgets.QHBoxLayout(assist_page)
-        layout = QtWidgets.QVBoxLayout()
-        outer.addLayout(layout, 1)
-        # 【2026-10-04・利用者の要望】開幕テンプレ・DPC/TDTD・継続パフェ・表示手数の設定欄
-        # (src.assist_view)。シミュレーターと同じく候補ごとのトグルスイッチ。右半分に置く
-        self.assist_settings = AssistSettingsPanel()
-        outer.addWidget(self.assist_settings, 1)
+        # 思考エンジンの登録・全自動の設定・プラグイン(PBA と同じく下に並べる)
+        row = QtWidgets.QHBoxLayout()
+        engine_reg_btn = QtWidgets.QPushButton("エンジンの登録")
+        engine_reg_btn.clicked.connect(self._open_engine_registry)
+        row.addWidget(engine_reg_btn)
+        # 【2026-10-22】全自動モード(src.auto)の操作の速さ等(全自動モードのプラグインが有効な時だけ出す)
+        self.auto_settings_btn = QtWidgets.QPushButton("全自動の設定")
+        self.auto_settings_btn.clicked.connect(self._on_auto_settings_clicked)
+        row.addWidget(self.auto_settings_btn)
+        plugin_btn = QtWidgets.QPushButton("プラグイン")
+        plugin_btn.setToolTip("入っているプラグインの一覧と、有効・無効の切り替え")
+        plugin_btn.clicked.connect(self._open_plugins)
+        row.addWidget(plugin_btn)
+        row.addStretch(1)
+        root.addLayout(row)
 
-        self.status_label = QtWidgets.QLabel()
-        layout.addWidget(self.status_label)
+        # 支援モードの開始まわり(対戦・一人用のタブの時だけ出す)
+        self.assist_area = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(self.assist_area)
+        layout.setContentsMargins(0, 0, 0, 0)
+        try:
+            from src.auto.panel import WARNING_TEXT
+        except ImportError:  # 全自動(プラグインから使う。公開版には無い)。注意書きは全自動のプラグインが有効な時だけ出す
+            WARNING_TEXT = ""
 
-        calibrate_btn = QtWidgets.QPushButton("キャリブレーションを実行")
-        calibrate_btn.clicked.connect(self._on_calibrate_clicked)
-        layout.addWidget(calibrate_btn)
+        self.auto_warning = QtWidgets.QLabel(WARNING_TEXT)
+        self.auto_warning.setWordWrap(True)
+        self.auto_warning.setStyleSheet("color: #c0392b;")
+        layout.addWidget(self.auto_warning)
+
+        # デバッグログ・画面録画は開発時の不具合調査用の機能であり、実機の画面キャプチャを含むファイルを生成する。
+        # 【2026-10-30】ログ出力プラグイン(plugins/debug_log。配布しない)が有効なときだけ出す(_apply_plugins)。
+        self.debug_log_checkbox = QtWidgets.QCheckBox(
+            f"認識結果をログに出力する ({DEBUG_LOG_DIR.name}\\debug_log_*.txt / {DEBUG_FRAMES_DIR.name}\\)"
+        )
+        self.debug_log_checkbox.setToolTip(
+            "最善手が明らかにおかしいと感じた時、AIが実際に何を盤面として"
+            "認識していたかを突き合わせて確認するためのデバッグ用ログです。\n"
+            f"支援モードを開始するたびに{DEBUG_LOG_DIR.name}フォルダへ新しい"
+            "日時付きのファイルとして保存され、前回までの記録は上書きされません。\n"
+            f"テキストログに加えて、実際にキャリブレーション座標で切り出した"
+            f"盤面・ホールド・ネクストの生画像を{DEBUG_FRAMES_DIR.name}フォルダに"
+            "直近1回分保存します（座標そのもののズレを画像で確認できます）。"
+        )
+        layout.addWidget(self.debug_log_checkbox)
+        self.record_video_checkbox = QtWidgets.QCheckBox(
+            f"支援モード中の画面を録画する ({DEBUG_LOG_DIR.name}\\debug_capture_*.mp4、暫定機能)"
+        )
+        self.record_video_checkbox.setToolTip(
+            "不具合報告のたびに別の画面録画ソフトで撮り直す手間を省くための"
+            "暫定機能です。キャリブレーション済みの範囲(盤面+HOLD+NEXT欄)を"
+            f"支援モード中ずっと{DEBUG_LOG_DIR.name}フォルダの日時付きファイルに"
+            "録画します(支援モードを開始するたびに新しいファイルになり、"
+            "前回までの記録は上書きされません)。\n"
+            "画面キャプチャなので、オーバーレイの提案(色ドット)も"
+            "外部の画面録画ソフトと同様に映り込みます。"
+        )
+        layout.addWidget(self.record_video_checkbox)
 
         self.assist_btn = QtWidgets.QPushButton("支援モード開始")
+        self.assist_btn.setToolTip("全自動モードをオンにした枠は全自動で、それ以外の枠は提示(ドット)だけで動かします")
         self.assist_btn.clicked.connect(self._on_toggle_assist)
         layout.addWidget(self.assist_btn)
-
-        # デバッグログ・画面録画は開発時の不具合調査用の機能であり、
-        # 実機の画面キャプチャを含むファイルを生成するため、配布物(exe)
-        # では機能自体を無効化する(チェックボックスを表示しない)。
-        if is_frozen():
-            self.debug_log_checkbox = None
-            self.record_video_checkbox = None
-        else:
-            self.debug_log_checkbox = QtWidgets.QCheckBox(
-                f"認識結果をログに出力する ({DEBUG_LOG_DIR.name}\\debug_log_*.txt / {DEBUG_FRAMES_DIR.name}\\)"
-            )
-            self.debug_log_checkbox.setToolTip(
-                "最善手が明らかにおかしいと感じた時、AIが実際に何を盤面として"
-                "認識していたかを突き合わせて確認するためのデバッグ用ログです。\n"
-                f"支援モードを開始するたびに{DEBUG_LOG_DIR.name}フォルダへ新しい"
-                "日時付きのファイルとして保存され、前回までの記録は上書きされません。\n"
-                f"テキストログに加えて、実際にキャリブレーション座標で切り出した"
-                f"盤面・ホールド・ネクストの生画像を{DEBUG_FRAMES_DIR.name}フォルダに"
-                "直近1回分保存します（座標そのもののズレを画像で確認できます）。"
-            )
-            layout.addWidget(self.debug_log_checkbox)
-
-            self.record_video_checkbox = QtWidgets.QCheckBox(
-                f"支援モード中の画面を録画する ({DEBUG_LOG_DIR.name}\\debug_capture_*.mp4、暫定機能)"
-            )
-            self.record_video_checkbox.setToolTip(
-                "不具合報告のたびに別の画面録画ソフトで撮り直す手間を省くための"
-                "暫定機能です。キャリブレーション済みの範囲(盤面+HOLD+NEXT欄)を"
-                f"支援モード中ずっと{DEBUG_LOG_DIR.name}フォルダの日時付きファイルに"
-                "録画します(支援モードを開始するたびに新しいファイルになり、"
-                "前回までの記録は上書きされません)。\n"
-                "画面キャプチャなので、オーバーレイの提案(色ドット)も"
-                "外部の画面録画ソフトと同様に映り込みます。"
-            )
-            layout.addWidget(self.record_video_checkbox)
-
-        # 【2026-10-04・利用者の要望】開幕テンプレ・DPC/TDTD・継続パフェの切り替えは設定欄
-        # (src.assist_view)にまとめ、シミュレーターと同じく候補ごとのトグルスイッチにした
-
         hint = QtWidgets.QLabel(
-            "支援モード中は画面右上の「終了」ボタンで終了できます"
+            "支援モード中は、ゲームのタイトルバーの終了ボタンで終了できます"
             "（ゲーム側のEscキー操作と競合しないよう、Escキーは使いません）"
         )
         hint.setStyleSheet("color: gray;")
         hint.setWordWrap(True)
         layout.addWidget(hint)
-        layout.addStretch(1)  # 左側の項目を上に詰める(右の設定欄の方が縦に長い)
+        root.addWidget(self.assist_area)
+
+        self.resize(980, 720)
+        # 【2026-10-30・利用者の要望】プラグイン方式(src/plugin_api.py。PBA と同じ形)。標準以外の機能はプラグインが足す
+        self.plugins = PluginManager.load()
+        self._apply_plugins()
+
+    def _new_side_box(self, side: str) -> "SideSettings":
+        self.side_boxes[side] = SideSettings(side, self._open_side_keys)
+        return self.side_boxes[side]
+
+    def _apply_plugins(self) -> None:
+        """有効なプラグインに合わせて、全自動モード・ログ出力・手動キャリブレーションの項目を出し入れする。"""
+        self.calibrate_btn.setVisible(self.plugins.manual_calibration())
+        full_auto = self.plugins.full_auto()
+        for side, box in self.side_boxes.items():
+            # 2P の全自動はローカル対戦プラグインも要る(2P は仮想ゲームパッドで動かす)
+            box.set_autoplay_available(full_auto and (side != "2p" or self.plugins.local_versus()))
+            box.set_pad_available(side == "2p" or self.plugins.synced_input())
+        for widget in (self.auto_settings_btn, self.auto_warning):
+            widget.setVisible(full_auto)
+        debug_log = self.plugins.debug_log()
+        for check in (self.debug_log_checkbox, self.record_video_checkbox):
+            check.setVisible(debug_log)
+            if not debug_log:
+                check.setChecked(False)
+
+    def _refresh_engines(self) -> None:
+        """思考エンジンの一覧を作り直す(Cold Clear 2・プラグインのエンジン・登録したエンジン)。"""
+        for box in self.side_boxes.values():
+            box.refresh_engines()
+
+    def _open_side_keys(self, side: str) -> None:
+        """枠の「キー割り当て」。1P・一人用はキーボード(全自動の設定)、2P は仮想ゲームパッドのボタン。"""
+        if side != "2p":
+            self._on_auto_settings_clicked()
+            return
+        from src.auto.pad_input import DEFAULT_PAD_KEYS
+        from src.auto.settings import ACTIONS
+
+        names = {"PAD_LEFT": "十字キー左", "PAD_RIGHT": "十字キー右", "PAD_UP": "十字キー上", "PAD_DOWN": "十字キー下"}
+        lines = [f"{ACTIONS[a]}: {names.get(b, b.removeprefix('PAD_'))}" for a, b in DEFAULT_PAD_KEYS.items()]
+        QtWidgets.QMessageBox.information(
+            self, "2P のキー割り当て(仮想ゲームパッド)",
+            "2P は仮想ゲームパッド(Xbox 360 コントローラー)で操作します。\n"
+            "ゲーム側の 2P のボタン設定をこの表と同じにしてください。\n\n" + "\n".join(lines),
+        )
+
+    def _open_engine_registry(self) -> None:
+        from src.engine_dialog import EngineRegistryDialog
+
+        registry = Registry.load()
+        reserved = {e.label for e in self.plugins.engines().values()}
+        dialog = EngineRegistryDialog(registry, reserved, self)
+        if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            registry.engines = dialog.engines
+            registry.save()
+            self._refresh_engines()
+
+    def _open_plugins(self) -> None:
+        dialog = PluginDialog(self.plugins, self)
+        if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            save_disabled(dialog.disabled)
+            self.plugins.disabled = set(dialog.disabled)
+            self._apply_plugins()
+            self._refresh_engines()  # プラグインのエンジンが増減する
+            self._refresh_calibration_status()
 
 
     def _refresh_calibration_status(self) -> None:
-        if CONFIG_PATH.exists():
-            self.calibration = load_calibration()
+        """位置の求め方を表示する。ゲームのウィンドウが見つかればそれを優先し、無ければ手動のキャリブレーション。"""
+        self.calibration = load_calibration() if CONFIG_PATH.exists() else None
+        window = find_game_window()
+        if window is not None:
+            self.status_label.setText(f"ゲームのウィンドウ: {window.title}({window.width}×{window.height})")
+        elif self.calibration is not None and self.plugins.manual_calibration():
             self.status_label.setText(f"キャリブレーション: 読み込み済み ({CONFIG_PATH})")
         else:
-            self.calibration = None
-            self.status_label.setText("キャリブレーション: 未設定")
+            self.status_label.setText("ゲームのウィンドウが見つかりません(ぷよぷよテトリス2を起動して「ゲームのウィンドウを検出」)")
+
+    def _on_detect_clicked(self) -> None:
+        """ゲームのウィンドウを探す。見つからなければ表示中のウィンドウから選んでもらい、次から探せるよう覚える。"""
+        if find_game_window() is None:
+            entries = list_windows()
+            if not entries:
+                QtWidgets.QMessageBox.warning(self, "エラー", "表示中のウィンドウが見つかりません")
+                return
+            dialog = WindowPickDialog(entries, self)
+            if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted or dialog.selected() is None:
+                return
+            save_saved_window(dialog.selected())
+        self._refresh_calibration_status()
+
+    def _resolve_calibration(self) -> CalibrationResult | None:
+        """支援モードで使う位置。ゲームのウィンドウが見つかればその位置(覚えて、動いたら止める)、無ければ手動のキャリブレーション。"""
+        self._game_window = find_game_window()
+        if self._game_window is not None:
+            return layout_calibration(self._game_window)
+        if self.plugins.manual_calibration() and CONFIG_PATH.exists():
+            return load_calibration()
+        return None
+
+    def _check_game_window(self) -> None:
+        """支援モード中、ゲームのウィンドウが動いた・大きさが変わった・閉じたら止める(位置がずれて誤った提示をしないため)。"""
+        window = self._game_window
+        if window is None or not self.assist_mode:
+            return
+        if client_rect(window.hwnd) != (window.left, window.top, window.width, window.height):
+            self._stop_assist_mode()
+            QtWidgets.QMessageBox.information(
+                self, "支援モードを止めました", "ゲームのウィンドウが動いたか、大きさが変わったため、支援モードを止めました。もう一度開始してください。"
+            )
 
     def _on_tab_changed(self, index: int) -> None:
         """シミュレーター・無限中あけRENのタブは、初めて開いたときに画面を作る。"""
+        self.assist_area.setVisible(index in (self.TAB_VERSUS, self.TAB_SOLO))  # 支援モードの開始は対戦・一人用の時だけ
         widget = None
         if index == self.TAB_PRACTICE:
             if self.practice_window is None:
@@ -5121,14 +5518,66 @@ class MainWindow(QtWidgets.QWidget):
         else:
             self._start_assist_mode()
 
+    def _on_auto_settings_clicked(self) -> None:
+        from src.auto.panel import AutoPlaySettingsDialog
+
+        AutoPlaySettingsDialog(self).exec()
+
     # ---------- 支援モード ----------
+    def _active_sides(self) -> list[str]:
+        """今のタブで動かす枠。対戦モードは 1P と(思考エンジンを使うなら)2P、一人用モードは自分の盤面。"""
+        index = self.tabs.currentIndex()
+        if index == self.TAB_SOLO:
+            return ["solo"]
+        if index == self.TAB_VERSUS:
+            return ["1p"] + (["2p"] if self.side_boxes["2p"].uses_engine() else [])
+        return []
+
     def _start_assist_mode(self) -> None:
-        if self.calibration is None:
-            QtWidgets.QMessageBox.warning(self, "エラー", "先にキャリブレーションを実行してください")
+        """今のタブの枠ごとに支援モードを始める。全自動をオンにした枠は全自動(最善手をキー入力でゲームへ送る)。
+
+        【2026-10-31・利用者の要望】PBA と同じく、1つの画面で 1P と 2P を動かす。1P(一人用は自分の盤面)の一式は
+        self.worker 等、2P の一式は self.worker_2p 等に持つ。
+        """
+        sides = self._active_sides()
+        if not sides:
             return
+        main_side = sides[0]
+        main_box = self.side_boxes[main_side]
+        self.calibration = self._resolve_calibration()
+        if self.calibration is None:
+            QtWidgets.QMessageBox.warning(
+                self, "エラー", "ぷよぷよテトリス2のウィンドウが見つかりません。ゲームを起動して「ゲームのウィンドウを検出」を押してください。"
+                + ("\n(Switch 版はキャリブレーションを実行してください)" if self.plugins.manual_calibration() else "")
+            )
+            return
+        auto_settings = None
+        if main_box.autoplay_on() or (len(sides) > 1 and self.side_boxes["2p"].autoplay_on()):
+            from src.auto.settings import load_auto_settings
+
+            auto_settings = load_auto_settings()
+            duplicates = auto_settings.duplicate_keys()
+            if duplicates:
+                QtWidgets.QMessageBox.warning(
+                    self, "エラー", f"全自動の設定で、同じキーが複数の操作に割り当てられています: {', '.join(duplicates)}"
+                )
+                return
+        main_auto = auto_settings if main_box.autoplay_on() else None
+        # 【2026-10-31】1P と 2P を同時に動かす時は、撮影と認識を側ごとの子プロセスで行う(src/recognize_process.py)
+        separate = len(sides) > 1
+        # 【2026-10-31】Zetris 方式の入力プラグイン: フレーム同期で送る。1P も仮想パッドにできる
+        synced = self.plugins.synced_input()
+        pad_1p = synced and auto_settings is not None and auto_settings.pad_1p
+        if main_auto is not None and pad_1p:
+            from dataclasses import replace
+
+            from src.auto.pad_input import DEFAULT_PAD_KEYS
+
+            main_auto = replace(main_auto, keys=dict(DEFAULT_PAD_KEYS))
 
         try:
-            self.cold_clear = ColdClearClient()
+            # 【2026-10-31】枠で選んだ思考エンジン
+            self.cold_clear = ColdClearClient(selected_engine(side=main_side)[1])
         except (FileNotFoundError, RuntimeError, TimeoutError, OSError) as exc:
             # TimeoutErrorは、起動直後のinfoメッセージ待ちでCold Clear 2から
             # 応答が得られなかった場合（例: pythonw環境でsubprocessの
@@ -5139,7 +5588,7 @@ class MainWindow(QtWidgets.QWidget):
             # （cold_clear_client.pyのcreationflags指定）は別途修正したが、
             # 万一同様の問題が再発しても、アプリを巻き込まず通常のエラー
             # ダイアログで済むよう、ここでも幅広く捕捉しておく。
-            QtWidgets.QMessageBox.critical(self, "エラー", f"Cold Clear 2の起動に失敗しました:\n{exc}")
+            QtWidgets.QMessageBox.critical(self, "エラー", f"思考エンジンの起動に失敗しました:\n{exc}")
             return
 
         self.hide()
@@ -5148,9 +5597,16 @@ class MainWindow(QtWidgets.QWidget):
         self.overlay.show()
         overlay_excluded = _exclude_window_from_screen_capture(self.overlay)
 
-        self.badge = ControlBadge(on_stop=self._stop_assist_mode)
+        if main_auto is not None:
+            from src.auto.panel import AutoControlBadge
+
+            self.badge = AutoControlBadge(on_stop=self._stop_assist_mode, stop_key=main_auto.stop_key)
+        else:
+            self.badge = ControlBadge(on_stop=self._stop_assist_mode)
+        self.badge.place(self._game_window)
         self.badge.show()
-        badge_excluded = _exclude_window_from_screen_capture(self.badge)
+        # 情報パネルもゲームのウィンドウの上に重なるので、画面キャプチャから除外する
+        badge_excluded = _exclude_window_from_screen_capture(self.badge) and _exclude_window_from_screen_capture(self.badge.info)
 
         # 画面キャプチャからの除外に失敗した場合、自分が描いたドットを
         # 自分で盤面ブロックとして読んでしまう(自己汚染)。これは盤面認識が
@@ -5169,21 +5625,51 @@ class MainWindow(QtWidgets.QWidget):
         self._set_other_tabs_enabled(False)
         self.last_valid_draw_data = None
 
-        debug_log_enabled = self.debug_log_checkbox is not None and self.debug_log_checkbox.isChecked()
-        record_video = self.record_video_checkbox is not None and self.record_video_checkbox.isChecked()
+        debug_log_enabled = self.plugins.debug_log() and self.debug_log_checkbox.isChecked()
+        record_video = self.plugins.debug_log() and self.record_video_checkbox.isChecked()
         # 支援モード開始のたびに新しい日時付きファイルを使う(上書きしない)。
         # ログ・動画を両方有効にした場合は同じ日時にして突き合わせやすくする。
         new_log_path, new_video_path = _new_debug_log_paths() if (debug_log_enabled or record_video) else (None, None)
         debug_log_path = new_log_path if debug_log_enabled else None
         video_path = new_video_path if record_video else None
-        self.worker = AssistWorker(
-            self.calibration,
-            self.cold_clear,
-            debug_log_path,
-            record_video=record_video,
-            video_path=video_path,
-            **worker_options(load_assist_view()),
-        )
+        if main_auto is not None:
+            from src.auto.worker import AutoPlayWorker
+
+            from src.auto.worker import default_io
+
+            # 【2026-10-31】メモリ読み取りプラグイン: 1P の固定をゲームのメモリですぐ確かめる(読むだけ)
+            memory = None
+            if self.plugins.memory_read() and main_side == "1p":
+                from src.auto.ppt2_memory import PPT2Memory
+
+                memory = PPT2Memory.open()
+                if memory is None:
+                    print("メモリ読み取り: ゲームのプロセスを開けません(画像認識だけで動きます)")
+            self.worker = AutoPlayWorker(
+                self.calibration,
+                self.cold_clear,
+                debug_log_path,
+                main_auto,
+                io=default_io("1p", pad=pad_1p),
+                record_video=record_video,
+                video_path=video_path,
+                synced=synced,
+                separate_recognition=separate,
+                memory=memory,
+                pipeline=memory is not None,  # 【2026-10-31・案C】メモリが読める時は先読みモード
+            )
+            self.worker.auto_status.connect(self.badge.set_status, QtCore.Qt.ConnectionType.QueuedConnection)
+            self.worker.auto_stopped.connect(self._on_auto_stopped, QtCore.Qt.ConnectionType.QueuedConnection)
+        else:
+            self.worker = AssistWorker(
+                self.calibration,
+                self.cold_clear,
+                debug_log_path,
+                record_video=record_video,
+                video_path=video_path,
+                separate_recognition=separate,
+                **worker_options(load_assist_view(side_view_path(main_side))),
+            )
         # 別スレッド(worker)からのシグナルなので、必ずメインスレッドの
         # イベントループ経由で_on_draw_data_readyが呼ばれるよう明示する
         # （AutoConnectionでも通常は自動的にQueuedConnectionになるはずだが、
@@ -5196,12 +5682,95 @@ class MainWindow(QtWidgets.QWidget):
             self._on_next_debug_ready, QtCore.Qt.ConnectionType.QueuedConnection
         )
         self.worker.fatal_error.connect(self._on_fatal_error, QtCore.Qt.ConnectionType.QueuedConnection)
+        if self.badge is not None:
+            self.worker.plan_text_ready.connect(self.badge.set_plan, QtCore.Qt.ConnectionType.QueuedConnection)
         self.worker.start()
+        if "2p" in sides:
+            self._start_2p(auto_settings if self.side_boxes["2p"].autoplay_on() else None, debug_log_enabled, record_video)
 
         self.safety_timer.start(SAFETY_TIMEOUT_MS)
 
+    def _start_2p(self, settings_1p, debug_log_enabled: bool, record_video: bool) -> None:  # noqa: ANN001
+        """2P(右の盤面)も動かす。1P と同じ形の一式を、2P の位置で作る。settings_1p が None なら提示だけ、あれば全自動
+        (仮想ゲームパッド)。
+
+        【2026-10-31・利用者の要望】PBA のように1つの画面で 2人分を制御する。
+        """
+        from dataclasses import replace
+
+        from src.auto.pad_input import DEFAULT_PAD_KEYS, pad_status
+
+        status = pad_status() if settings_1p is not None else "ok"
+        if self._game_window is None or status != "ok":
+            QtWidgets.QMessageBox.warning(
+                self, "2P は動かしません",
+                "2P はゲームのウィンドウ(Steam 版)が見つかった時だけ動かせます。" if self._game_window is None
+                else "vgamepad(Python の部品)が入っていません。" if status == "no_vgamepad"
+                else "仮想ゲームパッドを作れません。ViGEmBus ドライバーを入れてください。",
+            )
+            return
+        try:
+            self.cold_clear_2p = ColdClearClient(selected_engine(side="2p")[1])
+        except (FileNotFoundError, RuntimeError, TimeoutError, OSError) as exc:
+            QtWidgets.QMessageBox.warning(self, "2P は動かしません", f"2P の思考エンジンの起動に失敗しました:\n{exc}")
+            return
+        calibration = layout_calibration(self._game_window, "2p")
+        self.overlay_2p = OverlayWindow(calibration)
+        self.overlay_2p.show()
+        _exclude_window_from_screen_capture(self.overlay_2p)
+        log_path, video_path = _new_debug_log_paths("2p") if (debug_log_enabled or record_video) else (None, None)
+        log_path = log_path if debug_log_enabled else None
+        video_path = video_path if record_video else None
+        if settings_1p is not None:
+            from src.auto.panel import AutoControlBadge
+            from src.auto.worker import AutoPlayWorker, default_io
+
+            settings = replace(settings_1p, keys=dict(DEFAULT_PAD_KEYS))  # 2P は仮想ゲームパッドのボタン
+            self.badge_2p = AutoControlBadge(on_stop=self._stop_assist_mode, stop_key=settings.stop_key, side="2p")
+            self.worker_2p = AutoPlayWorker(
+                calibration, self.cold_clear_2p, log_path, settings,
+                io=default_io("2p"), record_video=record_video, video_path=video_path,
+                synced=self.plugins.synced_input(),
+                separate_recognition=True,
+            )
+            self.worker_2p.auto_status.connect(self.badge_2p.set_status, QtCore.Qt.ConnectionType.QueuedConnection)
+            self.worker_2p.auto_stopped.connect(self._on_auto_stopped, QtCore.Qt.ConnectionType.QueuedConnection)
+        else:
+            self.badge_2p = ControlBadge(on_stop=self._stop_assist_mode, side="2p")
+            self.worker_2p = AssistWorker(
+                calibration, self.cold_clear_2p, log_path, record_video=record_video, video_path=video_path,
+                separate_recognition=True, **worker_options(load_assist_view(side_view_path("2p"))),
+            )
+        self.badge_2p.place(self._game_window)
+        self.badge_2p.show()
+        _exclude_window_from_screen_capture(self.badge_2p)
+        _exclude_window_from_screen_capture(self.badge_2p.info)
+        self.worker_2p.draw_data_ready.connect(self.overlay_2p.update_draw_data, QtCore.Qt.ConnectionType.QueuedConnection)
+        self.worker_2p.next_debug_ready.connect(self.overlay_2p.update_next_debug_data, QtCore.Qt.ConnectionType.QueuedConnection)
+        self.worker_2p.fatal_error.connect(self._on_fatal_error, QtCore.Qt.ConnectionType.QueuedConnection)
+        self.worker_2p.plan_text_ready.connect(self.badge_2p.set_plan, QtCore.Qt.ConnectionType.QueuedConnection)
+        self.worker_2p.start()
+
+    def _stop_2p(self) -> None:
+        if self.worker_2p is not None:
+            self.cold_clear_2p = self.worker_2p.cold_clear  # 作り直していれば現物の方を閉じる(1P と同じ)
+            self.worker_2p.stop()
+            if not self.worker_2p.wait(3000):
+                self.worker_2p.terminate()
+                self.worker_2p.wait()
+            self.worker_2p = None
+        if self.cold_clear_2p is not None:
+            self.cold_clear_2p.close()
+            self.cold_clear_2p = None
+        for name in ("overlay_2p", "badge_2p"):
+            widget = getattr(self, name)
+            if widget is not None:
+                widget.close()
+                setattr(self, name, None)
+
     def _stop_assist_mode(self) -> None:
         self.safety_timer.stop()
+        self._stop_2p()
 
         if self.worker is not None:
             # ワーカーはCold Clear 2が応答不能になったとき自分で作り直す
@@ -5237,8 +5806,10 @@ class MainWindow(QtWidgets.QWidget):
 
     def _set_other_tabs_enabled(self, enabled: bool) -> None:
         """【2026-10-04・利用者の指示】支援モード中はシミュレーター等のタブへ切り替えられないようにする。"""
-        for index in (self.TAB_PRACTICE, self.TAB_REN):
-            self.tabs.setTabEnabled(index, enabled)
+        current = self.tabs.currentIndex()
+        for index in (self.TAB_VERSUS, self.TAB_SOLO, self.TAB_PRACTICE, self.TAB_REN):
+            if index != current:  # 動かしている対戦・一人用のタブ以外
+                self.tabs.setTabEnabled(index, enabled)
 
     def _on_draw_data_ready(self, draw_data: OverlayDrawData | None) -> None:
         self.last_valid_draw_data = draw_data
@@ -5246,6 +5817,13 @@ class MainWindow(QtWidgets.QWidget):
             self.safety_timer.start(SAFETY_TIMEOUT_MS)  # 提示が届いた: 自動解除までの時間を数え直す
         if self.overlay is not None:
             self.overlay.update_draw_data(draw_data)
+
+    def _on_auto_stopped(self, reason: str) -> None:
+        """全自動モードのワーカーが自分で止まった(停止キー・読み取りと入力のずれ・対局の終わり等)。"""
+        if not self.assist_mode:
+            return
+        self._stop_assist_mode()
+        QtWidgets.QMessageBox.information(self, "全自動モードを停止しました", reason)
 
     def _on_next_debug_ready(self, slots: tuple[str | None, ...]) -> None:
         """【2026-09-07・暫定のデバッグ機能】next_debug_ready参照。"""
@@ -5278,6 +5856,7 @@ class MainWindow(QtWidgets.QWidget):
             self.overlay.close()
         if self.badge is not None:
             self.badge.close()
+        self._stop_2p()
         super().closeEvent(event)
 
 
@@ -5298,8 +5877,28 @@ def _log_uncaught_exception(exc_type, exc_value, exc_traceback) -> None:
         traceback.print_exception(exc_type, exc_value, exc_traceback, file=f)
 
 
+_fault_log_file = None  # faulthandlerの書き込み先(プロセスが終わるまで開いたままにする)
+
+
+def _enable_fault_log() -> None:
+    """Pythonの外で落ちたとき(ヒープ破損等)に、全スレッドの実行中の行をcrash_log.txtに書き出す。
+
+    【2026-10-04・利用者の了承】シミュレーターでリセットを連打したときpythonwが0xc0000374(ヒープ破損)で
+    落ち、Pythonの例外ではないためcrash_log.txtに何も残らず、どの処理の最中か分からなかった(イベントログのみ)。
+    """
+    import faulthandler
+
+    global _fault_log_file
+    try:
+        _fault_log_file = open(app_root() / "crash_log.txt", "a", encoding="utf-8")
+        faulthandler.enable(_fault_log_file, all_threads=True)
+    except OSError:
+        pass  # 記録できなくても起動は続ける
+
+
 def main() -> None:
     sys.excepthook = _log_uncaught_exception
+    _enable_fault_log()
     app = QtWidgets.QApplication(sys.argv)
     # exeファイル自体のアイコン(TBA.spec)とは別に、Qtはウィンドウの
     # タイトルバー・Alt+Tabのアイコンをこちらの設定で決めるため、
@@ -5313,4 +5912,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    import multiprocessing
+
+    multiprocessing.freeze_support()  # パフェ探索の子プロセス(src/education/pc_process.py)
     main()

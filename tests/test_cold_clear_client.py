@@ -7,23 +7,128 @@
 
 from __future__ import annotations
 
-import sys
+import json
 import queue
+import shutil
+import sys
+import tempfile
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from src.engine import cold_clear_client
 from src.engine.board_state import BoardState
 from src.engine.cold_clear_client import (
     COLD_CLEAR_EXE,
     ColdClearClient,
     board_state_to_tbp_board,
+    engine_exe,
+    engine_weights,
     location_to_board_cells,
 )
 
+# 本番の思考エンジン切り替え(config/engine.json)にテスト結果が左右されないよう、
+# 存在しない場所を指しておく(COLD_CLEAR_EXEを差し替えるハーネスはそのまま効く)。
+_ENGINE_DIR = Path(tempfile.mkdtemp(prefix="tba_test_engine_"))
+cold_clear_client.ENGINE_CONFIG = _ENGINE_DIR / "engine.json"
+
 _HAS_COLD_CLEAR = COLD_CLEAR_EXE.exists()
+
+# 自作AI(TetrisAI)。ビルド済みの環境でだけ実際の切り替えを確かめる。
+_TETRISAI_BOT = Path(r"C:\Users\fissk\claude-work\TetrisAI\target\release\tetrisai-bot.exe")
+_TETRISAI_TUNED = Path(r"C:\Users\fissk\claude-work\TetrisAI\config\weights\tuned.toml")
+
+
+class TestEngineSwitch(unittest.TestCase):
+    """config/engine.json による思考エンジンの切り替え。"""
+
+    def setUp(self) -> None:
+        self.config = _ENGINE_DIR / "engine.json"
+        self.addCleanup(self.config.unlink, missing_ok=True)
+
+    def _write(self, text: str) -> None:
+        self.config.write_text(text, encoding="utf-8")
+
+    def test_without_config_cold_clear_2_is_used(self) -> None:
+        self.assertEqual(engine_exe(), COLD_CLEAR_EXE)
+
+    def test_config_overrides_the_executable(self) -> None:
+        self._write(json.dumps({"exe": "C:/somewhere/tetrisai-bot.exe"}))
+        self.assertEqual(engine_exe(), Path("C:/somewhere/tetrisai-bot.exe"))
+
+    def test_distribution_ignores_config(self) -> None:
+        self._write(json.dumps({"exe": "C:/somewhere/tetrisai-bot.exe"}))
+        with patch.object(cold_clear_client, "is_frozen", return_value=True):
+            self.assertEqual(engine_exe(), COLD_CLEAR_EXE)
+
+    def test_broken_config_is_an_error_not_a_silent_fallback(self) -> None:
+        for text in ("{", "{}", "[]"):
+            self._write(text)
+            with self.assertRaises(ValueError, msg=text):
+                engine_exe()
+
+    def test_weights_default_to_beginner_config(self) -> None:
+        # "config"を書かなければ、従来どおり初心者向け設定を渡す(exeだけ切り替えた場合も)
+        expected = cold_clear_client.COLD_CLEAR_CONFIG if cold_clear_client.COLD_CLEAR_CONFIG.exists() else None
+        self.assertEqual(engine_weights(), expected)
+        self._write(json.dumps({"exe": "C:/somewhere/tetrisai-bot.exe"}))
+        self.assertEqual(engine_weights(), expected)
+
+    def test_config_overrides_the_weights(self) -> None:
+        # 【2026-10-22・利用者の指示】自作AIを調整済みの重み(tuned.toml)で動かす
+        self._write(json.dumps({"exe": "C:/somewhere/tetrisai-bot.exe", "config": "C:/somewhere/tuned.toml"}))
+        self.assertEqual(engine_weights(), Path("C:/somewhere/tuned.toml"))
+        with patch.object(cold_clear_client, "is_frozen", return_value=True):
+            self.assertNotEqual(engine_weights(), Path("C:/somewhere/tuned.toml"), "配布物では読まない")
+
+    def test_non_string_weights_is_an_error(self) -> None:
+        self._write(json.dumps({"exe": "C:/somewhere/tetrisai-bot.exe", "config": 3}))
+        with self.assertRaises(ValueError):
+            engine_weights()
+
+    def test_client_reports_missing_weights(self) -> None:
+        # 重みを指定したのに無いときは、黙って別の重みで動かさずエラーにする(エンジンは起動しない)
+        missing = _ENGINE_DIR / "no-such-weights.toml"
+        self._write(json.dumps({"exe": sys.executable, "config": str(missing)}))
+        with patch.object(cold_clear_client.subprocess, "Popen") as popen:
+            with self.assertRaises(FileNotFoundError) as ctx:
+                ColdClearClient()
+            popen.assert_not_called()
+        self.assertIn(str(missing), str(ctx.exception))
+
+    @unittest.skipUnless(_TETRISAI_BOT.exists() and _TETRISAI_TUNED.exists(), "自作AI(tetrisai-bot.exe・tuned.toml)が無い")
+    def test_client_passes_the_configured_weights(self) -> None:
+        self._write(json.dumps({"exe": str(_TETRISAI_BOT), "config": str(_TETRISAI_TUNED)}))
+        client = ColdClearClient()
+        try:
+            self.assertEqual(client._proc.args, [str(_TETRISAI_BOT), "--config", str(_TETRISAI_TUNED)])
+            self.assertIsNotNone(client.suggest_move(BoardState(), "T", None, ["I", "O", "L", "J", "S"]))
+        finally:
+            client.close()
+
+    def test_client_reports_the_configured_path_when_missing(self) -> None:
+        missing = _ENGINE_DIR / "no-such-engine.exe"
+        self._write(json.dumps({"exe": str(missing)}))
+        with self.assertRaises(FileNotFoundError) as ctx:
+            ColdClearClient()
+        self.assertIn(str(missing), str(ctx.exception))
+
+    @unittest.skipUnless(_TETRISAI_BOT.exists(), "自作AI(tetrisai-bot.exe)が未ビルド")
+    def test_client_runs_the_configured_engine(self) -> None:
+        self._write(json.dumps({"exe": str(_TETRISAI_BOT)}))
+        client = ColdClearClient()
+        try:
+            self.assertEqual(client._proc.args[0], str(_TETRISAI_BOT))
+            move = client.suggest_move(BoardState(), "T", None, ["I", "O", "L", "J", "S"])
+            self.assertIsNotNone(move)
+        finally:
+            client.close()
+
+
+def tearDownModule() -> None:
+    shutil.rmtree(_ENGINE_DIR, ignore_errors=True)
 
 
 class TestPlanParsing(unittest.TestCase):
@@ -83,6 +188,7 @@ class TestBeginnerConfig(unittest.TestCase):
         self.assertEqual(weights["mini_spin_clears"], [0.0, 0.0, 0.0])
         self.assertGreater(weights["tslot"][3], 0.0, "Tスロットを作る評価が無い")
 
+    @unittest.skipUnless(_HAS_COLD_CLEAR, "Cold Clear 2が未ビルド(external/cold-clear-2)")
     def test_client_passes_the_config_to_the_process(self) -> None:
         from unittest.mock import patch
 

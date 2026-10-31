@@ -139,7 +139,8 @@ def save_repeat(settings: dict[str, int], path: Path | None = None) -> None:
 # ---- 表示の設定(提示の表示/非表示、テンプレ優先/AI優先) ----
 # 【2026-09-24・利用者の要望】トグルで切り替え、次回も同じ状態で開く
 VIEW_PATH = app_root() / "config" / "education_view.json"
-DEFAULT_VIEW = {"show_hints": True, "prefer_ai": False, "ren_analysis": True}  # ren_analysis: 無限中あけRENのAI解析
+# ren_analysis: 無限中あけRENのAI解析。use_plugin_engine: シミュレーターのAIをプラグインの思考エンジンにする(【2026-10-24】)
+DEFAULT_VIEW = {"show_hints": True, "prefer_ai": False, "ren_analysis": True, "use_plugin_engine": False}
 
 
 # 【2026-10-02・利用者の要望】候補欄に出す候補の表示/非表示。キーは "show:<候補のID>"(既定は表示)
