@@ -5319,7 +5319,10 @@ class MainWindow(QtWidgets.QWidget):
         self.assist_area = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(self.assist_area)
         layout.setContentsMargins(0, 0, 0, 0)
-        from src.auto.panel import WARNING_TEXT
+        try:
+            from src.auto.panel import WARNING_TEXT
+        except ImportError:  # 全自動(プラグインから使う。公開版には無い)。注意書きは全自動のプラグインが有効な時だけ出す
+            WARNING_TEXT = ""
 
         self.auto_warning = QtWidgets.QLabel(WARNING_TEXT)
         self.auto_warning.setWordWrap(True)

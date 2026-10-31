@@ -62,6 +62,11 @@ class TestLoader(unittest.TestCase):
         plugins, errors = discover(REPO_PLUGINS)
         self.assertFalse(errors)
         by_id = {p.id: p for p in plugins}
+        # 公開しているのは Switch 用の手動キャリブレーションだけ(2026-10-31)。配布してよい
+        self.assertTrue(by_id["switch_capture"].manual_calibration)
+        self.assertTrue(by_id["switch_capture"].distributable)
+        if "full_auto" not in by_id:
+            return  # 公開版: 全自動・ログのプラグインは入っていない
         self.assertTrue(by_id["full_auto"].full_auto)
         self.assertFalse(by_id["full_auto"].distributable, "全自動モードは配布しない")
         self.assertTrue(by_id["debug_log"].debug_log)
@@ -83,13 +88,17 @@ class TestMainWindow(unittest.TestCase):
         window.show()
         return window
 
-    def test_items_appear_only_with_their_plugins(self) -> None:
+    def test_items_hidden_without_plugins(self) -> None:
         window = self._window()
         try:
             self.assertFalse(window.side_boxes["1p"].autoplay_box.isVisible(), "プラグインが無いのに全自動モードが出ている")
             self.assertFalse(window.debug_log_checkbox.isVisible())
+            self.assertFalse(window.auto_warning.isVisible())
         finally:
             window.close()
+
+    @unittest.skipUnless((REPO_PLUGINS / "full_auto").is_dir() and (REPO_PLUGINS / "debug_log").is_dir(), "公開版には無い")
+    def test_items_appear_with_their_plugins(self) -> None:
         shutil.copytree(REPO_PLUGINS / "full_auto", plugin_loader.PLUGIN_DIR / "full_auto")
         shutil.copytree(REPO_PLUGINS / "debug_log", plugin_loader.PLUGIN_DIR / "debug_log")
         window = self._window()

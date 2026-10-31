@@ -188,6 +188,7 @@ class TestBeginnerConfig(unittest.TestCase):
         self.assertEqual(weights["mini_spin_clears"], [0.0, 0.0, 0.0])
         self.assertGreater(weights["tslot"][3], 0.0, "Tスロットを作る評価が無い")
 
+    @unittest.skipUnless(_HAS_COLD_CLEAR, "Cold Clear 2が未ビルド(external/cold-clear-2)")
     def test_client_passes_the_config_to_the_process(self) -> None:
         from unittest.mock import patch
 
