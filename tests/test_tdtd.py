@@ -263,3 +263,85 @@ class TestSplitPieces(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSecondBagWithUnseenPiece(unittest.TestCase):
+    """【2026-10-04・利用者の要望/実画面 practice_20261004_190514】TDTDのはちみつ砲で、2巡目に要るOがまだ見えず
+    (操作J・NEXT TLSJI・HOLD Z。袋の残りはOとZ)、1手置くまで2巡目が出なかった。袋の残りから必ず来るなら組む。"""
+
+    ROWS_TEXT = ("..........", ".##.......", "###....#..", "###.######", "####.#####")
+
+    def _state(self):
+        from src.education.rules import COLS, ROWS
+
+        board = [[None] * COLS for _ in range(ROWS)]
+        for i, line in enumerate(self.ROWS_TEXT):
+            for c, ch in enumerate(line):
+                if ch == "#":
+                    board[ROWS - len(self.ROWS_TEXT) + i][c] = "O"
+        state = GameState.new(907465690, board=tuple(tuple(r) for r in board), position=("J", "Z", 28))
+        # 対局の途中: 操作ミノ(27番目)とHOLDのZ(26番目)の通し番号は分かっている
+        state.start_position = None
+        state.current_index, state.hold_index = 27, 26
+        state.turn_start = state._snapshot()
+        return state
+
+    def test_second_bag_starts_and_is_replanned(self) -> None:
+        from src.engine.openers import OPENER_TEMPLATES
+
+        state = self._state()
+        self.assertEqual(state.visible_next(), tuple("TLSJI"), "前提: 実画面と同じツモ")
+        advisor = Advisor(engine_factory=FakeEngine, odds_search=lambda *a, **k: None)
+        honey = next(t for t in OPENER_TEMPLATES if t.name_ja == "はちみつ砲")
+        track = advisor._start_track(state, honey, continuing=True, tdtd=True)
+        self.assertIsNotNone(track, "Oが見えるまで2巡目が始まらない")
+        self.assertIn("2巡目", track.form.section)
+        self.assertTrue(track.provisional, "見えていないOを仮の順で使っている")
+        rec = advisor._from_track(state, track)
+        _follow(state, rec)  # 1手目を置く(NEXTにOが見える)
+        self.assertIn("O", state.visible_next())
+        nxt = advisor._advance_track(state, track)
+        self.assertIsNotNone(nxt)
+        self.assertFalse(nxt.provisional, "Oが見えたら見えているミノだけで組み直す")
+        self.assertIsNotNone(advisor._from_track(state, nxt), "組み直した手順の次の手を置ける")
+
+
+class TestAssistSecondBagWithUnseenPiece(unittest.TestCase):
+    """支援モードでも同じ局面(TDTDのはちみつ砲・操作J・NEXT TLSJI・HOLD Z)で2巡目を始め、Oが見えたら組み直す。"""
+
+    BOARD = tuple(
+        (r, c)
+        for r, line in zip(range(15, 20), TestSecondBagWithUnseenPiece.ROWS_TEXT)
+        for c, ch in enumerate(line)
+        if ch == "#"
+    )
+
+    def test_starts_then_replans(self) -> None:
+        from src.engine.openers import OPENER_TEMPLATES, _assist_template, apply_step
+
+        cold_clear = MagicMock()
+        cold_clear.poll_suggestion.return_value = _move("A")
+        worker = AssistWorker(_make_calibration(), cold_clear, debug_log_path=None, opener_enabled=True, tdtd_mode="first")
+        worker._opener_continuing = _assist_template(next(t for t in OPENER_TEMPLATES if t.name_ja == "はちみつ砲"))
+        worker._opener_tdtd = True
+        worker._opener_locks = 26  # 操作ミノJが27番目(前の袋の最後)
+        worker._last_current_piece = "J"
+        rec = _recognition(current_piece="J", hold_piece="Z", next_queue=tuple("TLSJI"), filled_cells=self.BOARD)
+        worker._maybe_start_template(rec)
+        run = worker._opener
+        self.assertIsNotNone(run, "Oが見えるまで2巡目が始まらない")
+        self.assertIn("2巡目", run.form.section)
+        self.assertTrue(run.provisional)
+        # 1手目(J)を置いた: 操作T・NEXT LSJIO(Oが見えた)
+        first = run.steps[0]
+        self.assertEqual((first.piece, first.use_hold), ("J", False))
+        run.board = apply_step(run.board, first.cells)
+        run.index = 1
+        worker._opener_locks = 27
+        worker._last_current_piece = "T"
+        after = _recognition(
+            current_piece="T", hold_piece="Z", next_queue=tuple("LSJIO"), filled_cells=tuple(sorted(run.board))
+        )
+        worker._replan_provisional(after)
+        self.assertFalse(run.provisional, "Oが見えたら見えているミノだけで組み直す")
+        self.assertEqual(len(run.steps), 8)

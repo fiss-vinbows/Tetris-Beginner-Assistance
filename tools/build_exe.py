@@ -15,6 +15,29 @@ ROOT = Path(__file__).resolve().parent.parent
 DIST = ROOT / "dist" / "TBA"
 
 
+def copy_distributable_plugins(source: Path, target: Path) -> list[str]:
+    """配布してよいプラグイン(distributable=True)だけを配布物へ写す。写したプラグインのIDを返す。
+
+    【2026-10-30】プラグイン方式(src/plugin_api.py)。全自動モード・ログ出力・非公開のプラグインは配布しない。
+    """
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    from src.plugin_loader import discover_folders
+
+    if target.exists():
+        shutil.rmtree(target)  # 前回の配布物に残った(今は配布しない)プラグインを消す
+    found, errors = discover_folders(source)
+    if errors:
+        sys.exit(f"読み込めないプラグインがあります: {errors}")
+    copied = []
+    for folder, plugin in found:
+        if plugin.distributable:
+            shutil.copytree(folder, target / folder.name, ignore=shutil.ignore_patterns("__pycache__"))
+            copied.append(plugin.id)
+    print(f"配布するプラグイン: {copied or 'なし'}")
+    return copied
+
+
 def main() -> None:
     pyinstaller = ROOT / "venv" / "Scripts" / "pyinstaller.exe"
     subprocess.run([str(pyinstaller), "--noconfirm", "--clean", str(ROOT / "TBA.spec")], check=True, cwd=ROOT)
@@ -36,6 +59,7 @@ def main() -> None:
         shutil.copy2(calibration, DIST / "config" / "calibration.json")
     shutil.copy2(ROOT / "README.md", DIST / "README.md")
     shutil.copy2(ROOT / "LICENSE", DIST / "LICENSE")
+    copy_distributable_plugins(ROOT / "plugins", DIST / "plugins")
 
     # cold-clear-2.exe(MIT/Apache-2.0デュアルライセンス)を同梱配布するため、
     # 再配布条件(著作権表示・許諾文の同梱)を満たすようライセンス文も添付する。

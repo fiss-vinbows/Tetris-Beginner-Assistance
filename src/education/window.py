@@ -23,6 +23,7 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 
 from src.education import gamepad, keybindings
 from src.education.advisor import (
+    AI_LABEL,
     EXCLUDED_TEMPLATES,
     PC_ODDS_ID,
     REN_ID,
@@ -391,9 +392,14 @@ class PracticeWindow(QtWidgets.QWidget):
         self.priority_btn = ToggleSwitch("優先", "テンプレ", "AI")
         self.hints_btn.clicked.connect(lambda _c=False: self.perform("toggle_hints"))
         self.priority_btn.clicked.connect(lambda _c=False: self.perform("toggle_priority"))
+        # 【2026-10-24・利用者の要望】AIを Cold Clear 2 / プラグインが足した思考エンジン(src/plugin_api.py の engines)から選ぶ
+        self.engine_btn = ToggleSwitch("AI", "CC2", "プラグイン")
+        self.engine_btn.clicked.connect(lambda _c=False: self._toggle_engine())
+        self._plugin_engine = None  # Cold Clear 2 と切り替えるエンジン(名前, (exe, 重み))。_apply_engineで調べる
         next_box.addSpacing(8)
         next_box.addWidget(self.hints_btn)
         next_box.addWidget(self.priority_btn)
+        next_box.addWidget(self.engine_btn)
         next_box.addWidget(self.show_rec_check)
         next_box.addWidget(self.show_steps_check)
         next_box.addWidget(self.rec_label)
@@ -526,6 +532,8 @@ class PracticeWindow(QtWidgets.QWidget):
         self.view_path = keybindings.VIEW_PATH
         self.view = keybindings.load_view(self.view_path)
         self.advisor.prefer_ai = self.view["prefer_ai"]
+        if advisor is None:  # テストで渡したAdvisor(FakeEngine等)はそのまま使う
+            self._apply_engine()
         self._apply_filters()
         self._last_advisor_status = ""
         self._last_pc_pending = (False, False, False)  # (パフェ探索中, 6-3積み計算中, 継続パフェ計算中)
@@ -580,6 +588,38 @@ class PracticeWindow(QtWidgets.QWidget):
         self.board_view.state = state
 
     # ---- トグル ----
+    # ---- AIの切り替え ----
+    def _apply_engine(self) -> None:
+        """表示の設定(use_plugin_engine)に合わせてAIのエンジンを選ぶ。もう一方のエンジンが無いときはCold Clear 2。
+
+        【2026-10-31・利用者の要望】もう一方のエンジンは、メイン画面の「思考エンジン」で選んだもの
+        (Cold Clear 2 を選んでいる時は、プラグイン・登録したエンジンの最初の1つ)。
+        """
+        from src.engine.cold_clear_client import ColdClearClient, cold_clear_engine
+        from src.engine.registry import DEFAULT_ENGINE, Registry, available_engines
+
+        registry = Registry.load()
+        others = {k: v for k, v in available_engines(registry).items() if k != DEFAULT_ENGINE}
+        name = registry.selected if registry.selected in others else next(iter(others), None)
+        self._plugin_engine = None if name is None else (name, others[name])
+        self.engine_btn.on_text = name or "他のエンジン"
+        self.engine_btn.setEnabled(self._plugin_engine is not None)
+        self.engine_btn.setToolTip(
+            "Cold Clear 2(同梱・初心者向けの設定)と、メイン画面の「思考エンジン」で選んだエンジンを切り替えます。"
+            + ("" if self._plugin_engine else "\nCold Clear 2 のほかに思考エンジン(登録・プラグイン)が無いため使えません。")
+        )
+        if self.view["use_plugin_engine"] and self._plugin_engine is not None:
+            label, engine = self._plugin_engine
+        else:
+            engine, label = cold_clear_engine(), AI_LABEL
+        self.advisor.set_engine(lambda: ColdClearClient(engine), label)
+
+    def _toggle_engine(self) -> None:
+        self.view["use_plugin_engine"] = not self.view["use_plugin_engine"]
+        keybindings.save_view(self.view, self.view_path)
+        self._apply_engine()
+        self.refresh()
+
     def _refresh_toggles(self, show: bool) -> None:
         keys = self.bindings
         self.hints_btn.setChecked(show)
@@ -589,7 +629,8 @@ class PracticeWindow(QtWidgets.QWidget):
         self.priority_btn.set_title(f"優先 ({keys.get('toggle_priority', '')})")
         # 非表示のときは推奨配置・操作手順・候補欄をまとめて隠す(自力で練習する用)
         # 【2026-10-03・利用者の指示】提示を非表示にしたときは優先(テンプレ⇔AI)も隠す
-        widgets = [self.priority_btn, self.show_rec_check, self.show_steps_check, self.rec_label, self.candidate_title,
+        self.engine_btn.setChecked(self.view["use_plugin_engine"] and self._plugin_engine is not None)
+        widgets = [self.priority_btn, self.engine_btn, self.show_rec_check, self.show_steps_check, self.rec_label, self.candidate_title,
                    self.cycle_btn, self.candidate_scope, *self.candidate_buttons]
         for widget in widgets:
             widget.setVisible(show)

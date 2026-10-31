@@ -33,7 +33,7 @@ class TestMainTabs(unittest.TestCase):
 
     def test_tabs_and_lazy_creation(self) -> None:
         tabs = self.window.tabs
-        self.assertEqual([tabs.tabText(i) for i in range(tabs.count())], ["支援モード", "シミュレーター", "無限中あけREN"])
+        self.assertEqual([tabs.tabText(i) for i in range(tabs.count())], ["対戦モード", "一人用モード", "シミュレーター", "無限中あけREN"])
         self.assertIsNone(self.window.practice_window, "開くまで作らない")
         tabs.setCurrentIndex(MainWindow.TAB_PRACTICE)
         practice = self.window.practice_window
@@ -66,6 +66,8 @@ class TestMainTabs(unittest.TestCase):
         self.window._set_other_tabs_enabled(False)
         self.assertFalse(self.window.tabs.isTabEnabled(MainWindow.TAB_PRACTICE))
         self.assertFalse(self.window.tabs.isTabEnabled(MainWindow.TAB_REN))
+        self.assertFalse(self.window.tabs.isTabEnabled(MainWindow.TAB_SOLO), "動かしていない一人用のタブに移れる")
+        self.assertTrue(self.window.tabs.isTabEnabled(MainWindow.TAB_VERSUS), "動かしている対戦モードのタブを閉じた")
         self.window._set_other_tabs_enabled(True)
         self.assertTrue(self.window.tabs.isTabEnabled(MainWindow.TAB_PRACTICE))
 

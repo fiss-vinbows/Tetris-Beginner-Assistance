@@ -236,5 +236,24 @@ class TestRenWithChangedSeed(unittest.TestCase):
         self.assertTrue(seeds - {3}, "前提: 種が3マス以外になる流れ")
 
 
+class TestOtherTemplatesAtGameStart(unittest.TestCase):
+    """【2026-10-04・利用者の指示(案B)】候補で中開け4列RENを選んだままリセットすると、中あけ系しか候補に出なかった。
+    対局の最初(盤面が空)は、TD系テンプレも候補に並べる。"""
+
+    def test_td_templates_are_listed_after_reset(self) -> None:
+        from src.engine.openers import TD_TEMPLATE_NAMES
+
+        state = GameState.new(4)
+        advisor = Advisor(engine_factory=FakeEngine, odds_search=lambda *a, **k: None)
+        advisor.preferred_id = next(iter(manual_templates()))
+        advisor.update(state, now=0.0)
+        advisor.active_id = REN_ID  # 前の対局でRENを消していた
+        state = state.reset_new_sequence(4)
+        advisor.update(state, now=0.0)
+        ids = {c.source_id for c in advisor.candidates()}
+        self.assertTrue(ids & TD_TEMPLATE_NAMES, f"TD系テンプレが候補に無い: {ids}")
+        self.assertIn(next(iter(manual_templates())), ids, "中開け4列RENも候補に残る")
+
+
 if __name__ == "__main__":
     unittest.main()

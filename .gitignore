@@ -41,9 +41,35 @@ dist/
 config/education_*.json
 config/assist_view.json
 
+# 思考エンジンの切り替え(自作AI等の個人のパス。cold_clear_client.ENGINE_CONFIG)
+config/engine.json
+
 # パフェDB試作: solution-finder本体(配布物をそのまま展開)と生成したDB
 tools/sfinder/
 tools/pc_db/*.sqlite
 
 # 教育モードのスクリーンショット(練習画面の画像)
 screenshots/
+
+# 【2026-10-30】名前が「_」で始まるプラグインは非公開(git に入れない)。プラグインの有効・無効は利用者の設定
+plugins/_*/
+config/plugins.json
+# 【2026-10-30】一覧から選んだゲームのウィンドウ(利用者の設定)
+config/game_window.json
+# 全自動のキー割り当て・速さ(利用者の設定)
+config/auto_play.json
+
+# 【2026-10-31・利用者の指示】プラグインは公開しない(標準機能だけを公開する)。公開するのは配布してよい switch_capture だけ
+plugins/*
+!plugins/switch_capture/
+# 全自動・ローカル対戦・Zetris 方式の入力・メモリ読み取りの中身(プラグインから使う。公開しない)
+src/auto/
+# 思考エンジンの登録・2P の支援の設定(利用者の設定。非公開のエンジンの名前が入る)
+config/engines.json
+config/assist_view_2p.json
+# 上の非公開の部分を使うテスト
+tests/test_auto_play.py
+tests/test_frame_sync.py
+tests/test_local_versus.py
+tests/test_pipeline.py
+tests/test_ppt2_memory.py

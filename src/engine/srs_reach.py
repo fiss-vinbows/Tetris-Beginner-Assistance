@@ -67,7 +67,7 @@ def find_path(
 
 
 def find_path_min_soft(
-    state: GameState, piece: str, target: tuple[Cell, ...], *, spin_entry: bool = False
+    state: GameState, piece: str, target: tuple[Cell, ...], *, spin_entry: bool = False, grounded_soft_only: bool = False
 ) -> tuple[tuple[str, ...], int] | None:
     """ソフトドロップの区間数が最も少ない操作手順と、その区間数。無ければNone。
 
@@ -75,6 +75,9 @@ def find_path_min_soft(
     1回=連続したソフトドロップの1区間(「↓×16」は1回、「↓→回転→↓」は2回)。
     Tスピンに必要な下降も数える。find_path(操作数が最短)ではソフトドロップが
     最少とは限らないため、(区間数, 操作数)の小さい順に探す。
+
+    grounded_soft_only: ソフトドロップの区間を、接地するところまで下げるものに限る(空中で止めない)。
+    【2026-10-30・全自動モード】空中で止める区間は押す時間の誤差で段がずれ、置きミスになった。
     """
     sim = copy.copy(state)
     sim.game_over = False
@@ -104,7 +107,10 @@ def find_path_min_soft(
                 node, label = prev[node]
                 path.append(label)
             return _compress(list(reversed(path)) + ["ハードドロップ"]), sections
+        grounded_here = grounded_soft_only and _soft and sim.is_grounded()
         for label, method in _OPS:
+            if grounded_soft_only and _soft and label != "↓" and not grounded_here:
+                continue  # ソフトドロップを空中で止めて、別の操作に移ることになる
             sim.orient, sim.row, sim.col = orient, row, col
             if getattr(sim, method)():
                 is_soft = label == "↓"

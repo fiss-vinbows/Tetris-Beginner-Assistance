@@ -38,6 +38,14 @@ COLD_CLEAR_EXE = (
     else app_root() / "external" / "cold-clear-2" / "target" / "release" / "cold-clear-2.exe"
 )
 
+# 思考エンジンの切り替え設定。{"exe": "実行ファイルのパス"} と書くと、
+# Cold Clear 2の代わりにそのTBP互換エンジン(自作AI tetrisai-bot.exe 等)を使う。
+# ファイルが無ければ従来どおりCOLD_CLEAR_EXE。個人のパスを書くためgit管理外。
+# 配布物(TBA.exe)では読まず、常に同梱のcold-clear-2.exeを使う。
+# 【2026-10-22・利用者の指示】"config": "評価の重みのファイル" も書ける(エンジンへ --config で渡す。
+# 例: 自作AIの tuned.toml)。書かなければ従来どおり COLD_CLEAR_CONFIG(初心者向け設定)を渡す。
+ENGINE_CONFIG = app_root() / "config" / "engine.json"
+
 # 初心者向けの評価設定(ColdClearClient.__init__参照)。
 COLD_CLEAR_CONFIG = app_root() / "config" / "cold_clear_beginner.json"
 
@@ -126,17 +134,62 @@ def board_state_to_tbp_board(board: BoardState, tbp_rows: int = 40) -> list[list
     return tbp_board
 
 
+def _read_engine_config() -> dict | None:
+    """ENGINE_CONFIGの中身。使わない(ファイルが無い・配布物)ならNone。"""
+    if is_frozen() or not ENGINE_CONFIG.exists():
+        return None
+    # 書き間違いのまま黙ってCold Clear 2に戻ると、自作AIを試しているつもりで
+    # 別のエンジンを見ることになるため、読めない設定はエラーにする。
+    try:
+        data = json.loads(ENGINE_CONFIG.read_text(encoding="utf-8"))
+        Path(data["exe"])
+        if "config" in data and not isinstance(data["config"], str):
+            raise TypeError('"config" は文字列で書いてください')
+        return data
+    except (ValueError, KeyError, TypeError) as e:
+        raise ValueError(
+            f"思考エンジンの設定を読めません: {ENGINE_CONFIG}\n"
+            f'{{"exe": "実行ファイルのパス", "config": "重みのファイル(省略可)"}} の形で書いてください。({e})'
+        ) from e
+
+
+def engine_exe() -> Path:
+    """支援モードで使う思考エンジンの実行ファイル。ENGINE_CONFIGがあればそのexe、無ければCOLD_CLEAR_EXE。"""
+    data = _read_engine_config()
+    return COLD_CLEAR_EXE if data is None else Path(data["exe"])
+
+
+def cold_clear_engine() -> tuple[Path, Path | None]:
+    """同梱のCold Clear 2の(実行ファイル, 初心者向けの重み)。ENGINE_CONFIGに関係なくこれを使う。"""
+    return COLD_CLEAR_EXE, (COLD_CLEAR_CONFIG if COLD_CLEAR_CONFIG.exists() else None)
+
+
+def engine_weights() -> Path | None:
+    """エンジンへ --config で渡す評価の重み。ENGINE_CONFIGの"config"、無ければ初心者向け設定(あれば)。"""
+    data = _read_engine_config()
+    if data is not None and "config" in data:
+        return Path(data["config"])
+    return COLD_CLEAR_CONFIG if COLD_CLEAR_CONFIG.exists() else None
+
+
 class ColdClearClient:
     """Cold Clear 2プロセスを1つ起動して使い回すクライアント。
 
     支援モード開始時にstart()を呼び、終了時にclose()を呼ぶこと。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, engine: tuple[Path, Path | None] | None = None) -> None:
+        """engine: 使う(実行ファイル, 重み)。省略すると ENGINE_CONFIG に従う(無ければCold Clear 2)。"""
         self._board_height = 20
-        if not COLD_CLEAR_EXE.exists():
+        exe = engine_exe() if engine is None else engine[0]
+        if not exe.exists():
+            if exe != COLD_CLEAR_EXE:
+                raise FileNotFoundError(
+                    f"思考エンジンの実行ファイルが見つかりません: {exe}\n"
+                    f"{ENGINE_CONFIG} のパスを確認してください(消すとCold Clear 2に戻ります)。"
+                )
             raise FileNotFoundError(
-                f"Cold Clear 2の実行ファイルが見つかりません: {COLD_CLEAR_EXE}\n"
+                f"Cold Clear 2の実行ファイルが見つかりません: {exe}\n"
                 "external/cold-clear-2 で `cargo build --release` を実行してください。"
             )
         # start.batをpythonw(コンソールを持たない実行形式)で起動した場合、
@@ -156,9 +209,16 @@ class ColdClearClient:
         # 評価からTSS(1ライン)とミニスピンの加点だけを外した設定にした。
         # 自己対戦480手で潜り込み(スピン以外)1件・TSD以上39件。
         # 設定ファイルが無ければ既定で起動する。
-        args = [str(COLD_CLEAR_EXE)]
-        if COLD_CLEAR_CONFIG.exists():
-            args += ["--config", str(COLD_CLEAR_CONFIG)]
+        # 【2026-10-22】engine.jsonで重みのファイル("config")を指定したときはそちらを渡す。
+        # 指定したのに無いときは、黙って既定の重みで動かさずエラーにする(別の重みで試すことになるため)。
+        args = [str(exe)]
+        weights = engine_weights() if engine is None else engine[1]
+        if weights is not None:
+            if not weights.exists():
+                raise FileNotFoundError(
+                    f"評価の重みのファイルが見つかりません: {weights}\n{ENGINE_CONFIG} の \"config\" を確認してください。"
+                )
+            args += ["--config", str(weights)]
         self._proc = subprocess.Popen(
             args,
             stdin=subprocess.PIPE,

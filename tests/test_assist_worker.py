@@ -861,6 +861,33 @@ class TestAssistWorkerTickOnce(unittest.TestCase):
         # 立て直しでは、既に提示済みの配置を消さない(消すと振動になる)。
         self.assertIsNotNone(self.worker._committed_placement)
 
+    def test_persistent_invalid_suggestion_rethinks_with_current_board(self) -> None:
+        # 【2026-10-31・実機ログ debug_log_20261031_094305_2p】おじゃまで盤面がせり上がった後、AIは前の盤面のまま
+        # 考え続け、手が「物理的に成立しない」として捨てられ続けた(6〜20秒、全自動の2Pが止まった)。
+        # 成立しない提案が続いたら、今の盤面で考え直すこと(盤面の読み取りが落ち着くのを待たない)。
+        self.cold_clear.poll_suggestion.return_value = _move("T")
+        with patch("src.app.time.monotonic", return_value=999.0):
+            with patch("src.app.recognize", return_value=_recognition(current_piece="T")):
+                self.worker._tick_once(capture=MagicMock())
+
+        # せり上がった盤面(AIの手 (19, 0) はブロックと重なる)。盤面の変化による考え直しが済むまで進める
+        risen = _recognition(current_piece="T", filled_cells=tuple((19, c) for c in range(9)))
+        for i in range(5):
+            with patch("src.app.time.monotonic", return_value=1000.0 + i * 0.15):
+                with patch("src.app.recognize", return_value=risen):
+                    self.worker._tick_once(capture=MagicMock())
+        self.worker._invalid_suggestion_ticks = 0
+        self.cold_clear.start_thinking.reset_mock()
+        # 盤面はもう変わらないが、AIは前の盤面の手を返し続ける
+        for i in range(AssistWorker.INVALID_SUGGESTION_RETHINK_TICKS):
+            with patch("src.app.time.monotonic", return_value=1000.75 + i * 0.15):
+                with patch("src.app.recognize", return_value=risen):
+                    self.worker._tick_once(capture=MagicMock())
+
+        self.cold_clear.start_thinking.assert_called_once()
+        board = self.cold_clear.start_thinking.call_args.args[0]
+        self.assertEqual(board.grid[19][0], risen.board.grid[19][0], "せり上がった後の盤面で考え直していない")
+
     def test_mismatch_rethink_uses_the_same_filled_in_hold_as_the_turn_key(self) -> None:
         # 【2026-09-26・静的分析の指摘】手番不一致からの再計算だけが生のHOLDを渡しており、
         # HOLDが一瞬読めないと「HOLD空」の局面で考えさせる一方、照合キーは補完済みのHOLDになる。
